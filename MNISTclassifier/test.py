@@ -1,5 +1,5 @@
 import numpy as np
-from classifier import normalize_pixels, encode_labels, split_data
+from utils import normalize_pixels, encode_labels, split_data
 
 
 # ── normalize_pixels tests ─────────────────────────────────────────────────────

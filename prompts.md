@@ -89,3 +89,42 @@ ran ruff check classifier.py, it flagged a couple of unused import warnings. fix
 
 **result:**
 got 6 tests total, two per function. checked range and exact values for normalize, dtype and values for encode, shapes and total count for split. all 6 passing.
+
+### normalized confusion matrix
+
+**prompt:**
+"add a normalized confusion matrix, basically divide each row by its total so values are between 0 and 1 instead of raw counts. plot both the normal one and normalized one so we can compare"
+
+**result:**
+got a plot_confusion_matrix function with a normalize flag. when true it row divides by class totals. both versions plotted at the end, normalized one is way easier to read for spotting which digits get confused.
+
+---
+
+### class wise metrics
+
+**prompt:**
+"add classificationreport from sklearn to get precision recall and f1 for each digit separately instead of just the overall averages"
+
+**result:**
+got classification_report call after evaluation. can now see exactly which digits like 4 and 9 or 3 and 5 are harder to classify instead of just looking at one overall number.
+
+---
+
+### comparing multiple classifiers
+
+**prompt:**
+"compare multiple classifiers like decision tree, naive bayes, svm and random forest. train all of them and plot a barplot of their macro-f1 scores to see which one actually performs better instead of just guessing"
+
+**result:**
+got all four classifiers benchmarked on a 10k subsample since svm is too slow on full data. barplot sorted by macro-f1 with scores annotated on each bar. random forest came out on top which justified keeping it.
+
+---
+
+### hyperparameter tuning
+
+**prompt:**
+"add gridsearchcv to tune random forest hyperparameters like max_depth, n_estimators, min_samples_split etc. use cv=3 and macro-f1 as scoring metric then retrian the best model on full data"
+
+**result:**
+got gridsearchcv set up with the param grid and n_jobs=-1 to use all cores. best params printed after search then used to retrain on the full 56k training set. slight improvement in macro-f1 over default params.
+
