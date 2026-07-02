@@ -1,8 +1,8 @@
 # Model Comparison Report: Llama 3.1 8B Instruct vs. Gemma 3 27B IT vs. Nemotron Nano 9B V2
 
 **Internship Project — Week 2: AI/LLM Model Comparison**
-**Author:** *[Your Name]*
-**Date:** *[Submission Date]*
+**Author:** *Huzaifa Saboor*
+**Date:** *2/7/2026*
 
 > **How to use this report:** This document is fully structured and ready to
 > commit to GitHub. Cells marked `_TBD_` are the metrics you should fill in
@@ -84,25 +84,25 @@ uses the `:free` endpoint.
 
 | Component | Value |
 |---|---|
-| Machine | *[e.g., Dell XPS 15 / MacBook Pro M2 / Cloud VM]* |
-| CPU | *[TBD — fill in from your machine]* |
-| RAM | *[TBD]* |
-| GPU (if used for local Ollama models) | *[TBD]* |
-| OS | *[TBD, e.g., Windows 11 / macOS 14 / Ubuntu 22.04]* |
+| Machine | *Lenovo Ideapad Slim 5 16IRL8* |
+| CPU | *i7-13700H , 2400Mhz , 14 Core(s)* |
+| RAM | *16 GB* |
+| GPU (if used for local Ollama models) | *Intel Iris(R) XE Graphics* |
+| OS | *Windows 11* |
 
 ### 3.2 Local Environment
 
-- Python version: *[TBD, e.g., 3.11.6]*
+- Python version: *3.13.5*
 - Key packages: `requests`, `python-dotenv` (see `requirements.txt`)
-- Ollama version (from Week 2 local task): *[TBD]*
-- Network: *[e.g., home broadband, ~X Mbps]* — network latency directly
+- Ollama version (from Week 2 local task): *0.31.1*
+- Network: *PTCL, 30 Mbps* — network latency directly
   affects OpenRouter response times, so it's worth noting here.
 
 ### 3.3 OpenRouter Environment
 
 - Endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - Auth: Bearer token via `OPENROUTER_API_KEY` (see [API Key Management](#api-key-management-recap))
-- Client: this project's custom `openrouter_chat.py` CLI (Part 1 of this
+- Client: this project's custom `ChatApp.py` CLI (Part 1 of this
   submission)
 - Request format: default OpenRouter routing (no pinned provider), no
   system prompt unless noted (e.g., Nemotron reasoning trace behavior)
@@ -113,7 +113,7 @@ Each model was sent the same five prompts (see [Section 4](#4-prompts-used)),
 one per category, in a fresh conversation (history cleared between tests to
 avoid context-length bias). For each response, the following was recorded:
 
-1. **Response time** — measured by `openrouter_chat.py` itself (wall-clock
+1. **Response time** — measured by `ChatApp.py` itself (wall-clock
    time from request sent to response received), displayed after every
    reply.
 2. **Token usage** — `prompt_tokens` / `completion_tokens` / `total_tokens`
@@ -134,7 +134,10 @@ minimize variance from provider-side load fluctuations.
 | **Explanation** | "Explain how DNS (Domain Name System) works, as if teaching a first-year computer science student." |
 | **Coding** | "Write a Python function that takes a list of integers and returns the two numbers that sum to a given target, along with a brief explanation of the time complexity." |
 | **Reasoning** | "A farmer has 17 sheep. All but 9 die. How many sheep does the farmer have left? Explain your reasoning step by step." |
-| **Summarization** | "Summarize the following paragraph in 2 sentences: *[paste a 150–200 word paragraph of your choice, e.g., a news article excerpt]*." |
+| **Summarization** | "Summarize the following paragraph in 2 sentences: *LeBron Raymone James Sr. (/ləˈbrɒn/ lə-BRON;[1] born December 30, 1984) is an American professional basketball player who most recently played for the Los Angeles Lakers of the National Basketball Association (NBA). Nicknamed "King James", he is the NBA's all-time leading scorer and has won four NBA championships from 10 NBA Finals appearances, including eight consecutive appearances between 2011 and 2018.[2] He has won three Olympic gold medals as a member of the U.S. national team, and is widely considered to be one of the greatest basketball players of all time and one of the greatest athletes in modern history.[a]
+
+In addition to ranking fourth in NBA career assists and sixth in NBA career steals, James holds several individual honors, including four NBA MVP awards, four Finals MVP awards, the Rookie of the Year award, three All-Star Game MVP awards, the inaugural NBA Cup MVP, and the Olympics MVP in the 2024 Summer Olympics. A record 22-time All-Star and 21-time All-NBA selection (including a record 13 First Team selections), he has also made six All-Defensive Teams. The oldest active player in the NBA, he holds records for the most seasons played with 23, the most games played, the most minutes played, and the most field goals made in league history.
+*." |
 | **Creative Writing** | "Write a short (100-word) story about a robot who discovers music for the first time." |
 
 > Tip: Keep the exact same prompt text across all three models so the
@@ -355,7 +358,7 @@ This experiment compared three OpenRouter-hosted models — Llama 3.1 8B
 Instruct, Gemma 3 27B IT, and Nemotron Nano 9B V2 — across a shared set of
 prompts spanning explanation, coding, reasoning, summarization, and
 creative writing. Combined with a custom Python CLI chat client built for
-this internship (see `openrouter_chat.py`), the exercise reinforced two
+this internship (see `ChatApp.py`), the exercise reinforced two
 practical lessons: first, that model size and specialization trade off
 against speed and cost in predictable ways, and second, that a
 provider-agnostic gateway like OpenRouter makes it straightforward to
@@ -369,8 +372,7 @@ quality against latency and budget constraints.
 
 ### API Key Management Recap
 
-This project's companion CLI application (`openrouter_chat.py`) loads
+This project's companion CLI application (`ChatApp.py`) loads
 `OPENROUTER_API_KEY` from a local `.env` file via `python-dotenv`, and
 `.env` is excluded from version control via `.gitignore`. No API key is
-hardcoded anywhere in this repository. See `README.md` for full setup
-instructions.
+hardcoded anywhere in this repository.
