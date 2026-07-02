@@ -1,8 +1,8 @@
 # Model Comparison Report: Llama 3.1 8B Instruct vs. Gemma 3 27B IT vs. Nemotron Nano 8B v1
 
 **Internship Project — Week 2: AI/LLM Model Comparison**
-**Author:** *[Your Name]*
-**Date:** *[Submission Date]*
+**Author:** *Huzaifa Saboor*
+**Date:** *2/7/2026*
 
 > **How to use this report:** This document is fully structured and ready to
 > commit to GitHub. Cells marked `_TBD_` are the metrics you should fill in
@@ -94,7 +94,7 @@ applications — this internship uses the free-tier `:free` endpoint.
 
 - Endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - Auth: Bearer token via `OPENROUTER_API_KEY` (see [API Key Management](#api-key-management-recap))
-- Client: this project's custom `openrouter_chat.py` CLI (Part 1 of this
+- Client: this project's custom `ChatApp.py` CLI (Part 1 of this
   submission)
 - Request format: default OpenRouter routing (no pinned provider), no
   system prompt unless noted (e.g., Nemotron reasoning mode)
@@ -351,5 +351,4 @@ constraints.
 This project's companion CLI application (`openrouter_chat.py`) loads
 `OPENROUTER_API_KEY` from a local `.env` file via `python-dotenv`, and
 `.env` is excluded from version control via `.gitignore`. No API key is
-hardcoded anywhere in this repository. See `README.md` for full setup
-instructions.
+hardcoded anywhere in this repository.

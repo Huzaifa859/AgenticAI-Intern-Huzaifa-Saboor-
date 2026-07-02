@@ -53,8 +53,8 @@ INITIAL_BACKOFF_SECONDS = 2.0
 
 # Optional headers that let your app show up on the OpenRouter leaderboards.
 # They are not required for the API to function and can be safely edited.
-APP_REFERER = "https://github.com/your-username/openrouter-cli-chat"
-APP_TITLE = "OpenRouter CLI Chatbot"
+APP_REFERER = "https://github.com/Huzaifa859/AgenticAI-Intern-Huzaifa-Saboor-"
+APP_TITLE = "Huzaifa Week 2 OpenRouter CLI Chatbot"
 
 
 class Colors:
