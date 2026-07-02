@@ -1,8 +1,8 @@
-# Model Comparison Report: Llama 3.1 8B Instruct vs. Gemma 3 27B IT vs. Nemotron Nano 8B v1
+# Model Comparison Report: Llama 3.1 8B Instruct vs. Gemma 3 27B IT vs. Nemotron Nano 9B V2
 
 **Internship Project — Week 2: AI/LLM Model Comparison**
-**Author:** *Huzaifa Saboor*
-**Date:** *2/7/2026*
+**Author:** *[Your Name]*
+**Date:** *[Submission Date]*
 
 > **How to use this report:** This document is fully structured and ready to
 > commit to GitHub. Cells marked `_TBD_` are the metrics you should fill in
@@ -11,6 +11,13 @@
 > they're left for you to measure rather than guessed. Everything else
 > (model descriptions, prompts, methodology, and analysis framework) is
 > complete and based on each model's published documentation.
+>
+> **Note on model selection:** the original assignment listed
+> `nvidia/llama-3.1-nemotron-nano-8b-v1:free`, but that model has since
+> been retired from OpenRouter (confirmed via a 404 "model not found"
+> response and an empty search result on openrouter.ai/models). It has
+> been replaced here with its direct successor, `nvidia/nemotron-nano-9b-v2:free`,
+> which is NVIDIA's next-generation Nemotron Nano model.
 
 ---
 
@@ -20,7 +27,7 @@
 
 This experiment evaluates and compares three large language models (LLMs)
 available through OpenRouter — **Llama 3.1 8B Instruct**, **Gemma 3 27B
-IT**, and **Nemotron Nano 8B v1** — across speed, output quality, and
+IT**, and **Nemotron Nano 9B V2** — across speed, output quality, and
 practical use-case fit. The goal is to build hands-on intuition for how
 model size, architecture, and provider-side tuning affect real-world
 chatbot behavior, and to produce a reference that can inform model
@@ -47,7 +54,7 @@ variant used here) for experimentation without cost.
 |---|---|---|---|---|
 | Llama 3.1 8B Instruct | `meta-llama/llama-3.1-8b-instruct` | Meta | 8B | 128K tokens |
 | Gemma 3 27B IT | `google/gemma-3-27b-it` | Google DeepMind | ~27.4B | 128K tokens |
-| Nemotron Nano 8B v1 | `nvidia/llama-3.1-nemotron-nano-8b-v1:free` | NVIDIA | 8B | 128K tokens |
+| Nemotron Nano 9B V2 | `nvidia/nemotron-nano-9b-v2:free` | NVIDIA | 9B | 128K tokens |
 
 **Llama 3.1 8B Instruct** is Meta's compact, general-purpose
 instruction-tuned model from the Llama 3.1 family — designed to be fast
@@ -60,13 +67,14 @@ supports over 140 languages and includes function-calling and structured
 output support, trading some speed for a significantly larger parameter
 count and stronger reasoning/coding capability.
 
-**Nemotron Nano 8B v1** is NVIDIA's post-trained derivative of Llama 3.1
-8B Instruct, specifically fine-tuned for reasoning, RAG, and tool-calling
-through a multi-stage SFT + reinforcement learning pipeline. It supports a
-toggleable "detailed thinking" reasoning mode (enabled via the system
-prompt) and is optimized to fit on a single consumer RTX GPU for local
-deployment, making it attractive for lightweight, cost-sensitive
-applications — this internship uses the free-tier `:free` endpoint.
+**Nemotron Nano 9B V2** is NVIDIA's next-generation Nemotron Nano model,
+trained from scratch (rather than derived from an existing Llama
+checkpoint like its predecessor) as a unified reasoning and non-reasoning
+model. By default it produces a reasoning trace before its final answer;
+this behavior can be controlled via the system prompt if only the final
+answer is needed. It offers a free tier on OpenRouter, making it
+attractive for lightweight, cost-sensitive applications — this internship
+uses the `:free` endpoint.
 
 ---
 
@@ -94,10 +102,10 @@ applications — this internship uses the free-tier `:free` endpoint.
 
 - Endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - Auth: Bearer token via `OPENROUTER_API_KEY` (see [API Key Management](#api-key-management-recap))
-- Client: this project's custom `ChatApp.py` CLI (Part 1 of this
+- Client: this project's custom `openrouter_chat.py` CLI (Part 1 of this
   submission)
 - Request format: default OpenRouter routing (no pinned provider), no
-  system prompt unless noted (e.g., Nemotron reasoning mode)
+  system prompt unless noted (e.g., Nemotron reasoning trace behavior)
 
 ### 3.4 Evaluation Methodology
 
@@ -158,7 +166,7 @@ Each response was scored on a **1 (poor) – 5 (excellent)** scale across:
 
 ### 6.1 Response Time by Prompt Category (seconds)
 
-| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 8B v1 |
+| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
 |---|---|---|---|
 | Explanation | _TBD_ | _TBD_ | _TBD_ |
 | Coding | _TBD_ | _TBD_ | _TBD_ |
@@ -169,7 +177,7 @@ Each response was scored on a **1 (poor) – 5 (excellent)** scale across:
 
 ### 6.2 Token Usage by Prompt Category (total tokens)
 
-| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 8B v1 |
+| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
 |---|---|---|---|
 | Explanation | _TBD_ | _TBD_ | _TBD_ |
 | Coding | _TBD_ | _TBD_ | _TBD_ |
@@ -179,7 +187,7 @@ Each response was scored on a **1 (poor) – 5 (excellent)** scale across:
 
 ### 6.3 Quality Scores (1–5 scale)
 
-| Metric | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 8B v1 |
+| Metric | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
 |---|---|---|---|
 | Accuracy | _TBD_ | _TBD_ | _TBD_ |
 | Reasoning Quality | _TBD_ | _TBD_ | _TBD_ |
@@ -192,14 +200,14 @@ Each response was scored on a **1 (poor) – 5 (excellent)** scale across:
 
 ### 6.4 Published Model Specs (reference, not measured)
 
-| Spec | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 8B v1 |
+| Spec | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
 |---|---|---|---|
-| Parameters | 8B | ~27.4B | 8B |
+| Parameters | 8B | ~27.4B | 9B |
 | Context Window | 128K | 128K | 128K |
 | Modality | Text only | Text + image input | Text only |
-| Reasoning Mode | Standard | Standard | Toggleable ("detailed thinking on") |
+| Reasoning Mode | Standard | Standard | Unified model; reasoning trace on by default, toggleable via system prompt |
 | Free Tier on OpenRouter | No (paid) | No (paid) | Yes (`:free` variant) |
-| Local Deployment | Ollama-friendly | Larger footprint | Fits a single consumer RTX GPU |
+| Local Deployment | Ollama-friendly | Larger footprint | Compact — suited to local/edge deployment |
 
 ---
 
@@ -238,7 +246,7 @@ answers on the reasoning prompt."]*
 
 **Weaknesses**
 - Larger model size generally means higher latency and token cost than
-  the two 8B models.
+  the two smaller models.
 - Overkill for simple queries where a smaller model would suffice.
 
 **Best Use Cases:** coding assistance, complex reasoning, multilingual
@@ -249,29 +257,36 @@ support.
 most complete and well-structured code, but had the highest average
 response time."]*
 
-### 7.3 Nemotron Nano 8B v1
+### 7.3 Nemotron Nano 9B V2
 
 **Strengths**
-- Purpose-built for reasoning, conversational chat, RAG, and tool-calling
-  through NVIDIA's multi-stage post-training pipeline.
+- Trained from scratch by NVIDIA as a unified reasoning and non-reasoning
+  model — it can produce a step-by-step reasoning trace before its final
+  answer, or skip straight to the answer when configured to via the
+  system prompt.
 - Free tier available on OpenRouter, making it ideal for
   budget-conscious development and testing.
-- Compact enough to run locally on a single consumer RTX GPU if self-hosted
-  later.
+- Compact (9B parameters) relative to Gemma 3 27B, keeping latency and
+  cost low while still targeting stronger reasoning than a standard
+  instruction-tuned model of similar size.
 
 **Weaknesses**
-- Reasoning mode requires an explicit `detailed thinking on` system prompt
-  to activate — easy to forget, which can silently reduce answer quality.
+- Because reasoning traces are on by default, responses can run longer
+  (and use more output tokens) than a same-size non-reasoning model unless
+  explicitly configured otherwise.
 - As a free-tier endpoint, it may be subject to stricter rate limits or
   variable latency versus paid models.
+- Being a newer model family (superseding the original Llama-3.1-derived
+  Nemotron Nano 8B v1), published third-party benchmarks are less
+  extensive than for more established models.
 
 **Best Use Cases:** reasoning-heavy tasks on a budget, RAG pipelines,
 tool-calling/agentic workflows, and prototyping where cost must stay at
 or near zero.
 
 **Performance Observations:** *[Fill in after testing — e.g., "Reasoning
-prompt answer was notably more structured when reasoning mode was
-enabled."]*
+prompt answer included a visible reasoning trace by default, which was
+more thorough than Llama 3.1 8B's direct answer."]*
 
 ---
 
@@ -283,7 +298,8 @@ enabled."]*
 - Slowest model overall: _TBD_
 - Category with the largest speed gap between models: _TBD_
 - Hypothesis for observed differences (parameter count, provider load,
-  free-tier vs. paid routing, network conditions): _TBD_
+  free-tier vs. paid routing, reasoning-trace overhead, network
+  conditions): _TBD_
 
 ## 9. Quality Analysis
 
@@ -301,10 +317,10 @@ enabled."]*
 |---|---|---|
 | General Chat | Llama 3.1 8B Instruct | Fast, capable, low cost for everyday conversation |
 | Coding | Gemma 3 27B IT | Larger model, generally stronger code generation/reasoning |
-| Reasoning | Nemotron Nano 8B v1 | Purpose-tuned reasoning mode via "detailed thinking on" |
+| Reasoning | Nemotron Nano 9B V2 | Unified model with a built-in reasoning trace by default |
 | Summarization | *[fill in based on your results]* | *[TBD]* |
 | Creative Tasks | *[fill in based on your results]* | *[TBD]* |
-| Lightweight Applications | Nemotron Nano 8B v1 or Llama 3.1 8B Instruct | Both are 8B models suited to local/edge or low-cost deployment |
+| Lightweight Applications | Nemotron Nano 9B V2 or Llama 3.1 8B Instruct | Both are compact, low-cost models suited to local/edge or budget-conscious deployment |
 
 ---
 
@@ -313,36 +329,41 @@ enabled."]*
 For real-world application development, consider:
 
 1. **Start small, scale up only when needed.** Llama 3.1 8B Instruct or
-   Nemotron Nano 8B v1 are reasonable defaults for most chat and
+   Nemotron Nano 9B V2 are reasonable defaults for most chat and
    lightweight-reasoning applications; reserve Gemma 3 27B IT for tasks
    that specifically demand deeper reasoning, coding accuracy, or
    multilingual/multimodal input.
 2. **Match the model to the task, not the other way around.** Route
-   reasoning-heavy or tool-calling workloads to Nemotron Nano (with
-   reasoning mode enabled), coding/complex-analysis workloads to Gemma 3
-   27B, and general conversational traffic to Llama 3.1 8B.
+   reasoning-heavy or tool-calling workloads to Nemotron Nano (letting its
+   default reasoning trace run), coding/complex-analysis workloads to
+   Gemma 3 27B, and general conversational traffic to Llama 3.1 8B.
 3. **Take advantage of OpenRouter's flexibility.** Because switching
    models is a one-line change (as demonstrated by the `/model` command in
    this project's CLI app), it's practical to A/B test models in
    production or route dynamically based on request type and cost budget.
-4. **Watch free-tier limitations.** The `:free` Nemotron endpoint is great
-   for development, but production systems should verify rate limits and
-   consider a paid tier or self-hosted deployment for reliability.
+4. **Watch free-tier limitations — and model deprecations.** The `:free`
+   Nemotron endpoint is great for development, but production systems
+   should verify rate limits and consider a paid tier or self-hosted
+   deployment for reliability. It's also worth periodically checking that
+   pinned model IDs are still active on OpenRouter; providers do retire
+   older model versions (as happened with the original Nemotron Nano 8B
+   v1 used in earlier drafts of this project).
 
 ## 12. Conclusion
 
 This experiment compared three OpenRouter-hosted models — Llama 3.1 8B
-Instruct, Gemma 3 27B IT, and Nemotron Nano 8B v1 — across a shared set of
+Instruct, Gemma 3 27B IT, and Nemotron Nano 9B V2 — across a shared set of
 prompts spanning explanation, coding, reasoning, summarization, and
 creative writing. Combined with a custom Python CLI chat client built for
 this internship (see `openrouter_chat.py`), the exercise reinforced two
 practical lessons: first, that model size and specialization trade off
 against speed and cost in predictable ways, and second, that a
 provider-agnostic gateway like OpenRouter makes it straightforward to
-evaluate and switch between models as application requirements evolve. The
-completed data in Section 6 should guide model selection for future
-project phases, balancing response quality against latency and budget
-constraints.
+evaluate and switch between models as application requirements evolve —
+including recovering gracefully when a specific model ID is retired, as
+happened during this project. The completed data in Section 6 should
+guide model selection for future project phases, balancing response
+quality against latency and budget constraints.
 
 ---
 
@@ -351,4 +372,5 @@ constraints.
 This project's companion CLI application (`openrouter_chat.py`) loads
 `OPENROUTER_API_KEY` from a local `.env` file via `python-dotenv`, and
 `.env` is excluded from version control via `.gitignore`. No API key is
-hardcoded anywhere in this repository.
+hardcoded anywhere in this repository. See `README.md` for full setup
+instructions.

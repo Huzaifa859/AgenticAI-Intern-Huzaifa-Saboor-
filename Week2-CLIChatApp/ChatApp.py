@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-openrouter_chat.py
+ChatApp.py
 ===================
 
 A command-line chat application that talks to Large Language Models
@@ -43,7 +43,7 @@ from dotenv import load_dotenv
 MODELS: Dict[str, str] = {
     "1": "meta-llama/llama-3.1-8b-instruct",
     "2": "google/gemma-3-27b-it",
-    "3": "nvidia/llama-3.1-nemotron-nano-8b-v1:free",
+    "3": "nvidia/nemotron-nano-9b-v2:free",
 }
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
