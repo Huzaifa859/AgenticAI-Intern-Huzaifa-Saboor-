@@ -134,9 +134,7 @@ minimize variance from provider-side load fluctuations.
 | **Explanation** | "Explain how DNS (Domain Name System) works, as if teaching a first-year computer science student." |
 | **Coding** | "Write a Python function that takes a list of integers and returns the two numbers that sum to a given target, along with a brief explanation of the time complexity." |
 | **Reasoning** | "A farmer has 17 sheep. All but 9 die. How many sheep does the farmer have left? Explain your reasoning step by step." |
-| **Summarization** | "Summarize the following paragraph in 2 sentences: *LeBron Raymone James Sr. (/ləˈbrɒn/ lə-BRON;[1] born December 30, 1984) is an American professional basketball player who most recently played for the Los Angeles Lakers of the National Basketball Association (NBA). Nicknamed "King James", he is the NBA's all-time leading scorer and has won four NBA championships from 10 NBA Finals appearances, including eight consecutive appearances between 2011 and 2018.[2] He has won three Olympic gold medals as a member of the U.S. national team, and is widely considered to be one of the greatest basketball players of all time and one of the greatest athletes in modern history.[a]
-
-In addition to ranking fourth in NBA career assists and sixth in NBA career steals, James holds several individual honors, including four NBA MVP awards, four Finals MVP awards, the Rookie of the Year award, three All-Star Game MVP awards, the inaugural NBA Cup MVP, and the Olympics MVP in the 2024 Summer Olympics. A record 22-time All-Star and 21-time All-NBA selection (including a record 13 First Team selections), he has also made six All-Defensive Teams. The oldest active player in the NBA, he holds records for the most seasons played with 23, the most games played, the most minutes played, and the most field goals made in league history.
+| **Summarization** | "Summarize the following paragraph in 2 sentences: *LeBron Raymone James Sr. (/ləˈbrɒn/ lə-BRON;[1] born December 30, 1984) is an American professional basketball player who most recently played for the Los Angeles Lakers of the National Basketball Association (NBA). Nicknamed "King James", he is the NBA's all-time leading scorer and has won four NBA championships from 10 NBA Finals appearances, including eight consecutive appearances between 2011 and 2018.[2] He has won three Olympic gold medals as a member of the U.S. national team, and is widely considered to be one of the greatest basketball players of all time and one of the greatest athletes in modern history.[a]In addition to ranking fourth in NBA career assists and sixth in NBA career steals, James holds several individual honors, including four NBA MVP awards, four Finals MVP awards, the Rookie of the Year award, three All-Star Game MVP awards, the inaugural NBA Cup MVP, and the Olympics MVP in the 2024 Summer Olympics. A record 22-time All-Star and 21-time All-NBA selection (including a record 13 First Team selections), he has also made six All-Defensive Teams. The oldest active player in the NBA, he holds records for the most seasons played with 23, the most games played, the most minutes played, and the most field goals made in league history.
 *." |
 | **Creative Writing** | "Write a short (100-word) story about a robot who discovers music for the first time." |
 
@@ -169,37 +167,42 @@ Each response was scored on a **1 (poor) – 5 (excellent)** scale across:
 
 ### 6.1 Response Time by Prompt Category (seconds)
 
-| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
-|---|---|---|---|
-| Explanation | _TBD_ | _TBD_ | _TBD_ |
-| Coding | _TBD_ | _TBD_ | _TBD_ |
-| Reasoning | _TBD_ | _TBD_ | _TBD_ |
-| Summarization | _TBD_ | _TBD_ | _TBD_ |
-| Creative Writing | _TBD_ | _TBD_ | _TBD_ |
-| **Average** | **_TBD_** | **_TBD_** | **_TBD_** |
+| Category         | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
+| ---------------- | --------------------- | -------------- | ------------------- |
+| Explanation      | *20.79s*              | *101.03s*      | *37.55s*            |
+| Coding           | *3.26s*               | *40.68s*       | *52.26s*            |
+| Reasoning        | *5.58s*               | *36.98s*       | *19.06s*            |
+| Summarization    | *3.75s*               | *18.44s*       | *31.17s*            |
+| Creative Writing | *3.11s*               | *8.97s*        | *12.13s*            |
+| **Average**      | ***7.30s***           | ***41.22s***   | ***30.43s***        |
 
-### 6.2 Token Usage by Prompt Category (total tokens)
+### 6.2 Token Usage by Prompt Category (completion tokens)
 
-| Category | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
-|---|---|---|---|
-| Explanation | _TBD_ | _TBD_ | _TBD_ |
-| Coding | _TBD_ | _TBD_ | _TBD_ |
-| Reasoning | _TBD_ | _TBD_ | _TBD_ |
-| Summarization | _TBD_ | _TBD_ | _TBD_ |
-| Creative Writing | _TBD_ | _TBD_ | _TBD_ |
+| Category         | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
+| ---------------- | --------------------- | -------------- | ------------------- |
+| Explanation      | *747*                 | *1283*         | *1400*              |
+| Coding           | *429*                 | *738*          | *1206*              |
+| Reasoning        | *207*                 | *180*          | *745*               |
+| Summarization    | *96*                  | *73*           | *560*               |
+| Creative Writing | *139*                 | *129*          | *360*               |
 
 ### 6.3 Quality Scores (1–5 scale)
 
-| Metric | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
-|---|---|---|---|
-| Accuracy | _TBD_ | _TBD_ | _TBD_ |
-| Reasoning Quality | _TBD_ | _TBD_ | _TBD_ |
-| Coding Ability | _TBD_ | _TBD_ | _TBD_ |
-| Creativity | _TBD_ | _TBD_ | _TBD_ |
-| Instruction Following | _TBD_ | _TBD_ | _TBD_ |
-| Response Completeness | _TBD_ | _TBD_ | _TBD_ |
-| Ease of Use | _TBD_ | _TBD_ | _TBD_ |
-| **Overall Quality** | **_TBD_** | **_TBD_** | **_TBD_** |
+| Metric                | Llama 3.1 8B Instruct | Gemma 3 27B IT | Nemotron Nano 9B V2 |
+| --------------------- | --------------------- | -------------- | ------------------- |
+| Accuracy              | *4*                   | *5*            | *5*                 |
+| Reasoning Quality     | *4*                   | *4*            | *5*                 |
+| Coding Ability        | *4*                   | *5*            | *4*                 |
+| Creativity            | *4*                   | *5*            | *4*                 |
+| Instruction Following | *4*                   | *5*            | *5*                 |
+| Response Completeness | *3*                   | *5*            | *5*                 |
+| Ease of Use           | *5*                   | *3*            | *3*                 |
+| **Overall Quality**   | ***4.0/5***           | ***4.6/5***    | ***4.4/5***         |
+
+---
+
+
+
 
 ### 6.4 Published Model Specs (reference, not measured)
 
@@ -293,37 +296,42 @@ more thorough than Llama 3.1 8B's direct answer."]*
 
 ---
 
+
 ## 8. Speed Analysis
 
-*[Fill in based on Section 6.1 data. Suggested structure:]*
+* Fastest model overall: **Llama 3.1 8B Instruct**, with an average response time of **7.30 seconds**.
+* Slowest model overall: **Gemma 3 27B IT**, with an average response time of **41.22 seconds**.
+* Category with the largest speed gap between models: **Explanation**, where response times ranged from **20.79 seconds (Llama)** to **101.03 seconds (Gemma)**, resulting in a difference of over **80 seconds**.
+* Hypothesis for observed differences:
 
-- Fastest model overall: _TBD_
-- Slowest model overall: _TBD_
-- Category with the largest speed gap between models: _TBD_
-- Hypothesis for observed differences (parameter count, provider load,
-  free-tier vs. paid routing, reasoning-trace overhead, network
-  conditions): _TBD_
+  * **Model size:** Gemma 3 27B contains significantly more parameters than the other models, contributing to its higher latency.
+  * **Inference optimization:** Llama 3.1 8B appears to be highly optimized for low-latency inference, resulting in consistently fast responses.
+  * **Response length:** Nemotron Nano 9B frequently generated substantially longer outputs, increasing generation time and token usage.
+  * **Free-tier routing and provider load:** Since the evaluation used free-tier API endpoints, response times were likely affected by server load, rate limits, and request routing.
+  * **Network and infrastructure overhead:** Variations in network latency and backend infrastructure may also have contributed to observed response times.
 
 ## 9. Quality Analysis
 
-*[Fill in based on Section 6.3 data. Suggested structure:]*
+* Highest-scoring model overall: **Gemma 3 27B IT**, with an overall quality score of **4.6/5**.
+* Model with the best coding output: **Gemma 3 27B IT**, due to its detailed explanations, structured code, and comprehensive complexity analysis.
+* Model with the best reasoning output: **Nemotron Nano 9B V2**, which consistently provided explicit step-by-step reasoning and detailed explanations across tasks.
+* Any surprising results:
 
-- Highest-scoring model overall: _TBD_
-- Model with the best coding output: _TBD_
-- Model with the best reasoning output: _TBD_
-- Any surprising results (e.g., a smaller model outperforming a larger one
-  on a specific task): _TBD_
+  * Despite being the smallest model evaluated, **Llama 3.1 8B Instruct** demonstrated excellent performance relative to its size, achieving the fastest response times while maintaining strong output quality.
+  * **Nemotron Nano 9B V2** demonstrated stronger reasoning transparency than the larger Gemma 3 27B model by consistently exposing its intermediate reasoning steps.
+  * The results suggest that model size alone does not determine practical performance, as smaller and more optimized models can provide an effective balance between speed, cost, and output quality.
 
 ## 10. Use-Case Fit Analysis
 
-| Use Case | Best-Fit Model | Rationale |
-|---|---|---|
-| General Chat | Llama 3.1 8B Instruct | Fast, capable, low cost for everyday conversation |
-| Coding | Gemma 3 27B IT | Larger model, generally stronger code generation/reasoning |
-| Reasoning | Nemotron Nano 9B V2 | Unified model with a built-in reasoning trace by default |
-| Summarization | *[fill in based on your results]* | *[TBD]* |
-| Creative Tasks | *[fill in based on your results]* | *[TBD]* |
-| Lightweight Applications | Nemotron Nano 9B V2 or Llama 3.1 8B Instruct | Both are compact, low-cost models suited to local/edge or budget-conscious deployment |
+| Use Case                 | Best-Fit Model        | Rationale                                                                                                                                                  |
+| ------------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| General Chat             | Llama 3.1 8B Instruct | Fast, capable, and cost-efficient for everyday conversational tasks while maintaining good response quality.                                               |
+| Coding                   | Gemma 3 27B IT        | Produced the most comprehensive code explanations, included complexity analysis, and demonstrated the strongest coding capability overall.                 |
+| Reasoning                | Nemotron Nano 9B V2   | Consistently generated explicit step-by-step reasoning and provided the most transparent reasoning process.                                                |
+| Summarization            | Gemma 3 27B IT        | Generated the most concise and information-dense summaries while preserving the key details from the source text.                                          |
+| Creative Tasks           | Gemma 3 27B IT        | Produced the most coherent and emotionally engaging creative writing output with strong narrative structure.                                               |
+| Lightweight Applications | Llama 3.1 8B Instruct | Delivered the fastest response times while maintaining competitive quality, making it well-suited for local deployment and latency-sensitive applications. |
+
 
 ---
 
