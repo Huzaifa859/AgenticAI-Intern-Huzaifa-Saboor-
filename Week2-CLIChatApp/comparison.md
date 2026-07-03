@@ -4,15 +4,8 @@
 **Author:** *Huzaifa Saboor*
 **Date:** *2/7/2026*
 
-> **How to use this report:** This document is fully structured and ready to
-> commit to GitHub. Cells marked `_TBD_` are the metrics you should fill in
-> after running your own tests with `openrouter_chat.py` — timing and
-> quality scores depend on your specific hardware, network, and prompts, so
-> they're left for you to measure rather than guessed. Everything else
-> (model descriptions, prompts, methodology, and analysis framework) is
-> complete and based on each model's published documentation.
 >
-> **Note on model selection:** the original assignment listed
+> **Note on model selection:** I originally used
 > `nvidia/llama-3.1-nemotron-nano-8b-v1:free`, but that model has since
 > been retired from OpenRouter (confirmed via a 404 "model not found"
 > response and an empty search result on openrouter.ai/models). It has
@@ -138,9 +131,6 @@ minimize variance from provider-side load fluctuations.
 *." |
 | **Creative Writing** | "Write a short (100-word) story about a robot who discovers music for the first time." |
 
-> Tip: Keep the exact same prompt text across all three models so the
-> comparison is apples-to-apples. Paste your actual summarization source
-> paragraph into the placeholder above before committing.
 
 ---
 
