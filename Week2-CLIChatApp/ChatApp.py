@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 # Constants & configuration
 # --------------------------------------------------------------------------- #
 
-# The three models this internship task requires. The dictionary key is the
+# The dictionary key is the
 # number the user types at the selection menu; the value is the exact
 # OpenRouter model identifier used in API requests.
 MODELS: Dict[str, str] = {
