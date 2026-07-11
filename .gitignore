@@ -23,3 +23,15 @@ __pycache__/
 
 # Environment variables
 .env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Type checking
+.mypy_cache/
+
+# Logs and coverage
+*.log
+.coverage
+htmlcov/

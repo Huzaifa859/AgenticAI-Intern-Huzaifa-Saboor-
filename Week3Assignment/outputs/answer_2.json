@@ -1,0 +1,10 @@
+{
+  "question": "What is gradient descent and how is it used in machine learning?",
+  "answer": "Gradient descent is an optimization algorithm used in machine learning to update the model's parameters by minimizing the loss function. It is expressed with the learning rate and the cost function as follows: θ←−θ−α∇J(θ).",
+  "confidence": 0.9,
+  "sources": [
+    "machine_learning_cheatsheet.pdf",
+    "artificial_intelligence_cheatsheet.pdf",
+    "deep_learning_cheatsheet.pdf"
+  ]
+}
