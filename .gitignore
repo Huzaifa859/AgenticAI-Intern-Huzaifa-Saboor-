@@ -20,3 +20,6 @@ __pycache__/
 
 # ChromaDB
 **/chroma_store/
+
+# Environment variables
+.env
