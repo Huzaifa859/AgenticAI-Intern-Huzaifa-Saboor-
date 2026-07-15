@@ -128,3 +128,112 @@ got all four classifiers benchmarked on a 10k subsample since svm is too slow on
 **result:**
 got gridsearchcv set up with the param grid and n_jobs=-1 to use all cores. best params printed after search then used to retrain on the full 56k training set. slight improvement in macro-f1 over default params.
 
+# week 2 — llm foundations
+
+**prompt:**
+"should i download ollama on my laptop which has integrated gpu"
+
+**result:**
+Yes, you can absolutely install Ollama on a laptop with only an integrated GPU. Ollama can run models on the CPU if you don't have a dedicated NVIDIA GPU.
+
+---
+
+**prompt:**
+"i have 16gb ram.what will i be able to run"
+
+**result:**
+With 16 GB RAM, you should be able to run both Llama 3 8B and Mistral 7B using Ollama, even if your laptop only has an integrated GPU.
+
+---
+
+**prompt:**
+"do i run these commands ollama run llama3 and ollama run mistral in virtual env"
+
+**result:**
+No. You do not run the Ollama commands inside your Python virtual environment.
+
+---
+
+**prompt:**
+"Compare outputs of 3 models on the same prompt via OpenRouter.How to do this tell me step by step"
+
+**result:**
+gpt told me to sign up for OpenRouter and select any three models and use the same prompt on them and gave me step by step walkthrough
+
+---
+
+**prompt:**
+"give me three free models exact name which i should use"
+
+**result:**
+gave me names of three models i can use for without buying credits
+
+---
+
+**prompt:**
+this is my week 2 assignment for internship
+
+Install Ollama and run llama3 + mistral locally
+
+Compare outputs of 3 models on the same prompt via OpenRouter
+
+Build a CLI chat app using the OpenRouter API (Python or Node)
+
+Document a model comparison: speed, quality, use-case fit
+
+Update prompts.md
+
+i have done first and second part
+
+now for third task
+
+i want to add three models to the python code where the user inputs which model he/she wants to use and then give me code for the ✅ Build a CLI chat app using the OpenRouter API (Python or Node) preferably python and then give me Document a model comparison: speed, quality, use-case fit. My mentor expects me to use every feature so add everything relevant in both code and document. Well formatted and commented code and give me back the code only not the python file
+
+give me a prompt for this
+
+**result:**
+recieved a long prompt for building the ChatApp with many details regarding features,error handling and api key management.
+
+---
+
+**prompt:**
+"modify the cli chat app so that it supports these three models: llama 3.1 8b instruct, gemma 3 27b it and nemotron nano. the user should be able to choose which model to use and switch between them during runtime."
+
+**result:**
+The CLI chat application was updated to support multiple LLMs through OpenRouter. A model selection menu was added, allowing users to choose between Llama 3.1 8B Instruct, Gemma 3 27B IT and Nemotron Nano at startup and switch models during runtime.
+
+---
+
+**prompt:**
+"add api key management using a .env file and make sure the project follows good secrets hygiene practices."
+
+**result:**
+API key management was implemented using a `.env` file and the `python-dotenv` package. A `.env.example` template file was created, and `.gitignore` was updated to prevent sensitive API keys from being committed to GitHub.
+
+---
+
+**prompt:**
+"im using openrouter for my assignment. add response timing, token usage statistics and retry logic for rate limit errors."
+
+**result:**
+The application was enhanced with response timing metrics, token usage tracking and automatic retry logic with exponential backoff to handle rate limit errors and improve reliability.
+
+---
+
+**prompt:**
+"im submitting this project for an internship. improve the code quality by adding type hints, comments, docstrings and better project structure."
+
+**result:**
+The codebase was refactored to include type hints, comprehensive comments, function docstrings, improved error handling and a more organized project structure to meet professional development standards.
+
+---
+
+**prompt:**
+"create a markdown document comparing multiple llms based on speed, quality and use case fit. include tables and conclusions."
+
+**result:**
+A detailed markdown report was created comparing multiple LLMs based on response speed, output quality and use-case suitability. The document includes comparison tables, analysis sections and conclusions derived from testing.
+
+
+
+
