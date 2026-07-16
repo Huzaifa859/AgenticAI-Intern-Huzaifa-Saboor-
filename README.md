@@ -24,7 +24,7 @@ AgenticAI-Intern-Huzaifa-Saboor/
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Huzaifa859/AgenticAI-Intern-Huzaifa-Saboor-.git
 cd AgenticAI-Intern-Huzaifa-Saboor
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
