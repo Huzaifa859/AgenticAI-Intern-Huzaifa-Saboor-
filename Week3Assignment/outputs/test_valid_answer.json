@@ -1,0 +1,8 @@
+{
+  "question": "What is gradient descent?",
+  "answer": "An iterative optimization algorithm used to minimize a loss function.",
+  "confidence": 0.92,
+  "sources": [
+    "machine_learning_cheatsheet.pdf"
+  ]
+}

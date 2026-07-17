@@ -234,6 +234,87 @@ The codebase was refactored to include type hints, comprehensive comments, funct
 **result:**
 A detailed markdown report was created comparing multiple LLMs based on response speed, output quality and use-case suitability. The document includes comparison tables, analysis sections and conclusions derived from testing.
 
+## week 3 — rag pipeline assignment
 
+---
 
+### building the rag notebook
 
+**prompt:**
+"Build a RAG demo over PDFs using ChromaDB, sentence-transformers, and pypdf,
+reusing the OpenRouter client from ChatApp.ipynb. [full spec of requirements]"
+
+**result:**
+Claude built the full pipeline in one pass — PDF discovery, chunking,
+embedding, ChromaDB storage, retrieval, and the reused OpenRouter call —
+and tested it end-to-end before I reviewed it.
+
+---
+
+### simplifying the notebook
+
+**prompt:**
+"make the markdown text and comments briefer, it looks too complex"
+
+**result:**
+Condensed all markdown explanations and docstrings while keeping the same
+logic.
+---
+
+### cleaning up task 1 formatting
+
+**prompt:**
+asked to shrink the markdown text and code comments in my week3 notebook since it looked too dense/complex for my mentor to review — wanted headers condensed and comments trimmed without touching the actual logic.
+
+**result:**
+got the notebook back with shorter markdown sections and one-line comments/docstrings instead of full paragraph explanations. diffed it against my original to confirm the functions and logic were untouched, just the formatting.
+
+---
+
+### task 2 — embedding model comparison
+
+**prompt:**
+gave a detailed spec: compare two sentence-transformers models on retrieval quality, reuse task 1's chunk_records so the only thing changing is the embedding model, build one chromadb collection per model, run the same eval questions against both, and output a comparison table with specific columns (question, model, retrieved source, similarity score, retrieval time, generated answer, manual relevance rating).
+
+**result:**
+got build_and_time_collection() and evaluate_model_on_question(), plus a pandas comparison_df and a speed_summary table. reviewed the functions to make sure task 1 code wasn't duplicated. still had to actually run it myself, fill in the manual relevance ratings by hand, and write the analysis based on my real numbers since that part's a judgment call, not something to generate.
+
+---
+
+### task 3 — structured output pipeline
+
+**prompt:**
+spec'd out an llm → json → validate → save pipeline. gave the pydantic schema fields i wanted (question, answer, confidence, sources), asked for it split into build_prompt / generate_json / validate_output / save_json, and was explicit that the existing openrouter client shouldn't be touched.
+
+**result:**
+got the full pipeline plus a demo showing the validation-failure path on purpose. reviewed it and ran it — hit a UnicodeEncodeError on save_json on my windows machine (cp1252 default encoding couldn't handle a character in one of the answers). fixed that myself by adding encoding="utf-8" to the write_text call.
+
+---
+
+### task 4 — validation tests
+
+**prompt:**
+asked for pytest-style tests covering both valid and invalid llm outputs specifically — missing required field, wrong datatype, confidence out of the 0–1 range, sources not being a list, completely invalid json, and extra unexpected fields — organized as reusable test_ functions that reuse task 3's validate_output instead of rewriting it.
+
+**result:**
+got a TEST_CASES dict plus individual test_ functions and a small runner (since actual pytest doesn't execute notebook cells directly). double-checked the extra-fields case myself since my Answer schema doesn't forbid extra fields by default — pydantic just silently ignores them — so that case documents that behavior instead of faking it as a failure.
+
+---
+
+### task 5 — hallucination report
+
+**prompt:**
+asked for a markdown report on where the llm hallucinated in my pipeline and how i actually caught it, tied to my real implementation, with sections for scenarios observed, detection methods, and mitigation techniques.
+
+**result:**
+got a report grounded in my actual pipeline — retrieval inspection, similarity scores, pydantic validation, the task 4 tests. read through it and checked the scenarios against what i'd actually seen while testing before keeping them in.
+
+---
+
+### gitignore review
+
+**prompt:**
+asked if my existing .gitignore was missing anything for this kind of project.
+
+**result:**
+got suggestions — mypy cache, logs/coverage, env file variants — plus a flag about whether outputs/ should stay tracked so my saved json answers are visible for review. turned out i'd already left it untracked, so no change needed there, just added the extra entries.
