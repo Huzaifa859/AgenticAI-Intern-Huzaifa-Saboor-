@@ -1,0 +1,1 @@
+A scratch file with an extension read_file() intentionally rejects.
