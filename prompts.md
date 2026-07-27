@@ -234,6 +234,474 @@ The codebase was refactored to include type hints, comprehensive comments, funct
 **result:**
 A detailed markdown report was created comparing multiple LLMs based on response speed, output quality and use-case suitability. The document includes comparison tables, analysis sections and conclusions derived from testing.
 
+## week 3 — rag pipeline assignment
+
+---
+
+### building the rag notebook
+
+**prompt:**
+"Build a RAG demo over PDFs using ChromaDB, sentence-transformers, and pypdf,
+reusing the OpenRouter client from ChatApp.ipynb. [full spec of requirements]"
+
+**result:**
+Claude built the full pipeline in one pass — PDF discovery, chunking,
+embedding, ChromaDB storage, retrieval, and the reused OpenRouter call —
+and tested it end-to-end before I reviewed it.
+
+---
+
+### simplifying the notebook
+
+**prompt:**
+"make the markdown text and comments briefer, it looks too complex"
+
+**result:**
+Condensed all markdown explanations and docstrings while keeping the same
+logic.
+---
+
+### cleaning up task 1 formatting
+
+**prompt:**
+asked to shrink the markdown text and code comments in my week3 notebook since it looked too dense/complex for my mentor to review — wanted headers condensed and comments trimmed without touching the actual logic.
+
+**result:**
+got the notebook back with shorter markdown sections and one-line comments/docstrings instead of full paragraph explanations. diffed it against my original to confirm the functions and logic were untouched, just the formatting.
+
+---
+
+### task 2 — embedding model comparison
+
+**prompt:**
+gave a detailed spec: compare two sentence-transformers models on retrieval quality, reuse task 1's chunk_records so the only thing changing is the embedding model, build one chromadb collection per model, run the same eval questions against both, and output a comparison table with specific columns (question, model, retrieved source, similarity score, retrieval time, generated answer, manual relevance rating).
+
+**result:**
+got build_and_time_collection() and evaluate_model_on_question(), plus a pandas comparison_df and a speed_summary table. reviewed the functions to make sure task 1 code wasn't duplicated. still had to actually run it myself, fill in the manual relevance ratings by hand, and write the analysis based on my real numbers since that part's a judgment call, not something to generate.
+
+---
+
+### task 3 — structured output pipeline
+
+**prompt:**
+spec'd out an llm → json → validate → save pipeline. gave the pydantic schema fields i wanted (question, answer, confidence, sources), asked for it split into build_prompt / generate_json / validate_output / save_json, and was explicit that the existing openrouter client shouldn't be touched.
+
+**result:**
+got the full pipeline plus a demo showing the validation-failure path on purpose. reviewed it and ran it — hit a UnicodeEncodeError on save_json on my windows machine (cp1252 default encoding couldn't handle a character in one of the answers). fixed that myself by adding encoding="utf-8" to the write_text call.
+
+---
+
+### task 4 — validation tests
+
+**prompt:**
+asked for pytest-style tests covering both valid and invalid llm outputs specifically — missing required field, wrong datatype, confidence out of the 0–1 range, sources not being a list, completely invalid json, and extra unexpected fields — organized as reusable test_ functions that reuse task 3's validate_output instead of rewriting it.
+
+**result:**
+got a TEST_CASES dict plus individual test_ functions and a small runner (since actual pytest doesn't execute notebook cells directly). double-checked the extra-fields case myself since my Answer schema doesn't forbid extra fields by default — pydantic just silently ignores them — so that case documents that behavior instead of faking it as a failure.
+
+---
+
+### task 5 — hallucination report
+
+**prompt:**
+asked for a markdown report on where the llm hallucinated in my pipeline and how i actually caught it, tied to my real implementation, with sections for scenarios observed, detection methods, and mitigation techniques.
+
+**result:**
+got a report grounded in my actual pipeline — retrieval inspection, similarity scores, pydantic validation, the task 4 tests. read through it and checked the scenarios against what i'd actually seen while testing before keeping them in.
+
+---
+
+### gitignore review
+
+**prompt:**
+asked if my existing .gitignore was missing anything for this kind of project.
+
+**result:**
+got suggestions — mypy cache, logs/coverage, env file variants — plus a flag about whether outputs/ should stay tracked so my saved json answers are visible for review. turned out i'd already left it untracked, so no change needed there, just added the extra entries.
 
 
+# week 4 — ai agents
 
+---
+
+### understanding the assignment
+
+**prompt:**
+"this is my week 4 internship assignment. explain every task in simple words and tell me what exactly i have to build"
+
+**result:**
+got a breakdown of every task and understood that everything should be part of one research agent instead of making separate programs.
+
+---
+
+### choosing the web search api
+
+**prompt:**
+"should i use brave or serpapi for this assignment and later final project"
+
+**result:**
+compared both apis, decided to use SerpAPI because it has a free plan and was easier to set up for testing.
+
+---
+
+### creating the research agent
+
+**prompt:**
+"help me build a research agent with openrouter as the llm and serpapi as the web search tool. keep the code modular because i will be adding more features later"
+
+**result:**
+got a clean project structure where every feature was added as a separate function and the agent could call different tools when needed.
+
+---
+
+### adding memory
+
+**prompt:**
+"how do i add session memory so the agent remembers facts from earlier in the conversation without using a database"
+
+**result:**
+implemented in-memory session storage where important facts are saved and can be recalled later in the same session.
+
+---
+
+### logging tool calls
+
+**prompt:**
+"how do i log every tool call with timestamps without making the code messy"
+
+**result:**
+added a logging hook that records tool name, timestamp and status whenever the agent uses a tool.
+
+---
+
+### reading txt and pdf files
+
+**prompt:**
+"add a plugin so the agent can read both txt and pdf files and use their contents to answer questions"
+
+**result:**
+added separate functions for txt and pdf reading and connected them as tools that the agent can call.
+
+---
+
+### multi hop reasoning
+
+**prompt:**
+"how do i make the agent answer questions that need both web search and reading a local file"
+
+**result:**
+updated the agent workflow so it can use multiple tools before generating the final answer.
+
+---
+
+### improving notebook structure
+
+**prompt:**
+"make my notebook look more professional. improve the markdown formatting, headings and organization but dont change any code"
+
+**result:**
+markdown was cleaned up, sections were reorganized and the notebook became much easier to read.
+
+---
+
+### replacing brave with serpapi
+
+**prompt:**
+"replace brave search with serpapi but keep everything else exactly the same"
+
+**result:**
+all brave specific code was replaced with serpapi while keeping the same agent architecture and functionality.
+
+---
+
+### checking before github
+
+**prompt:**
+"check if my notebook is safe to push to github and make sure no api keys are exposed"
+
+**result:**
+verified that no api keys were present in the notebook outputs and confirmed it was safe to upload.
+
+
+---
+
+### building the base research agent
+
+**prompt:**
+"this is my week 4 assignment for internship. i need to build a research agent that has web search using serpapi or brave, memory so it remembers facts from earlier in the session, a hook that logs every tool call with timestamps, a file reader for txt and pdf, and a demo where the agent answers a multi hop question using all of it. complete it and give me the notebook back, add every feature so my mentor doesnt ask for changes in the pr. use brave api for now"
+
+**result:**
+got a full jupyter notebook back with all the pieces — a web_search tool using brave, a memory class, a logging decorator that wraps every tool call, a read_file tool for txt/pdf, and a demo at the end that chains all of it together to answer a multi hop question. ran it and it worked first try.
+
+---
+
+### switching to openrouter
+
+**prompt:**
+"modify the notebook to use openrouter instead of the anthropic sdk. keep everything else exactly the same and only swap the llm client. anthropic needs billing setup but openrouter is free so switch to that"
+
+**result:**
+the anthropic client got replaced with the openai sdk pointed at openrouters endpoint, tool calling format changed to match openai style since thats what openrouter uses. rest of the agent (memory, hook, tools) stayed untouched.
+
+---
+
+### getting a code review
+
+**prompt:**
+"act like a senior ai engineer reviewing my week 4 internship assignment. do a full code review on code quality, architecture, error handling, tool design, the logging hook, memory, llm integration, performance and internship readiness. dont redesign anything just improve it and give me a summary of what you changed and why at the end"
+
+**result:**
+got back a cleaned up version with better error handling for missing files and failed api calls, tools now return a consistent status field instead of random strings, the agent loop got split into smaller methods, and a big summary explaining every change and why it matters. also pointed out a few things it didnt change on purpose to keep things simple.
+
+---
+
+### asking about tool calling internals
+
+**prompt:**
+"does your agent actually use openrouters tool calling feature or is it just reading the text response and manually calling functions"
+
+**result:**
+confirmed its using real function calling through the tools parameter, not string parsing. showed me the exact lines where the model returns structured tool_calls and how the code reads tool_call.function.name and arguments instead of scanning the text.
+
+---
+
+### migrating brave to serpapi
+
+**prompt:**
+"modify my week4_agent notebook to replace brave search with serpapi. this is a migration not a rewrite so dont change anything else, keep the same function name and return format, load the serpapi key from a .env file, and give me a summary at the end of every file changed and every brave reference removed"
+
+**result:**
+web_search function still has the same name and same return shape (title, url, snippet) but its calling serpapi now instead of brave. api key loading switched to use python-dotenv. got a full changelog of what changed at the end like i asked.
+
+---
+
+### cleaning up the notebook formatting
+
+**prompt:**
+"review the whole notebook and only improve the formatting and readability, dont touch the logic or the apis or anything functional. remove emojis, fix the heading sizes, organize it into clear numbered sections, and add a short intro and conclusion. keep explanations short"
+
+**result:**
+notebook got reorganized into numbered sections like installation, configuration, memory, tools, demonstration etc. all the emoji checkmarks got removed and headings are consistent now. verified after that all the code cells are still exactly the same, only the markdown changed.
+
+---
+
+### checking my gitignore
+
+**prompt:**
+"is my gitignore enough for this project or am i missing something" (pasted my current .gitignore)
+
+**result:**
+said it was mostly fine but i was missing the generated sample files from the demo (sample_report.txt/pdf) and suggested adding those since they get recreated every run. also mentioned .idea/, build/, dist/ as optional extras.
+
+---
+
+### writing the readme section for week 4
+
+**prompt:**
+"generate only the week 4 section for my readme, dont touch the rest of it. needs a short overview, description of the files in the week4assignment folder, how to run it, mention that it asks for openrouter and serpapi keys at runtime, and a list of the features. keep it professional and no emojis"
+
+**result:**
+got a markdown block formatted the same as the week 2 and week 3 sections, ready to paste under week 3. also pointed out my env variables section at the bottom only mentions the openrouter key and i should probably add serpapi there too.
+
+
+# week 5 — model context protocol (mcp) and multi-agent systems
+
+---
+
+### understanding the assignment
+
+**prompt:**
+"these are my week 5 tasks. should i create separate notebooks or one notebook for everything? my mentor reviews notebooks."
+
+**result:**
+decided to implement the entire assignment in a single well-structured notebook with clear sections for the MCP server, client, supervisor, worker agents and tracing layer.
+
+---
+
+### generating the notebook
+
+**prompt:**
+"give me a prompt for claude to generate one notebook that implements my week 5 assignment. keep it concise because im using the free version."
+
+**result:**
+received a compact prompt instructing Claude to generate a single notebook implementing a custom MCP server, MCP client, supervisor–worker architecture and execution tracing.
+
+---
+
+### building the mcp server, client, agents and tracing in one notebook
+
+**prompt:**
+"Build a custom MCP server exposing one app resource and one tool. Connect the MCP server to a client (Claude Code or a custom client). Implement a supervisor + worker agent that routes tasks to ≥2 sub-agents. Add a tracing layer that logs every tool call across the agent graph. do all these in one single jupyter notebook"
+
+**result:**
+got a full notebook: a FastMCP server exposing one resource and one tool, a custom Python stdio client, a supervisor agent routing to three worker agents, and a tracing layer logging every MCP call, local tool call and routing decision. tested execution end to end before handing it back.
+
+---
+
+### reviewing the notebook
+
+**prompt:**
+"review this notebook and tell me if it satisfies all the assignment requirements."
+
+**result:**
+verified that the notebook covered the required tasks and suggested a few improvements for organization and documentation without changing the overall implementation.
+
+---
+
+### using the mcp python sdk
+
+**prompt:**
+"does this notebook use the python mcp sdk?"
+
+**result:**
+confirmed that the implementation uses the official MCP Python SDK for both the server and client while optionally using the Anthropic SDK for one worker agent.
+
+---
+
+### polishing notebook presentation
+
+**prompt:**
+"Review this Jupyter notebook and improve only its presentation, formatting, and documentation. Do NOT modify any Python code, logic, functionality, outputs, imports, or execution order. make it look like a polished internship submission"
+
+**result:**
+markdown cells were rewritten with a proper title, objective, requirements section and conclusion, checkmark emojis removed, headings made consistent, and short explanations added before each code section. code cells were left byte for byte identical, verified with a diff check before saving.
+
+---
+
+### removing the toc
+
+**prompt:**
+"remove toc"
+
+**result:**
+deleted the table of contents cell, left everything else untouched.
+
+---
+
+### formatting the notebook
+
+**prompt:**
+"give me a prompt to format the notebook documentation, remove the green check marks and make it professional for my mentor without changing any code."
+
+**result:**
+received a formatting prompt that improved headings, markdown, spacing and documentation while leaving the implementation unchanged.
+
+---
+
+### gitignore check
+
+**prompt:**
+"this is my current gitignore is there anything i need to add to this for my week 5 mcp assignment"
+
+**result:**
+got suggestions to add `.claude/`, `.mcp.json`, `trace_log.json`, `*.log`, `*.db`/`*.sqlite3` and `node_modules/`, plus a note not to accidentally ignore `uv.lock`/`poetry.lock`.
+
+---
+
+### debugging the windows fileno error
+
+**prompt:**
+pasted the full traceback from the mcp client connection cell, ending in "UnsupportedOperation: fileno"
+
+**result:**
+traced it to ipykernel's `sys.stderr` having no real `fileno()`, which breaks MCP's Windows subprocess fallback. fix was to pass `stdio_client` an `errlog` opened as a real file instead of the default `sys.stderr`.
+
+---
+
+### getting the full cell back
+
+**prompt:**
+"this is my previous one u removed the available tools and resources part"
+
+**result:**
+got the complete `connect_to_server` cell back with the `errlog` fix merged in, instead of just the isolated snippet.
+
+---
+
+### same error persisting
+
+**prompt:**
+pasted the same traceback again after applying the fix, still failing
+
+**result:**
+traceback showed the old code (no `errlog=`) was still what actually ran, pointed to stale cell/kernel state and asked for a kernel restart plus a full top-to-bottom rerun.
+
+---
+
+### step by step fix
+
+**prompt:**
+"what do i do?"
+
+**result:**
+got explicit click-by-click steps: replace the cell with the updated code, restart the kernel, then run all notebook cells from top to bottom.
+
+---
+
+### confirming the fix
+
+**prompt:**
+"ok it works now after these steps"
+
+**result:**
+confirmed the root cause (ipykernel's stderr has no `fileno()` on Windows) and that restarting the kernel was necessary for the updated code to take effect.
+
+---
+
+### project documentation
+
+**prompt:**
+"write a concise README section for my week 5 assignment including project overview, setup, run instructions, expected output and implemented features."
+
+**result:**
+created a professional README describing the project structure, execution steps, expected results and implemented MCP and multi-agent features.
+
+---
+
+### readme entry for week 5
+
+**prompt:**
+"give me markdown for week 5 just like i have done for rest of weeks give me only week 5 part so i can copy paste directly dont give me file"
+
+**result:**
+got a Week 5 section matching the style of previous weeks, including folder structure, setup, run instructions and expected output.
+
+---
+
+### making it about running, not explaining
+
+**prompt:**
+"markdown because this will go in .md file and make it more about how to run it instead of explanation need something brief"
+
+**result:**
+trimmed the section down to concise run instructions and expected output while keeping the formatting consistent with the rest of the README.
+
+---
+
+### updating gitignore
+
+**prompt:**
+"what should i add to my .gitignore for this mcp project, and should i keep trace_log.json in the repository?"
+
+**result:**
+updated the `.gitignore` to ignore local configuration, caches and databases while keeping `trace_log.json` tracked so the execution trace can be reviewed.
+
+---
+
+### git workflow
+
+**prompt:**
+"help me commit and push my week 5 assignment correctly after accidentally committing from inside the project folder."
+
+**result:**
+reset the local commit, recreated it from the repository root, verified the repository state and pushed the completed assignment with the correct history.
+
+---
+
+### pull request
+
+**prompt:**
+"give me a brief pull request description for my week 5 assignment."
+
+**result:**
+created a concise PR summary describing the MCP server, Python client, supervisor–worker architecture, execution tracing and documentation updates.
