@@ -102,7 +102,13 @@ def test_week6_pipeline_produces_grounded_report(buggy_repository: Path) -> None
     """
     repo = str(buggy_repository.resolve())
 
-    supervisor = Supervisor(config=Config.load())
+    # Keep this test static-only even when a local .env provides an
+    # OpenRouter key. Week 6 grounding coverage must stay deterministic.
+    config = Config.load()
+    config.openrouter_api_key = None
+    supervisor = Supervisor(config=config)
+    if supervisor.provider is not None:
+        supervisor.provider.api_key = None
     agent = supervisor.agents[AgentType.CODE_ANALYSIS]
     assert isinstance(agent, CodeAnalysisAgent)
 
