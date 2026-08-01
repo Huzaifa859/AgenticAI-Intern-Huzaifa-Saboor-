@@ -121,6 +121,7 @@ class Supervisor:
                 provider.model,
             )
         return provider
+
     def _init_agents(self) -> Dict[AgentType, BaseAgent]:
         """
         Construct and wire up the specialized agents.
@@ -134,8 +135,17 @@ class Supervisor:
             retriever=self.retriever,
             memory_store=self.memory_store,
         )
+        # CodeAnalysisAgent builds a per-repository Indexer under
+        # chroma/<repo-hash>/. Injecting the Supervisor's default
+        # Retriever would point retrieval at a different store than the
+        # agent just indexed, so leave retriever unset and let _bind()
+        # attach a Retriever to that Indexer.
         return {
-            AgentType.CODE_ANALYSIS: CodeAnalysisAgent(**shared_kwargs),
+            AgentType.CODE_ANALYSIS: CodeAnalysisAgent(
+                model_client=self.model_client,
+                tool_registry=self.tool_registry,
+                memory_store=self.memory_store,
+            ),
             AgentType.DOCUMENTATION: DocumentationAgent(**shared_kwargs),
             AgentType.TESTING: TestingAgent(**shared_kwargs),
         }

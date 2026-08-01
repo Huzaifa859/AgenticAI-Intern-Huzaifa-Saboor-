@@ -21,7 +21,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional at install time
+    load_dotenv = None  # type: ignore[assignment]
 
 
 def _env_str(name: str, default: str) -> str:
@@ -148,12 +154,12 @@ class Config:
     # --- Models (proposal: Tech Stack) --------------------------------
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: Optional[str] = None
-    openrouter_model: str = "anthropic/claude-3.5-sonnet"
-    claude_model: str = "anthropic/claude-3.5-sonnet"
+    openrouter_model: str = "anthropic/claude-sonnet-4"
+    claude_model: str = "anthropic/claude-sonnet-4"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
-    max_tokens: int = 4096
-    model_name: str = "anthropic/claude-3.5-sonnet"
+    max_tokens: int = 2048
+    model_name: str = "anthropic/claude-sonnet-4"
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -200,6 +206,13 @@ class Config:
         defaults and the environment overrides.
         """
         # TODO: load settings from `path` before applying env overrides
+        # Load local `.env` into os.environ (does not override existing
+        # vars). Credentials stay out of source; never logged here.
+        if load_dotenv is not None:
+            project_env = Path(__file__).resolve().parent.parent / ".env"
+            load_dotenv(project_env)
+            load_dotenv()
+
         defaults = cls()
         return cls(
             openrouter_api_key=_env_optional_str("OPENROUTER_API_KEY"),

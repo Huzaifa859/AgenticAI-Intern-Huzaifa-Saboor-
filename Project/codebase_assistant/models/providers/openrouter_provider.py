@@ -56,7 +56,7 @@ class OpenRouterProvider(BaseProvider):
 
     def __init__(
         self,
-        model: str = "anthropic/claude-3.5-sonnet",
+        model: str = "anthropic/claude-sonnet-4",
         api_key: Optional[str] = None,
         max_tokens: int = 4096,
         base_url: str = "https://openrouter.ai/api/v1",
