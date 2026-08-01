@@ -26,6 +26,7 @@ from .memory.conversation_memory import ConversationMemory
 from .memory.memory_store import MemoryStore
 from .models.model_client import LLMClient
 from .models.providers.base import BaseProvider
+from .models.providers.ollama_provider import OllamaProvider
 from .models.providers.openrouter_provider import OpenRouterProvider
 from .rag.indexer import Indexer
 from .rag.retriever import Retriever
@@ -54,14 +55,26 @@ class Supervisor:
         """
         self.config = config or Config.load()
 
-        # Shared model provider. One instance for the Supervisor and
-        # every agent that receives this model_client. Construction
+        # Shared OpenRouter provider for code analysis. Construction
         # failures never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
+        # Shared Ollama provider, kept separate for later Documentation
+        # Agent use. Not injected into CodeAnalysisAgent.
+        self.ollama_provider: Optional[BaseProvider] = self._init_ollama_provider()
         self.model_client = LLMClient(
             model_name=self.config.model_name,
             max_tokens=self.config.max_tokens,
             provider=self.provider,
+            config=self.config,
+        )
+        # Dedicated client for DocumentationAgent. Backed by Ollama and
+        # kept separate from the OpenRouter analysis client. May have
+        # provider=None when Ollama construction failed; that must not
+        # prevent Supervisor or DocumentationAgent construction.
+        self.ollama_model_client = LLMClient(
+            model_name=self.config.ollama_model,
+            max_tokens=self.config.max_tokens,
+            provider=self.ollama_provider,
             config=self.config,
         )
         self.tool_registry = ToolRegistry()
@@ -122,6 +135,50 @@ class Supervisor:
             )
         return provider
 
+    def _init_ollama_provider(self) -> Optional[BaseProvider]:
+        """
+        Construct the shared OllamaProvider from Config.
+
+        Held on the Supervisor for later Documentation Agent use. Not
+        injected into CodeAnalysisAgent. Construction or availability
+        failures never abort startup and never affect OpenRouter wiring.
+
+        Returns:
+            The OllamaProvider instance, or None if construction itself
+            failed.
+        """
+        try:
+            provider = OllamaProvider(
+                model=self.config.ollama_model,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.ollama_base_url,
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OllamaProvider initialization failed; continuing without "
+                "an Ollama provider: %s",
+                exc,
+            )
+            return None
+
+        logger.info(
+            "OllamaProvider initialized (model=%s, base_url=%s).",
+            provider.model,
+            provider.base_url,
+        )
+        if not provider.is_available():
+            logger.info(
+                "Ollama unavailable; Documentation Agent will not be able "
+                "to call a local model until Ollama is running."
+            )
+        else:
+            logger.info(
+                "Ollama available (model=%s).",
+                provider.model,
+            )
+        return provider
+
     def _init_agents(self) -> Dict[AgentType, BaseAgent]:
         """
         Construct and wire up the specialized agents.
@@ -129,25 +186,41 @@ class Supervisor:
         Returns:
             A mapping from AgentType to the corresponding agent instance.
         """
-        shared_kwargs = dict(
-            model_client=self.model_client,
-            tool_registry=self.tool_registry,
-            retriever=self.retriever,
-            memory_store=self.memory_store,
-        )
         # CodeAnalysisAgent builds a per-repository Indexer under
         # chroma/<repo-hash>/. Injecting the Supervisor's default
         # Retriever would point retrieval at a different store than the
         # agent just indexed, so leave retriever unset and let _bind()
         # attach a Retriever to that Indexer.
+        #
+        # DocumentationAgent receives the Ollama-backed client only;
+        # generation logic remains unimplemented.
+        documentation_agent = DocumentationAgent(
+            model_client=self.ollama_model_client,
+            tool_registry=self.tool_registry,
+            retriever=self.retriever,
+            memory_store=self.memory_store,
+        )
+        logger.info(
+            "DocumentationAgent received an Ollama-backed LLMClient "
+            "(provider=%s).",
+            type(self.ollama_provider).__name__
+            if self.ollama_provider is not None
+            else None,
+        )
+
         return {
             AgentType.CODE_ANALYSIS: CodeAnalysisAgent(
                 model_client=self.model_client,
                 tool_registry=self.tool_registry,
                 memory_store=self.memory_store,
             ),
-            AgentType.DOCUMENTATION: DocumentationAgent(**shared_kwargs),
-            AgentType.TESTING: TestingAgent(**shared_kwargs),
+            AgentType.DOCUMENTATION: documentation_agent,
+            AgentType.TESTING: TestingAgent(
+                model_client=self.model_client,
+                tool_registry=self.tool_registry,
+                retriever=self.retriever,
+                memory_store=self.memory_store,
+            ),
         }
 
     def handle_goal(self, goal: str) -> List[AgentResponse]:
