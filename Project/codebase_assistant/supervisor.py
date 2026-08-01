@@ -13,6 +13,7 @@ routing logic, and result aggregation.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Dict, List, Optional
 
@@ -24,12 +25,16 @@ from .config import Config
 from .memory.conversation_memory import ConversationMemory
 from .memory.memory_store import MemoryStore
 from .models.model_client import LLMClient
+from .models.providers.base import BaseProvider
+from .models.providers.openrouter_provider import OpenRouterProvider
 from .rag.indexer import Indexer
 from .rag.retriever import Retriever
 from .schemas.schemas import AgentRequest, AgentResponse, AgentType
 from .tools.filesystem_tools import FilesystemTools
 from .tools.github_tools import GitHubTools
 from .tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class Supervisor:
@@ -49,10 +54,15 @@ class Supervisor:
         """
         self.config = config or Config.load()
 
-        # Shared subsystems.
+        # Shared model provider. One instance for the Supervisor and
+        # every agent that receives this model_client. Construction
+        # failures never abort startup; static-only mode still works.
+        self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
         self.model_client = LLMClient(
             model_name=self.config.model_name,
             max_tokens=self.config.max_tokens,
+            provider=self.provider,
+            config=self.config,
         )
         self.tool_registry = ToolRegistry()
         self.indexer = Indexer(vector_store_path=self.config.vector_store_path)
@@ -70,6 +80,47 @@ class Supervisor:
         # TODO: register GitHub/Filesystem tool methods into self.tool_registry
         # TODO: register MCP-based tools once MCP integration is implemented
 
+    def _init_openrouter_provider(self) -> Optional[BaseProvider]:
+        """
+        Construct the shared OpenRouterProvider from Config.
+
+        A missing API key or probe failure does not prevent construction;
+        the provider simply reports itself unavailable. Only unexpected
+        construction errors are swallowed so Supervisor startup never
+        crashes because of the model layer.
+
+        Returns:
+            The OpenRouterProvider instance, or None if construction
+            itself failed.
+        """
+        try:
+            provider = OpenRouterProvider(
+                model=self.config.openrouter_model or self.config.claude_model,
+                api_key=self.config.openrouter_api_key,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.openrouter_base_url,
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OpenRouterProvider initialization failed; continuing without "
+                "a model provider: %s",
+                exc,
+            )
+            return None
+
+        if not provider.is_available():
+            logger.info(
+                "OpenRouterProvider is configured but unavailable; "
+                "analysis will run in static-only mode until a valid "
+                "OPENROUTER_API_KEY and network path are present."
+            )
+        else:
+            logger.info(
+                "OpenRouterProvider is available (model=%s).",
+                provider.model,
+            )
+        return provider
     def _init_agents(self) -> Dict[AgentType, BaseAgent]:
         """
         Construct and wire up the specialized agents.
