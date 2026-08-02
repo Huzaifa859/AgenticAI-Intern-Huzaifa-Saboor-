@@ -2,18 +2,24 @@
 app/main.py
 ===========
 
-Interactive multi-agent CLI for the Codebase Assistant.
+Primary CLI for the Codebase Assistant.
 
 Run from the project root (the directory containing both `app/` and
 `codebase_assistant/`):
 
+    python app/main.py
     python app/main.py /path/to/repository
     python app/main.py . --question "Find security bugs"
     python app/main.py https://github.com/pallets/flask
+    python app/main.py . --agent analysis
+    python app/main.py . --agent documentation
+    python app/main.py . --agent testing
+    python app/main.py . --agent all
 
-The repository (local path or GitHub URL) is prepared once. The CLI then
-loops a menu that dispatches to the existing CodeAnalysisAgent,
-DocumentationAgent, or TestingAgent without merging their logic.
+Without ``--agent``, the repository is prepared once and an interactive
+menu dispatches to Code Analysis, Documentation, or Testing. With
+``--agent``, the chosen agent (or all three) runs once and the process
+exits.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import stat
 import sys
 import tempfile
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 # This file lives in `app/`, one level below the project root, but it is
@@ -67,6 +73,9 @@ _CLONE_CACHE: Dict[str, str] = {}
 #: Temporary directories holding those clones, removed on exit.
 _TEMPORARY_ROOTS: List[str] = []
 
+#: Non-interactive ``--agent`` values and their meanings.
+_AGENT_CHOICES = ("analysis", "documentation", "testing", "all")
+
 MENU_TEXT = """\
 =================================
 Select an agent
@@ -83,17 +92,32 @@ Select an agent
 Choice: """
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
-    Parse command-line arguments for the interactive CLI.
+    Parse command-line arguments for the CLI.
+
+    Args:
+        argv: Optional argument list. Defaults to ``sys.argv[1:]``.
 
     Returns:
-        Parsed arguments with an optional repository path and question.
+        Parsed arguments with an optional repository path, question,
+        and agent selection.
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Interactive Codebase Assistant CLI. Prepare a repository once, "
-            "then choose Code Analysis, Documentation, or Testing agents."
+            "Codebase Assistant CLI. Prepare a repository, then run agents "
+            "interactively or once via --agent."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python app/main.py\n"
+            "  python app/main.py . --agent analysis\n"
+            "  python app/main.py . --agent documentation\n"
+            "  python app/main.py . --agent testing\n"
+            "  python app/main.py . --agent all\n"
+            "  python app/main.py . --agent analysis --question "
+            '"Find security bugs"\n'
         ),
     )
     parser.add_argument(
@@ -103,6 +127,16 @@ def parse_args() -> argparse.Namespace:
             "Local path or GitHub HTTPS URL of the repository. "
             "A URL is cloned to a temporary directory and removed on exit. "
             "If omitted, you will be prompted."
+        ),
+    )
+    parser.add_argument(
+        "--agent",
+        "-a",
+        choices=_AGENT_CHOICES,
+        default=None,
+        help=(
+            "Run one agent (or all) non-interactively and exit. "
+            "Omit this flag to keep the interactive menu."
         ),
     )
     parser.add_argument(
@@ -122,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable ANSI color output.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def read_repository_reference(raw_reference: Optional[str]) -> str:
@@ -378,8 +412,22 @@ def run_documentation_agent(
         print(response.output)
 
 
-def run_testing_agent(agent: TestingAgent, repository_path: str) -> None:
-    """Run the existing TestingAgent and print its result."""
+def run_testing_agent(
+    agent: TestingAgent,
+    repository_path: str,
+    *,
+    interactive: bool = True,
+) -> None:
+    """
+    Run the existing TestingAgent and print its result.
+
+    Args:
+        agent: Testing agent instance.
+        repository_path: Repository to generate tests for.
+        interactive: When True, optionally prompt to view generated
+            source. When False (``--agent`` mode), print the summary
+            only so the CLI never blocks on stdin.
+    """
     print(f"\nRunning Testing Agent on {repository_path} ...")
     response = agent.handle(
         AgentRequest(
@@ -409,10 +457,44 @@ def run_testing_agent(agent: TestingAgent, repository_path: str) -> None:
         return
 
     print_testing_result(response.output, include_source=False)
-    if response.output.generated_tests and ask_yes_no(
-        "View generated test source? (y/n): "
+    if (
+        interactive
+        and response.output.generated_tests
+        and ask_yes_no("View generated test source? (y/n): ")
     ):
         print_testing_result(response.output, include_source=True)
+
+
+def resolve_agents(
+    supervisor: Supervisor,
+) -> Tuple[CodeAnalysisAgent, DocumentationAgent, TestingAgent]:
+    """
+    Pull the three concrete agents out of the Supervisor.
+
+    Args:
+        supervisor: Wired Supervisor holding the agents.
+
+    Returns:
+        The Code Analysis, Documentation, and Testing agents.
+
+    Raises:
+        SystemExit: If any expected agent is missing or mistyped.
+    """
+    analysis_agent = supervisor.agents[AgentType.CODE_ANALYSIS]
+    documentation_agent = supervisor.agents[AgentType.DOCUMENTATION]
+    testing_agent = supervisor.agents[AgentType.TESTING]
+
+    if not isinstance(analysis_agent, CodeAnalysisAgent):
+        print("Error: Code Analysis Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(documentation_agent, DocumentationAgent):
+        print("Error: Documentation Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(testing_agent, TestingAgent):
+        print("Error: Testing Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+
+    return analysis_agent, documentation_agent, testing_agent
 
 
 def interactive_loop(
@@ -430,19 +512,9 @@ def interactive_loop(
         question: Default analysis question.
         color: Color override for the analysis report.
     """
-    analysis_agent = supervisor.agents[AgentType.CODE_ANALYSIS]
-    documentation_agent = supervisor.agents[AgentType.DOCUMENTATION]
-    testing_agent = supervisor.agents[AgentType.TESTING]
-
-    if not isinstance(analysis_agent, CodeAnalysisAgent):
-        print("Error: Code Analysis Agent is not available.", file=sys.stderr)
-        raise SystemExit(1)
-    if not isinstance(documentation_agent, DocumentationAgent):
-        print("Error: Documentation Agent is not available.", file=sys.stderr)
-        raise SystemExit(1)
-    if not isinstance(testing_agent, TestingAgent):
-        print("Error: Testing Agent is not available.", file=sys.stderr)
-        raise SystemExit(1)
+    analysis_agent, documentation_agent, testing_agent = resolve_agents(
+        supervisor
+    )
 
     print(f"\nRepository ready: {repository_path}")
 
@@ -479,13 +551,65 @@ def interactive_loop(
         print("Invalid selection. Please choose 1-4.")
 
 
-def main() -> None:
+def run_noninteractive(
+    supervisor: Supervisor,
+    repository_path: str,
+    agent: str,
+    question: str,
+    color: Optional[bool],
+) -> None:
     """
-    Prepare one repository, then dispatch to agents from an interactive menu.
+    Run one agent (or all three) once and return.
 
-    Temporary GitHub clones are cleaned up when the process exits.
+    Args:
+        supervisor: Wired Supervisor holding the three agents.
+        repository_path: Prepared local repository path.
+        agent: One of ``analysis``, ``documentation``, ``testing``,
+            or ``all``.
+        question: Analysis question used when Code Analysis runs.
+        color: Color override for the analysis report.
     """
-    args = parse_args()
+    analysis_agent, documentation_agent, testing_agent = resolve_agents(
+        supervisor
+    )
+    selected = (
+        ("analysis", "documentation", "testing")
+        if agent == "all"
+        else (agent,)
+    )
+
+    print(f"\nRepository ready: {repository_path}")
+    print(f"Running agent(s): {', '.join(selected)}")
+
+    for name in selected:
+        try:
+            if name == "analysis":
+                run_code_analysis(
+                    analysis_agent, repository_path, question, color
+                )
+            elif name == "documentation":
+                run_documentation_agent(documentation_agent, repository_path)
+            else:
+                run_testing_agent(
+                    testing_agent, repository_path, interactive=False
+                )
+        except Exception as exc:
+            print(f"{name} agent error:\n  - {exc}")
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """
+    Prepare one repository, then run agents interactively or once.
+
+    Without ``--agent``, the interactive menu is used. With ``--agent``,
+    the selected agent runs once and the process exits. Temporary GitHub
+    clones are cleaned up when the process exits.
+
+    Args:
+        argv: Optional argument list for tests. Defaults to
+            ``sys.argv[1:]``.
+    """
+    args = parse_args(argv)
     reference = read_repository_reference(args.repository)
 
     color: Optional[bool] = None
@@ -499,7 +623,18 @@ def main() -> None:
     repository_path = prepare_repository(supervisor, reference)
 
     try:
-        interactive_loop(supervisor, repository_path, args.question, color)
+        if args.agent:
+            run_noninteractive(
+                supervisor,
+                repository_path,
+                args.agent,
+                args.question,
+                color,
+            )
+        else:
+            interactive_loop(
+                supervisor, repository_path, args.question, color
+            )
     finally:
         cleanup_temporary_clones()
 

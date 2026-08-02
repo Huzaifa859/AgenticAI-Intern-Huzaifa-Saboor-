@@ -116,7 +116,13 @@ class Supervisor:
         self.indexer = Indexer(vector_store_path=self.config.vector_store_path)
         self.retriever = Retriever(vector_store_path=self.config.vector_store_path)
         self.memory_store = MemoryStore(storage_path=self.config.memory_store_path)
-        self.conversation_memory = ConversationMemory()
+        # Short-term session history. Uses the OpenRouter-backed client
+        # for summarization and the shared MemoryStore so conversations
+        # reload across runs.
+        self.conversation_memory = ConversationMemory(
+            model_client=self.model_client,
+            memory_store=self.memory_store,
+        )
 
         # Tools.
         self.github_tools = GitHubTools(token=self.config.github_token)
