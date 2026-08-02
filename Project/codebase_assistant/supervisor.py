@@ -16,10 +16,11 @@ TODO: Replace keyword routing with LLM-driven task decomposition.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import uuid
-from typing import Dict, List, Optional, Pattern, Tuple
+from typing import Callable, Dict, List, Optional, Pattern, Tuple
 
 from .agents.base import BaseAgent
 from .agents.code_analysis_agent import CodeAnalysisAgent
@@ -120,12 +121,64 @@ class Supervisor:
         # Tools.
         self.github_tools = GitHubTools(token=self.config.github_token)
         self.filesystem_tools = FilesystemTools(workspace_root=self.config.workspace_root)
+        self._register_tools()
 
         # Agents.
         self.agents: Dict[AgentType, BaseAgent] = self._init_agents()
 
-        # TODO: register GitHub/Filesystem tool methods into self.tool_registry
         # TODO: register MCP-based tools once MCP integration is implemented
+
+    def _register_tools(self) -> None:
+        """
+        Expose the shared tool instances through the ToolRegistry.
+
+        Bound methods of the already-constructed FilesystemTools and
+        GitHubTools are registered, so the registry is a lookup table
+        over the existing instances rather than a second implementation.
+        Names are namespaced (`filesystem.read_file`, `github.clone_repository`)
+        because both classes expose similarly named operations.
+
+        A tool that is already registered is skipped with a warning:
+        double registration is a wiring mistake, not a reason to abort
+        Supervisor startup.
+        """
+        for namespace, instance in (
+            ("filesystem", self.filesystem_tools),
+            ("github", self.github_tools),
+        ):
+            for name, handler in self._public_methods(instance):
+                qualified = f"{namespace}.{name}"
+                try:
+                    self.tool_registry.register_tool(qualified, handler)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("Could not register tool %s: %s", qualified, exc)
+
+        registered = self.tool_registry.list_tools()
+        logger.info(
+            "Registered %d tool(s) in the ToolRegistry: %s",
+            len(registered),
+            ", ".join(registered),
+        )
+
+    @staticmethod
+    def _public_methods(instance: object) -> List[Tuple[str, Callable[..., object]]]:
+        """
+        Collect the public callables a tool instance exposes.
+
+        Args:
+            instance: Tool instance to introspect.
+
+        Returns:
+            (name, bound callable) pairs for every public method, sorted
+            by name. Underscore-prefixed helpers are internal to the tool
+            and stay out of the registry.
+        """
+        return [
+            (name, member)
+            for name, member in inspect.getmembers(instance)
+            if not name.startswith("_")
+            and (inspect.ismethod(member) or inspect.isfunction(member))
+        ]
 
     def _init_openrouter_provider(self) -> Optional[BaseProvider]:
         """

@@ -1304,8 +1304,8 @@ class CodeAnalysisAgent(BaseAgent):
         if cached is not None:
             return cached
 
-        filesystem = self._filesystem or FilesystemTools(
-            workspace_root=root, config=self.config
+        filesystem = self._filesystem or self._filesystem_tools(
+            root, config=self.config
         )
         pipeline = _Pipeline(
             root=root,

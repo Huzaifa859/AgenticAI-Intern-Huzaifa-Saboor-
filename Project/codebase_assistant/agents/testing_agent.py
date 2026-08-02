@@ -6,7 +6,8 @@ Defines TestingAgent, responsible for generating unit tests, estimating
 coverage, and suggesting testing strategies for a codebase.
 
 Uses the injected OpenRouter-backed LLMClient, Retriever for RAG
-context, and FilesystemTools for reading repository source.
+context, and ToolRegistry-resolved FilesystemTools for reading
+repository source.
 """
 
 from __future__ import annotations
@@ -324,7 +325,7 @@ class TestingAgent(BaseAgent):
         chunks = self._retrieve_context(query, target_path)
 
         logger.info("Reading repository...")
-        filesystem = FilesystemTools(workspace_root=workspace)
+        filesystem = self._filesystem_tools(workspace)
         source_excerpts = self._read_repository_sources(
             filesystem,
             target_path,

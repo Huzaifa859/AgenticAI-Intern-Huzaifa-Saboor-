@@ -6,7 +6,7 @@ Defines DocumentationAgent, responsible for generating and updating
 documentation (docstrings, README sections, API docs) for a codebase.
 
 Uses the injected Ollama-backed LLMClient, Retriever for RAG context,
-and FilesystemTools for reading repository source.
+and ToolRegistry-resolved FilesystemTools for reading repository source.
 """
 
 from __future__ import annotations
@@ -426,7 +426,7 @@ class DocumentationAgent(BaseAgent):
         chunks = self._retrieve_context(query, target_path)
 
         logger.info("Reading repository...")
-        filesystem = FilesystemTools(workspace_root=workspace)
+        filesystem = self._filesystem_tools(workspace)
         # Repository-wide modes need the file listing to describe layout,
         # so they keep it even when retrieval already returned chunks.
         repository_wide = mode == "readme"
