@@ -278,9 +278,12 @@ class Supervisor:
                 to the configured workspace root.
 
         Returns:
-            One AgentResponse per selected agent, in execution order. An
-            agent that raises is reported as a failed AgentResponse so a
-            single failure never discards the other results.
+            One AgentResponse per selected agent, in execution order.
+            Responses are aggregated verbatim: each agent's own success,
+            output, and errors are passed through untouched. A failing
+            agent is recorded as a failed response and the remaining
+            agents still run, so a partial pipeline still returns every
+            result it managed to produce.
         """
         target = str(repo_path or self.config.workspace_root or ".")
         agent_types = self._select_agent_types(goal)
@@ -295,20 +298,64 @@ class Supervisor:
         for agent_type in agent_types:
             request = self._build_request(agent_type, goal, target)
             logger.info("Dispatching %s for goal.", agent_type.value)
-            try:
-                responses.append(self.dispatch(request))
-            except Exception as exc:
-                logger.warning("%s failed while handling the goal: %s", agent_type.value, exc)
-                responses.append(
-                    AgentResponse(
-                        task_id=request.task_id,
-                        agent_type=agent_type,
-                        success=False,
-                        output=None,
-                        errors=[str(exc)],
-                    )
+            response = self._dispatch_safely(request)
+            if not response.success:
+                logger.warning(
+                    "%s reported failure; continuing with the remaining agents.",
+                    agent_type.value,
                 )
+            responses.append(response)
+
+        self._log_aggregate(responses)
         return responses
+
+    @staticmethod
+    def _log_aggregate(responses: List[AgentResponse]) -> None:
+        """
+        Log the outcome of an aggregated multi-agent run.
+
+        Args:
+            responses: The collected responses, in execution order.
+        """
+        succeeded = [r.agent_type.value for r in responses if r.success]
+        failed = [r.agent_type.value for r in responses if not r.success]
+        logger.info(
+            "Goal complete: %d/%d agent(s) succeeded (ok: %s; failed: %s).",
+            len(succeeded),
+            len(responses),
+            ", ".join(succeeded) or "none",
+            ", ".join(failed) or "none",
+        )
+
+    def _dispatch_safely(self, request: AgentRequest) -> AgentResponse:
+        """
+        Dispatch one request, converting a raised error into a response.
+
+        Orchestration reports failures as data so one broken agent never
+        discards the results of the others or aborts the caller.
+
+        Args:
+            request: The request to dispatch.
+
+        Returns:
+            The agent's AgentResponse, or a failed AgentResponse
+            describing the exception it raised.
+        """
+        try:
+            return self.dispatch(request)
+        except Exception as exc:
+            logger.warning(
+                "%s failed while handling a request: %s",
+                request.agent_type.value,
+                exc,
+            )
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=request.agent_type,
+                success=False,
+                output=None,
+                errors=[str(exc)],
+            )
 
     def _select_agent_types(self, goal: str) -> List[AgentType]:
         """
@@ -338,11 +385,11 @@ class Supervisor:
         self, agent_type: AgentType, goal: str, repo_path: str
     ) -> AgentRequest:
         """
-        Build the AgentRequest for one agent selected by a goal.
+        Build the AgentRequest for one agent selected by a goal or task.
 
         Args:
             agent_type: Agent the request is for.
-            goal: The original user goal, passed through as the
+            goal: The original goal or task name, passed through as the
                 instruction so agents keep their own interpretation.
             repo_path: Repository to operate on.
 
@@ -409,22 +456,81 @@ class Supervisor:
             return AgentType.DOCUMENTATION
         return AgentType.CODE_ANALYSIS
 
-    def handle_task(self, task_name: str, repo_path: str) -> Dict[str, str]:
+    def handle_task(self, task_name: str, repo_path: str) -> AgentResponse:
         """
-        Route a task to the appropriate agent's simple `run` method and
-        return its (currently fake) result.
+        Route one task to the real pipeline of the matching agent.
+
+        The task name selects an agent by keyword and is passed through
+        as the instruction, so the agent runs its full `handle()`
+        pipeline (retrieval, prompting, grounding) rather than the
+        placeholder `run()` entry point.
 
         Args:
             task_name: Name/description of the task, used for routing.
             repo_path: Path to the repository the agent should operate on.
 
         Returns:
-            A dict with "status" and "message" keys produced by the
-            selected agent.
+            The AgentResponse produced by the selected agent. A task name
+            matching no agent returns a failed AgentResponse naming the
+            supported task types; nothing is raised.
         """
-        agent_type = self.route_task(task_name)
-        agent = self.agents[agent_type]
-        return agent.run(repo_path)
+        agent_type = self._route_task_strict(task_name)
+        if agent_type is None:
+            return self._unknown_task_response(task_name)
+
+        target = str(repo_path or self.config.workspace_root or ".")
+        request = self._build_request(agent_type, task_name, target)
+        logger.info("Dispatching %s for task %r.", agent_type.value, task_name)
+        return self._dispatch_safely(request)
+
+    @staticmethod
+    def _route_task_strict(task_name: str) -> Optional[AgentType]:
+        """
+        Route a task name to one agent, or to nothing when unrecognized.
+
+        Unlike `route_task`, which treats code analysis as a catch-all,
+        this reports an unmatched task so the caller can explain what it
+        supports instead of silently running the wrong pipeline. A name
+        mentioning several agents takes the earliest in pipeline order.
+
+        Args:
+            task_name: Name/description of the task.
+
+        Returns:
+            The matching AgentType, or None when no keyword matches.
+        """
+        normalized = (task_name or "").lower()
+        for agent_type, pattern in _GOAL_KEYWORDS:
+            if pattern.search(normalized):
+                return agent_type
+        return None
+
+    def _unknown_task_response(self, task_name: str) -> AgentResponse:
+        """
+        Build the failed response for a task that matched no agent.
+
+        Args:
+            task_name: The unrecognized task name.
+
+        Returns:
+            A failed AgentResponse naming the supported task types.
+        """
+        logger.warning("Task %r matched no agent; returning a failed response.", task_name)
+        # AgentType has no "none" member and schemas are fixed, so the
+        # response is attributed to the codebase-wide default agent. The
+        # failure itself is carried by success=False and errors.
+        return AgentResponse(
+            task_id=self.new_task_id(),
+            agent_type=AgentType.CODE_ANALYSIS,
+            success=False,
+            output=None,
+            errors=[
+                f"Unknown task {task_name!r}. Supported tasks mention "
+                f"analysis (analyze, review, bugs), documentation "
+                f"(document, readme, docstrings), or testing (tests, "
+                f"pytest, coverage)."
+            ],
+        )
 
     def dispatch(self, request: AgentRequest) -> AgentResponse:
         """

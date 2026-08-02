@@ -2,7 +2,8 @@
 test_supervisor_goals.py
 =========================
 
-Unit tests for Supervisor.handle_goal() keyword routing.
+Unit tests for Supervisor goal and task routing: handle_goal() keyword
+routing and handle_task() dispatch into the real agent pipelines.
 
 Providers, RAG subsystems, and the agents themselves are replaced with
 mocks, so these tests exercise routing, ordering, and aggregation only.
@@ -172,6 +173,172 @@ def test_failing_agent_does_not_discard_other_results(
     assert by_type[AgentType.TESTING].success is True
     assert by_type[AgentType.DOCUMENTATION].success is False
     assert "documentation exploded" in by_type[AgentType.DOCUMENTATION].errors[0]
+
+
+def _failing_agent(agent_type: AgentType, error: str) -> MagicMock:
+    """Agent that reports failure as data rather than raising."""
+    agent = MagicMock()
+    agent.handle.side_effect = lambda request: AgentResponse(
+        task_id=request.task_id,
+        agent_type=agent_type,
+        success=False,
+        output=None,
+        errors=[error],
+    )
+    return agent
+
+
+def test_aggregates_two_responses_for_analyze_and_document(
+    supervisor: Supervisor,
+) -> None:
+    """analyze + documentation should aggregate exactly two responses."""
+    responses = supervisor.handle_goal("analyze and document", "repo")
+
+    assert len(responses) == 2
+    assert [response.agent_type for response in responses] == [
+        AgentType.CODE_ANALYSIS,
+        AgentType.DOCUMENTATION,
+    ]
+    assert all(response.success for response in responses)
+
+
+def test_aggregates_three_responses_for_the_full_pipeline(
+    supervisor: Supervisor,
+) -> None:
+    """All three agents should produce three ordered responses."""
+    responses = supervisor.handle_goal("analyze, document and generate tests", "repo")
+
+    assert len(responses) == 3
+    assert [response.agent_type for response in responses] == ORDER
+
+
+def test_documentation_failure_still_returns_testing_success(
+    supervisor: Supervisor,
+) -> None:
+    """A failed agent must not stop or discard the agents after it."""
+    supervisor.agents[AgentType.DOCUMENTATION] = _failing_agent(
+        AgentType.DOCUMENTATION, "documentation produced an empty summary"
+    )
+
+    responses = supervisor.handle_goal("document and generate tests", "repo")
+
+    assert [response.agent_type for response in responses] == [
+        AgentType.DOCUMENTATION,
+        AgentType.TESTING,
+    ]
+    documentation, testing = responses
+    assert documentation.success is False
+    assert documentation.errors == ["documentation produced an empty summary"]
+    assert testing.success is True
+    supervisor.agents[AgentType.TESTING].handle.assert_called_once()
+
+
+def test_aggregation_preserves_each_response_verbatim(
+    supervisor: Supervisor,
+) -> None:
+    """success, output, and errors must survive aggregation untouched."""
+    payload = {"findings": ["one"]}
+    supervisor.agents[AgentType.CODE_ANALYSIS].handle.side_effect = (
+        lambda request: AgentResponse(
+            task_id=request.task_id,
+            agent_type=AgentType.CODE_ANALYSIS,
+            success=True,
+            output=payload,
+            errors=["degraded: model unavailable"],
+        )
+    )
+
+    analysis = supervisor.handle_goal("analyze and document", "repo")[0]
+
+    assert analysis.success is True
+    assert analysis.output is payload
+    assert analysis.errors == ["degraded: model unavailable"]
+
+
+def test_every_selected_agent_runs_even_when_the_first_fails(
+    supervisor: Supervisor,
+) -> None:
+    """A failure in the first agent must not skip the rest of the pipeline."""
+    supervisor.agents[AgentType.CODE_ANALYSIS] = _failing_agent(
+        AgentType.CODE_ANALYSIS, "analysis failed"
+    )
+
+    responses = supervisor.handle_goal("analyze, document and test", "repo")
+
+    assert [response.success for response in responses] == [False, True, True]
+    for agent_type in ORDER:
+        supervisor.agents[agent_type].handle.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("task_name", "expected"),
+    [
+        ("analysis", AgentType.CODE_ANALYSIS),
+        ("analyze the repository", AgentType.CODE_ANALYSIS),
+        ("find bugs", AgentType.CODE_ANALYSIS),
+        ("documentation", AgentType.DOCUMENTATION),
+        ("generate a readme", AgentType.DOCUMENTATION),
+        ("testing", AgentType.TESTING),
+        ("write unit tests", AgentType.TESTING),
+    ],
+)
+def test_handle_task_routes_to_the_real_agent_pipeline(
+    supervisor: Supervisor, task_name: str, expected: AgentType
+) -> None:
+    """Each task name should reach the matching agent's handle()."""
+    response = supervisor.handle_task(task_name, "repo")
+
+    assert response.agent_type == expected
+    assert response.success is True
+    supervisor.agents[expected].handle.assert_called_once()
+    # The placeholder entry point must no longer be used.
+    supervisor.agents[expected].run.assert_not_called()
+
+
+def test_handle_task_passes_the_repository_and_instruction(
+    supervisor: Supervisor,
+) -> None:
+    """The dispatched request should carry the task name and repository."""
+    supervisor.handle_task("generate documentation", "/tmp/demo-repo")
+
+    request = supervisor.agents[AgentType.DOCUMENTATION].handle.call_args.args[0]
+    assert request.instruction == "generate documentation"
+    assert request.context["repo_path"] == "/tmp/demo-repo"
+    assert request.context["doc_type"] == "readme"
+
+
+def test_handle_task_returns_failed_response_for_unknown_task(
+    supervisor: Supervisor,
+) -> None:
+    """An unrecognized task should fail as data, never as an exception."""
+    response = supervisor.handle_task("deploy to production", "repo")
+
+    assert response.success is False
+    assert response.output is None
+    assert "Unknown task" in response.errors[0]
+    assert "documentation" in response.errors[0]
+    for agent in supervisor.agents.values():
+        agent.handle.assert_not_called()
+
+
+def test_handle_task_reports_agent_exceptions_as_failed_response(
+    supervisor: Supervisor,
+) -> None:
+    """A raising agent should be reported, not propagated."""
+    supervisor.agents[AgentType.TESTING].handle.side_effect = RuntimeError("boom")
+
+    response = supervisor.handle_task("write tests", "repo")
+
+    assert response.success is False
+    assert "boom" in response.errors[0]
+
+
+def test_handle_task_defaults_to_workspace_root(supervisor: Supervisor) -> None:
+    """An empty repository path should fall back to the configured root."""
+    supervisor.handle_task("analyze this repository", "")
+
+    request = supervisor.agents[AgentType.CODE_ANALYSIS].handle.call_args.args[0]
+    assert request.context["repo_path"] == str(supervisor.config.workspace_root)
 
 
 def test_repo_path_defaults_to_workspace_root(supervisor: Supervisor) -> None:
