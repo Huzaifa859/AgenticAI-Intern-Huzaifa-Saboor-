@@ -7,15 +7,19 @@ Assistant. The Supervisor receives high-level user goals, breaks them
 down into tasks, routes those tasks to the appropriate specialized
 agent (Code Analysis, Documentation, Testing), and aggregates results.
 
-TODO: Implement real task planning/decomposition (likely LLM-driven),
-routing logic, and result aggregation.
+Goal routing is deterministic keyword matching: a goal selects one or
+more agents, which always run in pipeline order (code analysis →
+documentation → testing).
+
+TODO: Replace keyword routing with LLM-driven task decomposition.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Pattern, Tuple
 
 from .agents.base import BaseAgent
 from .agents.code_analysis_agent import CodeAnalysisAgent
@@ -36,6 +40,36 @@ from .tools.github_tools import GitHubTools
 from .tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+#: Goal keywords that select each agent, listed in execution order:
+#: code analysis, then documentation, then testing. Matching is on whole
+#: words so "latest" does not select testing and "documented" does.
+_GOAL_KEYWORDS: List[Tuple[AgentType, Pattern[str]]] = [
+    (
+        AgentType.CODE_ANALYSIS,
+        re.compile(
+            r"\b(analy[sz]e[sd]?|analy[sz]ing|analysis|review|inspect|"
+            r"examine|audit|bugs?|smells?|complexity|quality|security|lint)\b"
+        ),
+    ),
+    (
+        AgentType.DOCUMENTATION,
+        re.compile(
+            r"\b(document|documents|documented|documenting|documentation|"
+            r"docs?|docstrings?|readme|api reference)\b"
+        ),
+    ),
+    (
+        AgentType.TESTING,
+        re.compile(
+            r"\b(test|tests|tested|testing|pytest|unittest|unit tests?|coverage)\b"
+        ),
+    ),
+]
+
+#: Narrower documentation wordings, checked before defaulting to README.
+_DOCSTRING_PATTERN = re.compile(r"\bdocstrings?\b")
+_API_REFERENCE_PATTERN = re.compile(r"\b(api reference|api docs?)\b")
 
 
 class Supervisor:
@@ -58,8 +92,8 @@ class Supervisor:
         # Shared OpenRouter provider for code analysis. Construction
         # failures never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
-        # Shared Ollama provider, kept separate for later Documentation
-        # Agent use. Not injected into CodeAnalysisAgent.
+        # Shared Ollama provider, kept for local-model experiments. Not
+        # injected into any agent.
         self.ollama_provider: Optional[BaseProvider] = self._init_ollama_provider()
         self.model_client = LLMClient(
             model_name=self.config.model_name,
@@ -67,10 +101,10 @@ class Supervisor:
             provider=self.provider,
             config=self.config,
         )
-        # Dedicated client for DocumentationAgent. Backed by Ollama and
-        # kept separate from the OpenRouter analysis client. May have
-        # provider=None when Ollama construction failed; that must not
-        # prevent Supervisor or DocumentationAgent construction.
+        # Local-model client kept separate from the OpenRouter client. No
+        # agent is wired to it by default. May have provider=None when
+        # Ollama construction failed; that must not prevent Supervisor
+        # construction.
         self.ollama_model_client = LLMClient(
             model_name=self.config.ollama_model,
             max_tokens=self.config.max_tokens,
@@ -139,9 +173,9 @@ class Supervisor:
         """
         Construct the shared OllamaProvider from Config.
 
-        Held on the Supervisor for later Documentation Agent use. Not
-        injected into CodeAnalysisAgent. Construction or availability
-        failures never abort startup and never affect OpenRouter wiring.
+        Held on the Supervisor for local-model experiments. Not injected
+        into any agent. Construction or availability failures never abort
+        startup and never affect OpenRouter wiring.
 
         Returns:
             The OllamaProvider instance, or None if construction itself
@@ -169,8 +203,8 @@ class Supervisor:
         )
         if not provider.is_available():
             logger.info(
-                "Ollama unavailable; Documentation Agent will not be able "
-                "to call a local model until Ollama is running."
+                "Ollama unavailable; local-model calls will fail until "
+                "Ollama is running."
             )
         else:
             logger.info(
@@ -192,20 +226,20 @@ class Supervisor:
         # agent just indexed, so leave retriever unset and let _bind()
         # attach a Retriever to that Indexer.
         #
-        # DocumentationAgent receives the Ollama-backed client only;
-        # generation logic remains unimplemented.
+        # DocumentationAgent uses the OpenRouter-backed client: repository
+        # documentation needs longer, better-structured prose than the
+        # local model produced. `ollama_model_client` stays available on
+        # the Supervisor for local-model experiments.
         documentation_agent = DocumentationAgent(
-            model_client=self.ollama_model_client,
+            model_client=self.model_client,
             tool_registry=self.tool_registry,
             retriever=self.retriever,
             memory_store=self.memory_store,
         )
         logger.info(
-            "DocumentationAgent received an Ollama-backed LLMClient "
+            "DocumentationAgent received an OpenRouter-backed LLMClient "
             "(provider=%s).",
-            type(self.ollama_provider).__name__
-            if self.ollama_provider is not None
-            else None,
+            type(self.provider).__name__ if self.provider is not None else None,
         )
 
         return {
@@ -223,24 +257,133 @@ class Supervisor:
             ),
         }
 
-    def handle_goal(self, goal: str) -> List[AgentResponse]:
+    def handle_goal(
+        self, goal: str, repo_path: Optional[str] = None
+    ) -> List[AgentResponse]:
         """
-        Handle a high-level user goal by decomposing it into tasks,
-        routing them to the appropriate agents, and collecting results.
+        Handle a high-level user goal by routing it to the agents whose
+        keywords it mentions and collecting their responses.
+
+        Routing is deterministic keyword matching, not model-driven
+        planning. A goal can select several agents ("analyze and
+        document"), and selected agents always run in pipeline order:
+        code analysis, then documentation, then testing. A goal that
+        matches nothing falls back to code analysis, matching
+        `route_task`.
 
         Args:
             goal: Natural language description of what the user wants
                 accomplished.
+            repo_path: Repository the agents should operate on. Defaults
+                to the configured workspace root.
 
         Returns:
-            A list of AgentResponse objects from all dispatched tasks
-            (placeholder empty list).
-
-        TODO: Implement real goal decomposition (likely via the model
-        client), task routing, and aggregation of agent responses.
+            One AgentResponse per selected agent, in execution order. An
+            agent that raises is reported as a failed AgentResponse so a
+            single failure never discards the other results.
         """
-        # TODO: implement real goal decomposition and orchestration
-        return []
+        target = str(repo_path or self.config.workspace_root or ".")
+        agent_types = self._select_agent_types(goal)
+
+        logger.info(
+            "Goal routed to %d agent(s): %s",
+            len(agent_types),
+            ", ".join(agent_type.value for agent_type in agent_types),
+        )
+
+        responses: List[AgentResponse] = []
+        for agent_type in agent_types:
+            request = self._build_request(agent_type, goal, target)
+            logger.info("Dispatching %s for goal.", agent_type.value)
+            try:
+                responses.append(self.dispatch(request))
+            except Exception as exc:
+                logger.warning("%s failed while handling the goal: %s", agent_type.value, exc)
+                responses.append(
+                    AgentResponse(
+                        task_id=request.task_id,
+                        agent_type=agent_type,
+                        success=False,
+                        output=None,
+                        errors=[str(exc)],
+                    )
+                )
+        return responses
+
+    def _select_agent_types(self, goal: str) -> List[AgentType]:
+        """
+        Choose which agents a goal asks for, in execution order.
+
+        Args:
+            goal: The user's natural language goal.
+
+        Returns:
+            The matching AgentTypes ordered code analysis → documentation
+            → testing. Defaults to code analysis when nothing matches.
+        """
+        normalized = (goal or "").lower()
+        selected = [
+            agent_type
+            for agent_type, pattern in _GOAL_KEYWORDS
+            if pattern.search(normalized)
+        ]
+        if not selected:
+            logger.info(
+                "Goal matched no routing keywords; defaulting to code analysis."
+            )
+            return [AgentType.CODE_ANALYSIS]
+        return selected
+
+    def _build_request(
+        self, agent_type: AgentType, goal: str, repo_path: str
+    ) -> AgentRequest:
+        """
+        Build the AgentRequest for one agent selected by a goal.
+
+        Args:
+            agent_type: Agent the request is for.
+            goal: The original user goal, passed through as the
+                instruction so agents keep their own interpretation.
+            repo_path: Repository to operate on.
+
+        Returns:
+            An AgentRequest carrying the repository under both key names
+            the agents accept.
+        """
+        context: Dict[str, object] = {
+            "repo_path": repo_path,
+            "repository_path": repo_path,
+        }
+        if agent_type is AgentType.DOCUMENTATION:
+            context["doc_type"] = self._documentation_type(goal)
+        return AgentRequest(
+            task_id=self.new_task_id(),
+            agent_type=agent_type,
+            instruction=goal,
+            context=context,
+        )
+
+    @staticmethod
+    def _documentation_type(goal: str) -> str:
+        """
+        Pick the documentation mode a goal is asking for.
+
+        A repository-level goal wants a README overview, so that is the
+        default; narrower wordings select the narrower modes the
+        DocumentationAgent already supports.
+
+        Args:
+            goal: The user's natural language goal.
+
+        Returns:
+            One of "docstring", "api_reference", or "readme".
+        """
+        normalized = (goal or "").lower()
+        if _DOCSTRING_PATTERN.search(normalized):
+            return "docstring"
+        if _API_REFERENCE_PATTERN.search(normalized):
+            return "api_reference"
+        return "readme"
 
     def route_task(self, task_name: str) -> AgentType:
         """

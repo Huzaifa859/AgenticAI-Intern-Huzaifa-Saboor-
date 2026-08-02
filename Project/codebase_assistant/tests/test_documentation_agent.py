@@ -4,9 +4,9 @@ test_documentation_agent.py
 
 Unit tests for DocumentationAgent.
 
-The LLM client and Retriever are mocked so tests do not require a
-running Ollama server or a populated Chroma index. Filesystem reads use
-a temporary repository on disk.
+The LLM client and Retriever are mocked so tests do not require a live
+model provider or a populated Chroma index. Filesystem reads use a
+temporary repository on disk.
 """
 
 from __future__ import annotations
@@ -165,8 +165,8 @@ def test_retriever_returns_no_context(_mock_index: Any, sample_repo: Path) -> No
     assert "math_utils.py" in prompt
 
 
-def test_ollama_unavailable(sample_repo: Path) -> None:
-    """Unavailable Ollama should fail gracefully without calling generate."""
+def test_model_unavailable(sample_repo: Path) -> None:
+    """An unavailable model should fail gracefully without calling generate."""
     client = _mock_client(available=False)
     retriever = _mock_retriever()
     agent = _agent(client, retriever)
@@ -249,6 +249,88 @@ def test_run_returns_success_dict(_mock_index: Any, sample_repo: Path) -> None:
 
     assert outcome["status"] == "success"
     assert "Tiny math helpers" in outcome["message"]
+
+
+@pytest.fixture
+def project_repo(sample_repo: Path) -> Path:
+    """Extend the sample repository with project metadata files."""
+    (sample_repo / "requirements.txt").write_text(
+        "pydantic>=2.0\nchromadb>=0.4\n", encoding="utf-8"
+    )
+    (sample_repo / "app").mkdir()
+    (sample_repo / "app" / "main.py").write_text(
+        "def main():\n    print('run')\n", encoding="utf-8"
+    )
+    return sample_repo
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_readme_prompt_includes_inventory_and_project_files(
+    _mock_index: Any, project_repo: Path
+) -> None:
+    """README mode should ground layout and setup claims in real files."""
+    chunk = RetrievedChunk(
+        source="math_utils.py",
+        content="def add(a, b):\n    return a + b",
+        score=0.9,
+        metadata={"file_path": "math_utils.py"},
+    )
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever([chunk]))
+
+    agent.handle(_readme_request(project_repo))
+
+    prompt = client.generate.call_args.args[0][1].content
+    assert "REPOSITORY INVENTORY" in prompt
+    assert "app/main.py" in prompt
+    assert "PROJECT FILES" in prompt
+    assert "chromadb>=0.4" in prompt
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_readme_guidance_requests_structured_sections(
+    _mock_index: Any, project_repo: Path
+) -> None:
+    """The README prompt should ask for full markdown documentation."""
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    agent.handle(_readme_request(project_repo))
+
+    prompt = client.generate.call_args.args[0][1].content
+    for heading in (
+        "## Project Overview",
+        "## Architecture Overview",
+        "## Installation Requirements",
+        "## How to Run",
+        "## Limitations",
+    ):
+        assert heading in prompt
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_docstring_mode_skips_repository_wide_sections(
+    _mock_index: Any, project_repo: Path
+) -> None:
+    """Single-function documentation should not pay for repo-wide context."""
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    agent.handle(_docstring_request(project_repo))
+
+    prompt = client.generate.call_args.args[0][1].content
+    assert "REPOSITORY INVENTORY" not in prompt
+    assert "PROJECT FILES" not in prompt
+
+
+def test_system_prompt_enforces_grounding_and_markdown() -> None:
+    """The system prompt must keep the model grounded and markdown-formatted."""
+    from codebase_assistant.agents.documentation_agent import _SYSTEM_PROMPT
+
+    lowered = _SYSTEM_PROMPT.lower()
+    assert "never invent" in lowered
+    assert "markdown" in lowered
+    assert "single paragraph" in lowered
 
 
 def test_dedupe_chunks_removes_duplicate_content() -> None:

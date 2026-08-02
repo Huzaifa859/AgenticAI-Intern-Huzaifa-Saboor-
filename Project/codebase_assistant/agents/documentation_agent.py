@@ -32,56 +32,135 @@ from .base import BaseAgent
 logger = logging.getLogger(__name__)
 
 #: Cap on source files read into the prompt when building repository context.
-_MAX_SOURCE_FILES = 8
+_MAX_SOURCE_FILES = 12
 
 #: Cap on characters taken from each source file (fallback when no RAG).
 _MAX_FILE_CHARS = 2500
 
 #: Shorter file excerpts when retrieved chunks are already present.
-_MAX_FILE_CHARS_WITH_RETRIEVAL = 1200
+_MAX_FILE_CHARS_WITH_RETRIEVAL = 1500
 
 #: Cap on retrieved chunks rendered into the prompt.
-_MAX_CONTEXT_CHUNKS = 6
+_MAX_CONTEXT_CHUNKS = 8
 
 #: Cap on characters per retrieved chunk in the prompt.
 _MAX_CHUNK_CHARS = 1200
 
-#: Generation ceiling for documentation calls (keeps local LLM responses tight).
-_DOC_MAX_TOKENS = 1024
+#: Generation ceiling for documentation calls.
+_DOC_MAX_TOKENS = 2048
+
+#: Cap on file paths listed in the repository inventory section.
+_MAX_INVENTORY_FILES = 150
+
+#: Project metadata files that reveal dependencies and run instructions.
+_PROJECT_FILES = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "environment.yml",
+    "Makefile",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".env.example",
+    "README.md",
+    "README.rst",
+)
+
+#: Cap on characters read from each project metadata file.
+_MAX_PROJECT_FILE_CHARS = 1200
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 _SYSTEM_PROMPT = """\
-You are a concise technical documentation writer for Python codebases.
+You are a senior technical writer producing developer documentation for
+Python codebases. You write structured, markdown-formatted documentation
+that is grounded strictly in the evidence you are given.
 
-Rules (follow exactly):
-1. Stay grounded in the provided repository code and retrieved context.
-2. Never invent functions, classes, parameters, files, or APIs.
-3. Explain purpose before implementation details.
-4. Keep wording concise, precise, and technical — no marketing language.
-5. Prefer RETRIEVED CONTEXT when it is present; use REPOSITORY CONTENTS \
-only to fill gaps.
-6. If evidence is insufficient, say what is known and leave unknown \
-fields empty rather than guessing.
+Grounding rules (follow exactly):
+1. Use only the provided RETRIEVED CONTEXT, REPOSITORY INVENTORY,
+   PROJECT FILES, and REPOSITORY CONTENTS as evidence.
+2. Never invent functions, classes, parameters, files, commands,
+   dependencies, or APIs. Every name you write must appear in the
+   evidence.
+3. Prefer RETRIEVED CONTEXT when it is present; use REPOSITORY CONTENTS
+   only to fill gaps.
+4. When evidence for a section is missing, write
+   "Not documented in the provided repository evidence." for that
+   section instead of guessing, or omit the section entirely.
+5. Explain purpose before implementation details. Keep wording precise
+   and technical - no marketing language.
 
-Return ONE JSON object only (no markdown fences, no prose outside JSON):
+Formatting rules:
+- The "summary" field holds markdown. Use `##` headings, bullet lists,
+  and fenced code blocks. Do not produce a single paragraph.
+- Because the output is JSON, escape newlines inside strings as \\n and
+  quotes as \\".
+- Do not wrap the JSON itself in markdown fences.
+
+Return ONE JSON object only (no prose outside JSON):
 
 {
   "file_path": "path/to/file.py",
   "function_name": "name_or_README_or_module",
-  "summary": "Purpose-first summary.",
+  "summary": "Markdown documentation body.",
   "parameters": [
-    {"name": "param", "type": "str", "description": "What it is."}
+    {"name": "param_or_module", "type": "str_or_kind", "description": "What it is."}
   ],
   "returns": "Return value description, or empty string if N/A.",
-  "example_usage": "Short realistic usage example, or empty string."
+  "example_usage": "Realistic usage or run commands, or empty string."
 }
 
 Mode guidance:
 - docstring: document one function; summary = purpose; fill parameters/returns.
 - module: summarize the module's role; parameters may list public symbols.
-- readme: repository overview (purpose, layout, how to run); function_name=README.
+- readme: full repository documentation; function_name=README.
 - api_reference: public API summary; parameters list public callables/classes.
+"""
+
+_README_GUIDANCE = """\
+Write complete repository documentation suitable for a README overview.
+Put the whole document in "summary" as markdown, using these sections in
+order and only when the repository evidence supports them:
+
+## Project Overview
+## Purpose
+## Main Functionality
+## Architecture Overview
+## Directory and Module Summary
+## Important Classes, Functions, and Modules
+## Technologies and Frameworks
+## Installation Requirements
+## How to Run
+## Key Workflows
+## Limitations
+## Suggested Future Improvements
+
+Section rules:
+- Directory and Module Summary: describe only paths present in the
+  REPOSITORY INVENTORY.
+- Technologies and Frameworks: name only libraries that appear in
+  imports or in PROJECT FILES.
+- Installation Requirements and How to Run: derive strictly from
+  PROJECT FILES (requirements.txt, pyproject.toml, Makefile, Dockerfile,
+  entry-point modules). If nothing is discoverable, state that plainly
+  instead of inventing commands.
+- Key Workflows: describe end-to-end flows visible in the code, naming
+  the real modules or functions that implement each step.
+- Limitations: only gaps visible in the evidence, such as missing tests,
+  TODO markers, or unimplemented branches.
+- Suggested Future Improvements: only items justified by a limitation
+  you just documented. Omit the section otherwise.
+
+Field rules for this mode:
+- function_name: "README".
+- file_path: the repository path given in TARGET.
+- parameters: the main modules or packages, one entry each, with
+  name = path, type = "module" or "package", description = its role.
+- returns: one sentence naming the primary entry point, or "".
+- example_usage: real run commands taken from the evidence, or "".
 """
 
 _MODE_GUIDANCE = {
@@ -89,21 +168,24 @@ _MODE_GUIDANCE = {
         "Write a function docstring-style DocumentationResult. "
         "Start the summary with what the function is for, then note "
         "important behavior or caveats visible in the code. "
+        "Use markdown with a short purpose paragraph followed by "
+        "bullet points for behavior and caveats. "
         "List only parameters that appear in the signature."
     ),
     "module": (
-        "Write a module summary. Explain the module's purpose first, "
-        "then briefly what public symbols it exposes. "
+        "Write a module summary in markdown with '## Purpose', "
+        "'## Public Surface', and '## Notes' sections. Explain the "
+        "module's role first, then the public symbols it exposes and "
+        "how they fit into the wider system. "
         "Do not invent symbols that are not in the code."
     ),
-    "readme": (
-        "Write a short README summary: purpose, main modules/files, "
-        "and how a developer would use or inspect the project. "
-        "Keep it under ~150 words. Set function_name to README."
-    ),
+    "readme": _README_GUIDANCE,
     "api_reference": (
-        "Write a public API summary. List real public functions/classes "
-        "in parameters (name/type/description). "
+        "Write a public API reference in markdown, grouping symbols "
+        "under '## Classes' and '## Functions' headings with a short "
+        "grounded description and signature for each. List the same "
+        "real public functions/classes in parameters "
+        "(name/type/description). "
         "Omit private helpers (names starting with underscore) unless "
         "they are the only content."
     ),
@@ -159,7 +241,7 @@ class DocumentationAgent(BaseAgent):
         doc_type = str(context.get("doc_type") or "").lower()
 
         if not self._model_available():
-            logger.info("Calling Ollama... unavailable; returning failed response.")
+            logger.info("Documentation model unavailable; returning failed response.")
             empty = self._empty_result(
                 file_path=file_path or repo_path,
                 function_name=function_name or "",
@@ -170,7 +252,7 @@ class DocumentationAgent(BaseAgent):
                 success=False,
                 output=empty,
                 errors=[
-                    "Ollama model provider is unavailable; "
+                    "Documentation model provider is unavailable; "
                     "documentation was not generated."
                 ],
             )
@@ -272,9 +354,14 @@ class DocumentationAgent(BaseAgent):
             workspace=workspace,
             target_path=workspace,
             instruction=(
-                f"Write a concise README summary for {repo_path}: purpose, "
-                "key modules, and how to inspect or run it. "
-                "Stay grounded in the repository contents."
+                f"Write complete repository documentation for {repo_path} "
+                "suitable for a README overview: project overview, purpose, "
+                "main functionality, architecture, directory and module "
+                "summary, important classes and functions, technologies "
+                "used, installation requirements, how to run, key "
+                "workflows, limitations, and justified improvements. "
+                "Stay grounded in the repository evidence and state "
+                "clearly when information is unavailable."
             ),
             function_name="README",
         )
@@ -317,7 +404,7 @@ class DocumentationAgent(BaseAgent):
         Run the documentation pipeline for one request.
 
         Stages: read repository → retrieve context → build prompt →
-        call Ollama → parse DocumentationResult.
+        call the documentation model → parse DocumentationResult.
         """
         empty = self._empty_result(
             file_path=target_path,
@@ -325,7 +412,7 @@ class DocumentationAgent(BaseAgent):
         )
 
         if not self._model_available():
-            logger.info("Calling Ollama... unavailable.")
+            logger.info("Documentation model unavailable; skipping generation.")
             return empty
 
         # Index first so retrieval can prioritize grounded chunks.
@@ -340,15 +427,19 @@ class DocumentationAgent(BaseAgent):
 
         logger.info("Reading repository...")
         filesystem = FilesystemTools(workspace_root=workspace)
-        # When retrieval succeeded, keep file excerpts minimal to save tokens.
+        # Repository-wide modes need the file listing to describe layout,
+        # so they keep it even when retrieval already returned chunks.
+        repository_wide = mode == "readme"
         source_excerpts = self._read_repository_sources(
             filesystem,
             target_path,
             max_file_chars=(
                 _MAX_FILE_CHARS_WITH_RETRIEVAL if chunks else _MAX_FILE_CHARS
             ),
-            prefer_target_only=bool(chunks),
+            prefer_target_only=bool(chunks) and not repository_wide,
         )
+        inventory = self._repository_inventory(filesystem) if repository_wide else []
+        project_files = self._read_project_files(filesystem) if repository_wide else []
 
         logger.info("Building prompt...")
         prompt = self._build_prompt(
@@ -358,9 +449,11 @@ class DocumentationAgent(BaseAgent):
             function_name=function_name,
             chunks=chunks,
             source_excerpts=source_excerpts,
+            inventory=inventory,
+            project_files=project_files,
         )
 
-        logger.info("Calling Ollama...")
+        logger.info("Calling documentation model...")
         try:
             response = self.model_client.generate(
                 [
@@ -371,7 +464,7 @@ class DocumentationAgent(BaseAgent):
                 temperature=0.1,
             )
         except Exception as exc:
-            logger.warning("Ollama documentation call failed: %s", exc)
+            logger.warning("Documentation model call failed: %s", exc)
             return empty
 
         result = self._parse_response(
@@ -526,6 +619,57 @@ class DocumentationAgent(BaseAgent):
         return excerpts
 
     @staticmethod
+    def _repository_inventory(filesystem: FilesystemTools) -> List[str]:
+        """
+        List repository file paths so the model can describe layout.
+
+        Only paths are collected, not contents, which keeps the prompt
+        cheap while still grounding directory and module descriptions.
+        """
+        paths: List[str] = []
+        seen: set[str] = set()
+        for pattern in ("*.py", "*.md", "*.toml", "*.txt", "*.yml", "*.yaml", "*.cfg"):
+            try:
+                found = filesystem.list_files(".", pattern=pattern, recursive=True)
+            except Exception as exc:
+                logger.warning(
+                    "Could not list %s files for the inventory: %s", pattern, exc
+                )
+                continue
+            for path in found:
+                if path not in seen:
+                    seen.add(path)
+                    paths.append(path)
+        paths.sort()
+        return paths[:_MAX_INVENTORY_FILES]
+
+    @staticmethod
+    def _read_project_files(filesystem: FilesystemTools) -> List[str]:
+        """
+        Read project metadata files that reveal setup and run steps.
+
+        Missing files are skipped silently: absence is normal and the
+        prompt tells the model to say so rather than invent commands.
+        """
+        excerpts: List[str] = []
+        for name in _PROJECT_FILES:
+            try:
+                if not filesystem.file_exists(name):
+                    continue
+                content = filesystem.read_file(name)
+            except Exception as exc:
+                logger.warning("Could not read project file %s: %s", name, exc)
+                continue
+            if not content.strip():
+                continue
+            excerpts.append(
+                DocumentationAgent._format_file_excerpt(
+                    name, content, _MAX_PROJECT_FILE_CHARS
+                )
+            )
+        return excerpts
+
+    @staticmethod
     def _relative_to_workspace(
         filesystem: FilesystemTools, target_path: str
     ) -> str:
@@ -559,12 +703,15 @@ class DocumentationAgent(BaseAgent):
         function_name: str,
         chunks: Sequence[RetrievedChunk],
         source_excerpts: Sequence[str],
+        inventory: Sequence[str] = (),
+        project_files: Sequence[str] = (),
     ) -> str:
         """
         Build the user prompt for the documentation model call.
 
         Retrieved context is listed first and treated as primary evidence.
-        Repository excerpts are secondary fillers.
+        Repository excerpts are secondary fillers. Inventory and project
+        files ground layout, dependency, and run-instruction claims.
         """
         guidance = _MODE_GUIDANCE.get(mode, _MODE_GUIDANCE["docstring"])
         sections = [
@@ -591,19 +738,31 @@ class DocumentationAgent(BaseAgent):
                     f"[{index}] source={source} score={float(chunk.score):.3f}\n{body}"
                 )
             sections.append(
-                "RETRIEVED CONTEXT (primary — prioritize this)\n"
+                "RETRIEVED CONTEXT (primary - prioritize this)\n"
                 + "\n\n".join(rendered)
             )
         else:
             sections.append(
-                "RETRIEVED CONTEXT (primary — prioritize this)\n(none)"
+                "RETRIEVED CONTEXT (primary - prioritize this)\n(none)"
+            )
+
+        if inventory:
+            sections.append(
+                "REPOSITORY INVENTORY (every path that exists; describe "
+                "only these)\n" + "\n".join(inventory)
+            )
+
+        if project_files:
+            sections.append(
+                "PROJECT FILES (dependencies and run instructions must come "
+                "from here)\n" + "\n\n".join(project_files)
             )
 
         if source_excerpts:
             label = (
-                "REPOSITORY CONTENTS (secondary — use only to fill gaps)"
+                "REPOSITORY CONTENTS (secondary - use only to fill gaps)"
                 if chunks
-                else "REPOSITORY CONTENTS (primary — no retrieved context)"
+                else "REPOSITORY CONTENTS (primary - no retrieved context)"
             )
             sections.append(f"{label}\n" + "\n\n".join(source_excerpts))
         else:

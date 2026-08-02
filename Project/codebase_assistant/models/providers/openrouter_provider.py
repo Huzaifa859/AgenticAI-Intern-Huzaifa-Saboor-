@@ -9,6 +9,12 @@ and bug-finding.
 Makes real HTTPS requests with `requests`, retries transient failures
 with exponential backoff, and maps transport/API failures onto the
 project's model exception hierarchy.
+
+When the configured model cannot serve a request for a model-level
+reason - no credits, unknown model, rate limit, or a server-side error -
+the provider walks a fallback chain of alternative models with the same
+prompt, temperature, and token budget. Credential and request errors
+never trigger a fallback: another model would fail identically.
 """
 
 from __future__ import annotations
@@ -42,6 +48,33 @@ _MAX_ATTEMPTS = 4
 
 #: Initial backoff delay in seconds; doubles after each retryable failure.
 _INITIAL_BACKOFF_SECONDS = 1.0
+
+#: Models tried in order when the configured model is not usable.
+_FALLBACK_MODELS = (
+    "anthropic/claude-sonnet-4",
+    "meta-llama/llama-3.1-8b-instruct",
+    "google/gemma-3-27b-it",
+    "nvidia/nemotron-nano-9b-v2",
+)
+
+#: Status codes that permanently rule this model out for the request, so
+#: the next model is tried immediately without backing off. Rate limits
+#: and 5xx also fall back, but only after their backoff retries.
+_FALLBACK_STATUS_CODES = frozenset({402, 404})
+
+
+class _ModelUnavailable(Exception):
+    """
+    Internal signal that one model failed for a model-level reason.
+
+    Never escapes ``generate()``: it carries the real exception, which is
+    re-raised once every model in the chain has been tried.
+    """
+
+    def __init__(self, error: Exception, reason: str) -> None:
+        super().__init__(reason)
+        self.error = error
+        self.reason = reason
 
 
 class OpenRouterProvider(BaseProvider):
@@ -96,7 +129,14 @@ class OpenRouterProvider(BaseProvider):
 
     def generate(self, messages: List[ModelMessage], **kwargs) -> ModelResponse:
         """
-        Generate a completion via OpenRouter.
+        Generate a completion via OpenRouter, falling back across models.
+
+        The configured model is tried first. If it fails for a
+        model-level reason (HTTP 402, 404, 429, or 5xx), the same prompt,
+        temperature, and token budget are sent to the next model in the
+        fallback chain. Authentication and malformed-request failures are
+        raised immediately, since retrying them on another model cannot
+        help.
 
         Args:
             messages: Conversation history to send (system/user/assistant).
@@ -105,6 +145,7 @@ class OpenRouterProvider(BaseProvider):
 
         Returns:
             A ModelResponse with content, raw payload, and usage metadata.
+            ``raw["model_used"]`` names the model that answered.
 
         Raises:
             ProviderUnavailableError: Missing credentials, unreachable
@@ -123,10 +164,81 @@ class OpenRouterProvider(BaseProvider):
         if not messages:
             raise ModelResponseError("OpenRouter generate() requires a non-empty messages list.")
 
-        model = kwargs.get("model", self.model)
         max_tokens = int(kwargs.get("max_tokens", self.max_tokens))
         temperature = kwargs.get("temperature", 0.0)
+        chain = self._model_chain(kwargs.get("model", self.model))
 
+        last_error: Optional[Exception] = None
+        for position, model in enumerate(chain):
+            logger.info("Attempting model: %s", model)
+            try:
+                return self._generate_with_model(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except _ModelUnavailable as signal:
+                last_error = signal.error
+                logger.warning(
+                    "Model unavailable: %s (%s).", model, signal.reason
+                )
+                remaining = chain[position + 1 :]
+                if remaining:
+                    logger.info("Switching to: %s", remaining[0])
+
+        logger.error(
+            "All OpenRouter models failed (%s); falling back to static-only mode.",
+            ", ".join(chain),
+        )
+        raise last_error  # type: ignore[misc]
+
+    def _model_chain(self, primary: str) -> List[str]:
+        """
+        Build the ordered list of models to try for one request.
+
+        Args:
+            primary: The requested or configured model, tried first.
+
+        Returns:
+            The primary model followed by the fallback models, without
+            duplicates.
+        """
+        chain: List[str] = []
+        for candidate in (str(primary or ""),) + _FALLBACK_MODELS:
+            if candidate and candidate not in chain:
+                chain.append(candidate)
+        return chain
+
+    def _generate_with_model(
+        self,
+        model: str,
+        messages: List[ModelMessage],
+        max_tokens: int,
+        temperature: Any,
+    ) -> ModelResponse:
+        """
+        Run one chat completion against a single model.
+
+        The prompt, temperature, and token budget are identical for every
+        model in the chain, so a fallback answer is grounded in exactly
+        the same context as the primary attempt would have been.
+
+        Args:
+            model: OpenRouter model slug to call.
+            messages: Conversation history to send.
+            max_tokens: Token ceiling for the completion.
+            temperature: Sampling temperature.
+
+        Returns:
+            A ModelResponse from this model.
+
+        Raises:
+            _ModelUnavailable: The model itself could not serve the
+                request; the caller should try the next model.
+            ProviderUnavailableError: Credentials or transport failed.
+            ModelResponseError: Malformed request or unusable body.
+        """
         payload: Dict[str, Any] = {
             "model": model,
             "messages": [
@@ -183,27 +295,31 @@ class OpenRouterProvider(BaseProvider):
                 time.sleep(delay)
                 continue
 
-            if response.status_code in _RETRYABLE_STATUS_CODES:
+            status = response.status_code
+
+            if self._is_retryable(status):
                 if attempt >= _MAX_ATTEMPTS:
                     logger.error(
                         "OpenRouter request failed after %d attempts: HTTP %s",
                         _MAX_ATTEMPTS,
-                        response.status_code,
+                        status,
                     )
-                    if response.status_code == 429:
-                        raise RateLimitError(
-                            f"OpenRouter rate limit exceeded (HTTP 429) after "
-                            f"{_MAX_ATTEMPTS} attempts."
+                    if status == 429:
+                        error: Exception = RateLimitError(
+                            f"OpenRouter rate limit exceeded (HTTP 429) on "
+                            f"{model} after {_MAX_ATTEMPTS} attempts."
                         )
-                    raise ProviderUnavailableError(
-                        f"OpenRouter unavailable (HTTP {response.status_code}) "
-                        f"after {_MAX_ATTEMPTS} attempts."
-                    )
+                    else:
+                        error = ProviderUnavailableError(
+                            f"OpenRouter unavailable (HTTP {status}) on "
+                            f"{model} after {_MAX_ATTEMPTS} attempts."
+                        )
+                    raise _ModelUnavailable(error, f"HTTP {status}")
 
                 delay = self._backoff_seconds(attempt)
                 logger.warning(
                     "OpenRouter HTTP %s on attempt %d/%d; retrying in %.1fs",
-                    response.status_code,
+                    status,
                     attempt,
                     _MAX_ATTEMPTS,
                     delay,
@@ -211,15 +327,24 @@ class OpenRouterProvider(BaseProvider):
                 time.sleep(delay)
                 continue
 
-            if response.status_code >= 400:
+            if status in _FALLBACK_STATUS_CODES:
+                # Credits and unknown models do not recover on retry, so
+                # move straight to the next model instead of backing off.
+                raise _ModelUnavailable(
+                    self._model_level_error(status, model, response),
+                    f"HTTP {status}",
+                )
+
+            if status >= 400:
                 self._raise_for_client_error(response)
 
-            model_response = self._parse_response(response)
+            model_response = self._parse_response(response, model)
             logger.info(
                 "OpenRouter request succeeded: model=%s content_chars=%d",
                 model,
                 len(model_response.content or ""),
             )
+            logger.info("Model used: %s", model)
             return model_response
 
         logger.error(
@@ -304,6 +429,43 @@ class OpenRouterProvider(BaseProvider):
         return value if value > 0 else default
 
     @staticmethod
+    def _is_retryable(status: int) -> bool:
+        """
+        Report whether a status code is worth retrying on the same model.
+
+        Args:
+            status: HTTP status code from OpenRouter.
+
+        Returns:
+            True for rate limits and server-side errors.
+        """
+        return status in _RETRYABLE_STATUS_CODES or status >= 500
+
+    def _model_level_error(
+        self, status: int, model: str, response: requests.Response
+    ) -> Exception:
+        """
+        Build the exception for a model-level failure.
+
+        Args:
+            status: HTTP status code (402 or 404).
+            model: Model that produced the failure.
+            response: Failed HTTP response.
+
+        Returns:
+            The exception to raise if no fallback model succeeds.
+        """
+        detail = self._safe_error_detail(response)
+        if status == 402:
+            return ProviderUnavailableError(
+                f"OpenRouter has insufficient credits for {model} "
+                f"(HTTP 402). {detail}"
+            )
+        return ModelResponseError(
+            f"OpenRouter model {model} is unavailable (HTTP 404). {detail}"
+        )
+
+    @staticmethod
     def _backoff_seconds(attempt: int) -> float:
         """
         Exponential backoff delay for the given 1-based attempt number.
@@ -379,12 +541,17 @@ class OpenRouterProvider(BaseProvider):
         return ""
 
     @staticmethod
-    def _parse_response(response: requests.Response) -> ModelResponse:
+    def _parse_response(
+        response: requests.Response, model: str = ""
+    ) -> ModelResponse:
         """
         Convert an OpenRouter JSON body into the project's ModelResponse.
 
         Args:
             response: Successful HTTP response.
+            model: Model that produced the response, recorded in
+                ``raw["model_used"]`` so callers can report which model
+                actually answered after a fallback.
 
         Returns:
             Populated ModelResponse.
@@ -419,4 +586,6 @@ class OpenRouterProvider(BaseProvider):
             )
 
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        return ModelResponse(content=content, raw=data, usage=usage)
+        raw = dict(data)
+        raw["model_used"] = model or data.get("model", "")
+        return ModelResponse(content=content, raw=raw, usage=usage)

@@ -22,10 +22,22 @@ from codebase_assistant.exceptions.model_exceptions import (
     ProviderUnavailableError,
     RateLimitError,
 )
-from codebase_assistant.models.providers.openrouter_provider import OpenRouterProvider
+from codebase_assistant.models.providers.openrouter_provider import (
+    _FALLBACK_MODELS,
+    OpenRouterProvider,
+)
 from codebase_assistant.schemas.schemas import ModelMessage, ModelResponse
 
 MESSAGES = [ModelMessage(role="user", content="hello")]
+
+FALLBACK_CHAIN = _FALLBACK_MODELS
+
+CLAUDE, LLAMA, GEMMA, NEMOTRON = FALLBACK_CHAIN
+
+
+def _models_called(mock_post: MagicMock) -> List[str]:
+    """Model slug sent on each POST, in call order."""
+    return [call.kwargs["json"]["model"] for call in mock_post.call_args_list]
 
 
 def _config() -> Config:
@@ -135,15 +147,16 @@ def test_malformed_response_raises_model_response_error(
 @patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
 @patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
 def test_retries_on_http_429(mock_post: MagicMock, mock_sleep: MagicMock) -> None:
-    """HTTP 429 should retry and eventually raise RateLimitError."""
+    """HTTP 429 should back off per model, then exhaust the fallback chain."""
     mock_post.return_value = _http_response(429, {"error": {"message": "rate limited"}})
     provider = _provider()
 
     with pytest.raises(RateLimitError):
         provider.generate(MESSAGES)
 
-    assert mock_post.call_count == 4
-    assert mock_sleep.call_count == 3
+    # 4 backoff attempts on each of the 4 models in the chain.
+    assert mock_post.call_count == 4 * len(FALLBACK_CHAIN)
+    assert mock_sleep.call_count == 3 * len(FALLBACK_CHAIN)
 
 
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
@@ -161,8 +174,8 @@ def test_retries_on_http_5xx(
     with pytest.raises(ProviderUnavailableError):
         provider.generate(MESSAGES)
 
-    assert mock_post.call_count == 4
-    assert mock_sleep.call_count == 3
+    assert mock_post.call_count == 4 * len(FALLBACK_CHAIN)
+    assert mock_sleep.call_count == 3 * len(FALLBACK_CHAIN)
 
 
 @pytest.mark.parametrize(
@@ -171,7 +184,6 @@ def test_retries_on_http_5xx(
         (400, ModelResponseError),
         (401, ProviderUnavailableError),
         (403, ProviderUnavailableError),
-        (404, ModelResponseError),
     ],
 )
 @patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
@@ -182,7 +194,7 @@ def test_no_retries_on_client_errors(
     status_code: int,
     exc_type: type,
 ) -> None:
-    """400/401/403/404 must fail immediately without retrying."""
+    """Malformed requests and auth failures must fail on the first model."""
     mock_post.return_value = _http_response(
         status_code, {"error": {"message": f"http {status_code}"}}
     )
@@ -255,6 +267,163 @@ def test_whitespace_only_model_output_raises(
 
     mock_post.assert_called_once()
     mock_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("status_code", [402, 404])
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_falls_back_to_llama_on_402_and_404(
+    mock_post: MagicMock, mock_sleep: MagicMock, status_code: int
+) -> None:
+    """Insufficient credits or a missing model should switch to Llama."""
+    mock_post.side_effect = [
+        _http_response(status_code, {"error": {"message": f"http {status_code}"}}),
+        _http_response(200, _success_payload(content="Answer from Llama.")),
+    ]
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.content == "Answer from Llama."
+    assert result.raw["model_used"] == LLAMA
+    assert _models_called(mock_post) == [CLAUDE, LLAMA]
+    # Credits and unknown models never recover, so no backoff is spent.
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_falls_back_to_gemma_when_claude_rate_limited(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A rate-limited Claude and an unusable Llama should reach Gemma."""
+    mock_post.side_effect = (
+        [_http_response(429, {"error": {"message": "rate limited"}})] * 4
+        + [_http_response(402, {"error": {"message": "no credits"}})]
+        + [_http_response(200, _success_payload(content="Answer from Gemma."))]
+    )
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.content == "Answer from Gemma."
+    assert result.raw["model_used"] == GEMMA
+    assert _models_called(mock_post) == [CLAUDE] * 4 + [LLAMA, GEMMA]
+    assert mock_sleep.call_count == 3
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_falls_back_through_whole_chain_to_nemotron(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """The last model in the chain should still be tried."""
+    mock_post.side_effect = [
+        _http_response(402, {"error": {"message": "no credits"}}),
+        _http_response(404, {"error": {"message": "unknown model"}}),
+        _http_response(402, {"error": {"message": "no credits"}}),
+        _http_response(200, _success_payload(content="Answer from Nemotron.")),
+    ]
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.content == "Answer from Nemotron."
+    assert result.raw["model_used"] == NEMOTRON
+    assert _models_called(mock_post) == list(FALLBACK_CHAIN)
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_all_models_fail_raises_for_graceful_degradation(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """Exhausting the chain should raise so callers degrade to static-only."""
+    mock_post.return_value = _http_response(402, {"error": {"message": "no credits"}})
+    provider = _provider()
+
+    with pytest.raises(ProviderUnavailableError, match="insufficient credits"):
+        provider.generate(MESSAGES)
+
+    assert _models_called(mock_post) == list(FALLBACK_CHAIN)
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_no_fallback_on_authentication_or_malformed_request(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """Auth and 400 errors must not burn through the fallback chain."""
+    provider = _provider()
+
+    mock_post.return_value = _http_response(401, {"error": {"message": "bad key"}})
+    with pytest.raises(ProviderUnavailableError):
+        provider.generate(MESSAGES)
+    assert mock_post.call_count == 1
+
+    mock_post.reset_mock()
+    mock_post.return_value = _http_response(400, {"error": {"message": "malformed"}})
+    with pytest.raises(ModelResponseError):
+        provider.generate(MESSAGES)
+    assert mock_post.call_count == 1
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_fallback_preserves_prompt_and_generation_options(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """The fallback request must be identical except for the model slug."""
+    mock_post.side_effect = [
+        _http_response(402, {"error": {"message": "no credits"}}),
+        _http_response(200, _success_payload(content="Answer from Llama.")),
+    ]
+    messages = [
+        ModelMessage(role="system", content="Stay grounded in the context."),
+        ModelMessage(role="user", content="Document the add function."),
+    ]
+    provider = _provider()
+
+    provider.generate(messages, max_tokens=1234, temperature=0.1)
+
+    first, second = (call.kwargs["json"] for call in mock_post.call_args_list)
+    assert first["messages"] == second["messages"]
+    assert second["max_tokens"] == 1234
+    assert second["temperature"] == 0.1
+    assert first["model"] != second["model"]
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_model_used_reported_without_any_fallback(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A first-attempt success should still report the model in raw."""
+    mock_post.return_value = _http_response(200, _success_payload(content="ok"))
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.raw["model_used"] == CLAUDE
+    mock_post.assert_called_once()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_custom_primary_model_is_tried_before_the_chain(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A configured non-default model leads the chain without duplication."""
+    mock_post.side_effect = [
+        _http_response(404, {"error": {"message": "unknown model"}}),
+        _http_response(200, _success_payload(content="ok")),
+    ]
+    provider = _provider(model="openai/gpt-4o-mini")
+
+    result = provider.generate(MESSAGES)
+
+    assert result.raw["model_used"] == CLAUDE
+    assert _models_called(mock_post) == ["openai/gpt-4o-mini", CLAUDE]
 
 
 def test_generate_without_api_key_raises() -> None:

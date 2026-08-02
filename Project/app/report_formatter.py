@@ -17,7 +17,10 @@ import textwrap
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from codebase_assistant.agents.code_analysis_agent import CodeAnalysisReport
-from codebase_assistant.schemas.schemas import BugReport
+from codebase_assistant.schemas.schemas import BugReport, DocumentationResult, TestingResult
+
+# Avoid pytest collecting TestingResult when this module is imported in tests.
+TestingResult.__test__ = False
 
 BANNER_WIDTH = 65
 SEVERITY_ORDER: Tuple[str, ...] = ("high", "medium", "low")
@@ -564,3 +567,123 @@ def print_report(
         color: Optional color override. None means auto-detect.
     """
     print(format_report(report, width=width, color=color))
+
+
+def format_documentation_result(result: DocumentationResult) -> str:
+    """
+    Format a DocumentationResult for terminal display.
+
+    Args:
+        result: Documentation agent output.
+
+    Returns:
+        A readable multi-section string.
+    """
+    lines = [
+        "=" * BANNER_WIDTH,
+        "Documentation Result",
+        "=" * BANNER_WIDTH,
+        "",
+        "Summary",
+        "-" * BANNER_WIDTH,
+        (result.summary or "(empty)").strip() or "(empty)",
+        "",
+        "Function / Module",
+        "-" * BANNER_WIDTH,
+        f"File:      {result.file_path or '(none)'}",
+        f"Name:      {result.function_name or '(none)'}",
+        "",
+        "Parameters",
+        "-" * BANNER_WIDTH,
+    ]
+
+    if result.parameters:
+        for index, param in enumerate(result.parameters, start=1):
+            if not isinstance(param, dict):
+                lines.append(f"  [{index}] {param}")
+                continue
+            name = str(param.get("name") or "")
+            ptype = str(param.get("type") or "")
+            description = str(param.get("description") or "")
+            label = name or f"param_{index}"
+            type_part = f" ({ptype})" if ptype else ""
+            desc_part = f": {description}" if description else ""
+            lines.append(f"  [{index}] {label}{type_part}{desc_part}")
+    else:
+        lines.append("  (none)")
+
+    lines.extend(
+        [
+            "",
+            "Returns",
+            "-" * BANNER_WIDTH,
+            (result.returns or "(none)").strip() or "(none)",
+            "",
+            "Example usage",
+            "-" * BANNER_WIDTH,
+            (result.example_usage or "(none)").strip() or "(none)",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def print_documentation_result(result: DocumentationResult) -> None:
+    """Print a formatted DocumentationResult to stdout."""
+    print(format_documentation_result(result))
+
+
+def format_testing_result(
+    result: TestingResult, *, include_source: bool = False
+) -> str:
+    """
+    Format a TestingResult for terminal display.
+
+    Args:
+        result: Testing agent output.
+        include_source: When True, append full generated test modules.
+
+    Returns:
+        A readable multi-section string.
+    """
+    lines = [
+        "=" * BANNER_WIDTH,
+        "Testing Result",
+        "=" * BANNER_WIDTH,
+        "",
+        "Summary",
+        "-" * BANNER_WIDTH,
+        (result.summary or "(empty)").strip() or "(empty)",
+        "",
+        "Coverage estimate",
+        "-" * BANNER_WIDTH,
+        f"{float(result.coverage_estimate):.2f}",
+        "",
+        "Generated test filenames",
+        "-" * BANNER_WIDTH,
+    ]
+
+    filenames = sorted(result.generated_tests.keys())
+    if filenames:
+        for name in filenames:
+            lines.append(f"  - {name}")
+    else:
+        lines.append("  (none)")
+
+    if include_source and result.generated_tests:
+        lines.extend(["", "Generated test source", "-" * BANNER_WIDTH])
+        for name in filenames:
+            code = result.generated_tests.get(name) or ""
+            lines.append(f"\n--- {name} ---")
+            lines.append(code.rstrip() or "(empty file)")
+            lines.append("")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def print_testing_result(
+    result: TestingResult, *, include_source: bool = False
+) -> None:
+    """Print a formatted TestingResult to stdout."""
+    print(format_testing_result(result, include_source=include_source))

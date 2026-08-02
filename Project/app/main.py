@@ -2,7 +2,7 @@
 app/main.py
 ===========
 
-Demonstration entry point for the Codebase Assistant analysis pipeline.
+Interactive multi-agent CLI for the Codebase Assistant.
 
 Run from the project root (the directory containing both `app/` and
 `codebase_assistant/`):
@@ -11,11 +11,9 @@ Run from the project root (the directory containing both `app/` and
     python app/main.py . --question "Find security bugs"
     python app/main.py https://github.com/pallets/flask
 
-A GitHub HTTPS URL is cloned into a temporary directory, analyzed, and
-then deleted. Local paths are analyzed in place.
-
-If no repository is given on the command line, you will be prompted for
-one interactively.
+The repository (local path or GitHub URL) is prepared once. The CLI then
+loops a menu that dispatches to the existing CodeAnalysisAgent,
+DocumentationAgent, or TestingAgent without merging their logic.
 """
 
 from __future__ import annotations
@@ -27,6 +25,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import uuid
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -41,15 +40,26 @@ if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
 from codebase_assistant.agents.code_analysis_agent import CodeAnalysisAgent  # noqa: E402
+from codebase_assistant.agents.documentation_agent import DocumentationAgent  # noqa: E402
+from codebase_assistant.agents.testing_agent import TestingAgent  # noqa: E402
 from codebase_assistant.config import Config  # noqa: E402
 from codebase_assistant.exceptions.tool_exceptions import (  # noqa: E402
     InvalidRepositoryURLError,
     RepositoryCloneError,
 )
-from codebase_assistant.schemas.schemas import AgentType  # noqa: E402
+from codebase_assistant.schemas.schemas import (  # noqa: E402
+    AgentRequest,
+    AgentType,
+    DocumentationResult,
+    TestingResult,
+)
 from codebase_assistant.supervisor import Supervisor  # noqa: E402
 from codebase_assistant.tools.github_tools import GitHubTools  # noqa: E402
-from report_formatter import print_report  # noqa: E402
+from report_formatter import (  # noqa: E402
+    print_documentation_result,
+    print_report,
+    print_testing_result,
+)
 
 #: Clones made during this execution, keyed by canonical repository URL.
 _CLONE_CACHE: Dict[str, str] = {}
@@ -57,23 +67,41 @@ _CLONE_CACHE: Dict[str, str] = {}
 #: Temporary directories holding those clones, removed on exit.
 _TEMPORARY_ROOTS: List[str] = []
 
+MENU_TEXT = """\
+=================================
+Select an agent
+=================================
+
+1. Code Analysis Agent
+
+2. Documentation Agent
+
+3. Testing Agent
+
+4. Exit
+
+Choice: """
+
 
 def parse_args() -> argparse.Namespace:
     """
-    Parse command-line arguments for the demo entry point.
+    Parse command-line arguments for the interactive CLI.
 
     Returns:
         Parsed arguments with an optional repository path and question.
     """
     parser = argparse.ArgumentParser(
-        description="Run the Codebase Assistant analysis pipeline on a repository.",
+        description=(
+            "Interactive Codebase Assistant CLI. Prepare a repository once, "
+            "then choose Code Analysis, Documentation, or Testing agents."
+        ),
     )
     parser.add_argument(
         "repository",
         nargs="?",
         help=(
-            "Local path or GitHub HTTPS URL of the repository to analyze. "
-            "A URL is cloned to a temporary directory and removed afterwards. "
+            "Local path or GitHub HTTPS URL of the repository. "
+            "A URL is cloned to a temporary directory and removed on exit. "
             "If omitted, you will be prompted."
         ),
     )
@@ -81,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         "--question",
         "-q",
         default="Find likely bugs and correctness problems in this code.",
-        help="Natural language question to drive retrieval and analysis.",
+        help="Natural language question for the Code Analysis Agent.",
     )
     color = parser.add_mutually_exclusive_group()
     color.add_argument(
@@ -100,9 +128,6 @@ def parse_args() -> argparse.Namespace:
 def read_repository_reference(raw_reference: Optional[str]) -> str:
     """
     Read the repository reference, prompting when none was supplied.
-
-    The reference may be a local path or a GitHub HTTPS URL; classifying
-    it is left to the caller.
 
     Args:
         raw_reference: Value from the command line, or None to prompt.
@@ -126,27 +151,13 @@ def read_repository_reference(raw_reference: Optional[str]) -> str:
 
 
 def _remove_readonly(func, path, _excinfo) -> None:
-    """
-    Retry a failed removal after clearing the read-only bit.
-
-    Git writes object files read-only, which blocks deletion on Windows.
-
-    Args:
-        func: The removal function that failed.
-        path: Path it failed on.
-        _excinfo: Exception (or exc_info) reported by shutil.
-    """
+    """Retry a failed removal after clearing the read-only bit."""
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
 
 def remove_temporary_tree(path: str) -> None:
-    """
-    Delete a temporary directory tree, tolerating read-only git objects.
-
-    Args:
-        path: Directory to remove. Missing paths are ignored.
-    """
+    """Delete a temporary directory tree, tolerating read-only git objects."""
     if not os.path.isdir(path):
         return
 
@@ -154,7 +165,6 @@ def remove_temporary_tree(path: str) -> None:
         try:
             shutil.rmtree(path, onexc=_remove_readonly)
         except TypeError:
-            # Python < 3.12 does not accept `onexc`.
             shutil.rmtree(path, onerror=_remove_readonly)
     except OSError as exc:
         print(
@@ -166,10 +176,6 @@ def remove_temporary_tree(path: str) -> None:
 def normalize_repository_url(repo_url: str) -> str:
     """
     Build a canonical key identifying a remote repository.
-
-    A trailing `.git`, a trailing slash, and letter case are all
-    cosmetic on GitHub, so URLs differing only in those ways describe
-    the same repository and should share one clone.
 
     Args:
         repo_url: Remote repository URL.
@@ -189,10 +195,6 @@ def normalize_repository_url(repo_url: str) -> str:
 def clone_or_reuse_repository(github_tools: GitHubTools, repo_url: str) -> str:
     """
     Make a remote repository available locally, reusing an earlier clone.
-
-    Clones made during this execution are cached by canonical URL, so
-    asking for the same repository twice does not clone it twice. Every
-    clone lives under a temporary directory removed on exit.
 
     Args:
         github_tools: The existing GitHubTools component to clone with.
@@ -227,12 +229,7 @@ def clone_or_reuse_repository(github_tools: GitHubTools, repo_url: str) -> str:
 
 
 def cleanup_temporary_clones() -> None:
-    """
-    Remove every temporary clone created during this execution.
-
-    Safe to call more than once; registered with `atexit` so an
-    unexpected exit still leaves no clone behind.
-    """
+    """Remove every temporary clone created during this execution."""
     while _TEMPORARY_ROOTS:
         remove_temporary_tree(_TEMPORARY_ROOTS.pop())
     _CLONE_CACHE.clear()
@@ -243,20 +240,16 @@ atexit.register(cleanup_temporary_clones)
 
 def resolve_repository_path(raw_path: Optional[str]) -> str:
     """
-    Resolve and validate the repository path.
-
-    Accepts a command-line value or prompts when none was supplied.
-    The path must exist and be a directory.
+    Resolve and validate a local repository path.
 
     Args:
-        raw_path: Path from the command line, or None to prompt.
+        raw_path: Local path from the command line or prompt.
 
     Returns:
         The absolute, normalized repository path.
 
     Raises:
-        SystemExit: If the path is missing, not a directory, or empty
-            after prompting.
+        SystemExit: If the path is missing or not a directory.
     """
     candidate = (raw_path or "").strip()
 
@@ -280,22 +273,73 @@ def resolve_repository_path(raw_path: Optional[str]) -> str:
     return resolved
 
 
-def run_analysis(
+def prepare_repository(supervisor: Supervisor, reference: str) -> str:
+    """
+    Resolve a local path or clone a GitHub URL once for the session.
+
+    Args:
+        supervisor: Running Supervisor (provides GitHubTools).
+        reference: Local path or GitHub HTTPS URL.
+
+    Returns:
+        Absolute path to the repository on disk.
+
+    Raises:
+        SystemExit: If the reference cannot be prepared.
+    """
+    if not GitHubTools.is_remote_reference(reference):
+        return resolve_repository_path(reference)
+
+    try:
+        return clone_or_reuse_repository(supervisor.github_tools, reference)
+    except InvalidRepositoryURLError as exc:
+        print(f"Error: invalid repository URL. {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except RepositoryCloneError as exc:
+        print(f"Error: could not clone repository. {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def prompt_choice() -> str:
+    """
+    Show the agent menu and return the user's raw choice.
+
+    Returns:
+        The stripped choice string, or empty on EOF/interrupt.
+    """
+    try:
+        return input(MENU_TEXT).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "4"
+
+
+def ask_yes_no(prompt: str) -> bool:
+    """
+    Ask a yes/no question; default to no on empty/cancel.
+
+    Args:
+        prompt: Question to display.
+
+    Returns:
+        True only for an affirmative answer.
+    """
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes"}
+
+
+def run_code_analysis(
     agent: CodeAnalysisAgent,
     repository_path: str,
     question: str,
     color: Optional[bool],
 ) -> None:
-    """
-    Analyze a repository already present on disk and print the report.
-
-    Args:
-        agent: The Code Analysis Agent to run.
-        repository_path: Local directory to analyze.
-        question: Natural language question driving the analysis.
-        color: Force ANSI color on/off, or None to auto-detect.
-    """
-    print(f"Analyzing {repository_path} ...")
+    """Run the existing CodeAnalysisAgent and print its report."""
+    print(f"\nRunning Code Analysis Agent on {repository_path} ...")
     report = agent.analyze_repository(
         repository_path=repository_path,
         question=question,
@@ -303,14 +347,143 @@ def run_analysis(
     print_report(report, color=color)
 
 
+def run_documentation_agent(
+    agent: DocumentationAgent, repository_path: str
+) -> None:
+    """Run the existing DocumentationAgent and print its result."""
+    print(f"\nRunning Documentation Agent on {repository_path} ...")
+    response = agent.handle(
+        AgentRequest(
+            task_id=str(uuid.uuid4()),
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Generate a README summary for this repository.",
+            context={
+                "repo_path": repository_path,
+                "repository_path": repository_path,
+                "doc_type": "readme",
+            },
+        )
+    )
+
+    if not response.success:
+        errors = response.errors or ["Documentation generation failed."]
+        print("Documentation Agent error:")
+        for error in errors:
+            print(f"  - {error}")
+        return
+
+    if isinstance(response.output, DocumentationResult):
+        print_documentation_result(response.output)
+    else:
+        print(response.output)
+
+
+def run_testing_agent(agent: TestingAgent, repository_path: str) -> None:
+    """Run the existing TestingAgent and print its result."""
+    print(f"\nRunning Testing Agent on {repository_path} ...")
+    response = agent.handle(
+        AgentRequest(
+            task_id=str(uuid.uuid4()),
+            agent_type=AgentType.TESTING,
+            instruction=(
+                "Generate pytest unit tests for this repository, covering "
+                "functions, methods, edge cases, invalid inputs, and "
+                "common failure scenarios."
+            ),
+            context={
+                "repo_path": repository_path,
+                "repository_path": repository_path,
+            },
+        )
+    )
+
+    if not response.success:
+        errors = response.errors or ["Test generation failed."]
+        print("Testing Agent error:")
+        for error in errors:
+            print(f"  - {error}")
+        return
+
+    if not isinstance(response.output, TestingResult):
+        print(response.output)
+        return
+
+    print_testing_result(response.output, include_source=False)
+    if response.output.generated_tests and ask_yes_no(
+        "View generated test source? (y/n): "
+    ):
+        print_testing_result(response.output, include_source=True)
+
+
+def interactive_loop(
+    supervisor: Supervisor,
+    repository_path: str,
+    question: str,
+    color: Optional[bool],
+) -> None:
+    """
+    Repeatedly offer the agent menu until the user exits.
+
+    Args:
+        supervisor: Wired Supervisor holding the three agents.
+        repository_path: Prepared local repository path for the session.
+        question: Default analysis question.
+        color: Color override for the analysis report.
+    """
+    analysis_agent = supervisor.agents[AgentType.CODE_ANALYSIS]
+    documentation_agent = supervisor.agents[AgentType.DOCUMENTATION]
+    testing_agent = supervisor.agents[AgentType.TESTING]
+
+    if not isinstance(analysis_agent, CodeAnalysisAgent):
+        print("Error: Code Analysis Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(documentation_agent, DocumentationAgent):
+        print("Error: Documentation Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(testing_agent, TestingAgent):
+        print("Error: Testing Agent is not available.", file=sys.stderr)
+        raise SystemExit(1)
+
+    print(f"\nRepository ready: {repository_path}")
+
+    while True:
+        choice = prompt_choice()
+
+        if choice == "1":
+            try:
+                run_code_analysis(
+                    analysis_agent, repository_path, question, color
+                )
+            except Exception as exc:
+                print(f"Code Analysis Agent error:\n  - {exc}")
+            continue
+
+        if choice == "2":
+            try:
+                run_documentation_agent(documentation_agent, repository_path)
+            except Exception as exc:
+                print(f"Documentation Agent error:\n  - {exc}")
+            continue
+
+        if choice == "3":
+            try:
+                run_testing_agent(testing_agent, repository_path)
+            except Exception as exc:
+                print(f"Testing Agent error:\n  - {exc}")
+            continue
+
+        if choice == "4":
+            print("Goodbye!")
+            return
+
+        print("Invalid selection. Please choose 1-4.")
+
+
 def main() -> None:
     """
-    Run the analysis pipeline and print a readable report.
+    Prepare one repository, then dispatch to agents from an interactive menu.
 
-    Creates a Supervisor, obtains the CodeAnalysisAgent, and runs the
-    full repository analysis without modifying the pipeline itself.
-    A GitHub URL is cloned to a temporary directory first and removed
-    once the run finishes.
+    Temporary GitHub clones are cleaned up when the process exits.
     """
     args = parse_args()
     reference = read_repository_reference(args.repository)
@@ -323,30 +496,10 @@ def main() -> None:
 
     print("Starting Codebase Assistant...")
     supervisor = Supervisor(config=Config.load())
-
-    agent = supervisor.agents[AgentType.CODE_ANALYSIS]
-    if not isinstance(agent, CodeAnalysisAgent):
-        print("Error: Code Analysis Agent is not available.", file=sys.stderr)
-        raise SystemExit(1)
-
-    if not GitHubTools.is_remote_reference(reference):
-        run_analysis(
-            agent, resolve_repository_path(reference), args.question, color
-        )
-        return
+    repository_path = prepare_repository(supervisor, reference)
 
     try:
-        repository_path = clone_or_reuse_repository(
-            supervisor.github_tools, reference
-        )
-        print("Starting analysis...")
-        run_analysis(agent, repository_path, args.question, color)
-    except InvalidRepositoryURLError as exc:
-        print(f"Error: invalid repository URL. {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
-    except RepositoryCloneError as exc:
-        print(f"Error: could not clone repository. {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
+        interactive_loop(supervisor, repository_path, args.question, color)
     finally:
         cleanup_temporary_clones()
 

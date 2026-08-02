@@ -196,6 +196,10 @@ class Config:
         out of source control are overridable: credentials, service
         URLs, storage locations, and the log level.
 
+        Precedence, highest first: the project `.env`, then variables
+        already present in the environment, then a `.env` found by
+        walking up from the working directory, then the defaults.
+
         Args:
             path: Optional path to a config file. Not yet honored.
 
@@ -206,12 +210,15 @@ class Config:
         defaults and the environment overrides.
         """
         # TODO: load settings from `path` before applying env overrides
-        # Load local `.env` into os.environ (does not override existing
-        # vars). Credentials stay out of source; never logged here.
+        # Load local `.env` into os.environ. The project `.env` overrides
+        # pre-existing process variables: a stale or placeholder key
+        # inherited from the parent shell must not silently shadow the
+        # credentials the developer actually configured. Credentials stay
+        # out of source and are never logged here.
         if load_dotenv is not None:
             project_env = Path(__file__).resolve().parent.parent / ".env"
-            load_dotenv(project_env)
-            load_dotenv()
+            load_dotenv(project_env, override=True)
+            load_dotenv(override=False)
 
         defaults = cls()
         return cls(
