@@ -82,6 +82,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """
+    Read a boolean setting from the environment.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is unset or unparseable.
+
+    Returns:
+        True for 1/true/yes/on (case-insensitive), False for
+        0/false/no/off, otherwise ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass
 class Config:
     """
@@ -105,6 +128,12 @@ class Config:
         embedding_model_name: sentence-transformers model used to embed
             chunks.
         retrieval_top_k: Number of chunks retrieved per query.
+        rerank_enabled: When True, Retriever applies an optional
+            cross-encoder pass after the vector search.
+        rerank_model_name: sentence-transformers CrossEncoder model
+            used for reranking.
+        rerank_candidates: Candidate pool size fetched before
+            reranking. Must be >= retrieval_top_k.
 
         openrouter_base_url: Base URL of the OpenRouter API.
         openrouter_api_key: OpenRouter API key. Sourced from the
@@ -150,6 +179,9 @@ class Config:
     chroma_collection_name: str = "codebase_chunks"
     embedding_model_name: str = "all-mpnet-base-v2"
     retrieval_top_k: int = 8
+    rerank_enabled: bool = False
+    rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = 24
 
     # --- Models (proposal: Tech Stack) --------------------------------
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -236,5 +268,12 @@ class Config:
                 "MEMORY_STORE_PATH", defaults.memory_store_path
             ),
             retrieval_top_k=_env_int("RETRIEVAL_TOP_K", defaults.retrieval_top_k),
+            rerank_enabled=_env_bool("RERANK_ENABLED", defaults.rerank_enabled),
+            rerank_model_name=_env_str(
+                "RERANK_MODEL_NAME", defaults.rerank_model_name
+            ),
+            rerank_candidates=_env_int(
+                "RERANK_CANDIDATES", defaults.rerank_candidates
+            ),
             log_level=_env_str("LOG_LEVEL", defaults.log_level),
         )
