@@ -53,19 +53,28 @@ from codebase_assistant.exceptions.tool_exceptions import (  # noqa: E402
     InvalidRepositoryURLError,
     RepositoryCloneError,
 )
+from codebase_assistant.memory.conversation_memory import (  # noqa: E402
+    ConversationMemory,
+)
 from codebase_assistant.schemas.schemas import (  # noqa: E402
     AgentRequest,
     AgentType,
     DocumentationResult,
+    ModelMessage,
     TestingResult,
 )
 from codebase_assistant.supervisor import Supervisor  # noqa: E402
 from codebase_assistant.tools.github_tools import GitHubTools  # noqa: E402
+from codebase_assistant.tracing.events import TraceEventType  # noqa: E402
+from codebase_assistant.tracing.tracer import Tracer  # noqa: E402
 from report_formatter import (  # noqa: E402
     print_documentation_result,
     print_report,
     print_testing_result,
 )
+
+#: Soft cap so CLI memory never persists full reports or generated source.
+_MAX_MEMORY_CONTENT_CHARS = 400
 
 #: Clones made during this execution, keyed by canonical repository URL.
 _CLONE_CACHE: Dict[str, str] = {}
@@ -226,13 +235,40 @@ def normalize_repository_url(repo_url: str) -> str:
     return "/".join([parsed.netloc.lower(), *(s.lower() for s in segments)])
 
 
-def clone_or_reuse_repository(github_tools: GitHubTools, repo_url: str) -> str:
+def _cli_trace(
+    tracer: Optional[Tracer],
+    name: str,
+    *,
+    success: Optional[bool] = True,
+    **metadata: object,
+) -> None:
+    """Record a CLI lifecycle event; never raises."""
+    if tracer is None:
+        return
+    try:
+        tracer.record(
+            TraceEventType.LIFECYCLE,
+            name,
+            component="CLI",
+            success=success,
+            **metadata,
+        )
+    except Exception:
+        pass
+
+
+def clone_or_reuse_repository(
+    github_tools: GitHubTools,
+    repo_url: str,
+    tracer: Optional[Tracer] = None,
+) -> str:
     """
     Make a remote repository available locally, reusing an earlier clone.
 
     Args:
         github_tools: The existing GitHubTools component to clone with.
         repo_url: GitHub HTTPS URL to clone.
+        tracer: Optional shared Tracer for clone events.
 
     Returns:
         Path to the cloned repository on disk.
@@ -245,6 +281,13 @@ def clone_or_reuse_repository(github_tools: GitHubTools, repo_url: str) -> str:
     cached = _CLONE_CACHE.get(key)
     if cached and os.path.isdir(cached):
         print(f"Reusing existing clone of {key}.")
+        _cli_trace(
+            tracer,
+            "repository_cloned",
+            repository_url=repo_url,
+            repository_path=cached,
+            reused=True,
+        )
         return cached
 
     print("Validating repository...")
@@ -257,6 +300,13 @@ def clone_or_reuse_repository(github_tools: GitHubTools, repo_url: str) -> str:
     print("Cloning repository...")
     github_tools.clone_repository(repo_url, destination)
     print("Repository cloned.")
+    _cli_trace(
+        tracer,
+        "repository_cloned",
+        repository_url=repo_url,
+        repository_path=destination,
+        reused=False,
+    )
 
     _CLONE_CACHE[key] = destination
     return destination
@@ -321,11 +371,30 @@ def prepare_repository(supervisor: Supervisor, reference: str) -> str:
     Raises:
         SystemExit: If the reference cannot be prepared.
     """
+    tracer = getattr(supervisor, "tracer", None)
     if not GitHubTools.is_remote_reference(reference):
-        return resolve_repository_path(reference)
+        path = resolve_repository_path(reference)
+        _cli_trace(
+            tracer,
+            "repository_selected",
+            repository_reference=reference,
+            repository_path=path,
+            remote=False,
+        )
+        return path
 
     try:
-        return clone_or_reuse_repository(supervisor.github_tools, reference)
+        path = clone_or_reuse_repository(
+            supervisor.github_tools, reference, tracer=tracer
+        )
+        _cli_trace(
+            tracer,
+            "repository_selected",
+            repository_reference=reference,
+            repository_path=path,
+            remote=True,
+        )
+        return path
     except InvalidRepositoryURLError as exc:
         print(f"Error: invalid repository URL. {exc}", file=sys.stderr)
         raise SystemExit(1) from None
@@ -366,25 +435,136 @@ def ask_yes_no(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
+def record_memory_message(
+    memory: Optional[ConversationMemory],
+    role: str,
+    content: str,
+) -> None:
+    """
+    Append one short turn to ConversationMemory when available.
+
+    Uses the existing ``add_message`` API so summarization and
+    MemoryStore persistence run automatically. Content is truncated so
+    full agent reports never enter memory.
+
+    Args:
+        memory: Session ConversationMemory, or None to skip.
+        role: Message role (``user`` or ``assistant``).
+        content: Short summary text to store.
+    """
+    if memory is None:
+        return
+    text = (content or "").strip()
+    if not text:
+        return
+    if len(text) > _MAX_MEMORY_CONTENT_CHARS:
+        text = text[: _MAX_MEMORY_CONTENT_CHARS - 3].rstrip() + "..."
+    memory.add_message(ModelMessage(role=role, content=text))
+
+
+def record_repository_loaded(
+    memory: Optional[ConversationMemory],
+    reference: str,
+    repository_path: str,
+) -> None:
+    """
+    Record the selected repository for this CLI session.
+
+    Args:
+        memory: Session ConversationMemory, or None to skip.
+        reference: Original path or URL the user supplied.
+        repository_path: Resolved local path used by agents.
+    """
+    if memory is None:
+        return
+    memory.metadata["repository_reference"] = reference
+    memory.metadata["repository_path"] = repository_path
+    record_memory_message(memory, "user", f"Repository: {reference}")
+    record_memory_message(memory, "assistant", "Repository loaded.")
+
+
+def summarize_analysis_for_memory(report: object) -> str:
+    """
+    Build a short analysis summary for ConversationMemory.
+
+    Args:
+        report: AnalysisReport-like object with finding lists.
+
+    Returns:
+        Compact counts only — never the full report body.
+    """
+    static_count = len(getattr(report, "static_findings", []) or [])
+    llm_count = len(getattr(report, "llm_findings", []) or [])
+    static_label = "finding" if static_count == 1 else "findings"
+    llm_label = "finding" if llm_count == 1 else "findings"
+    return (
+        f"{static_count} static {static_label}. "
+        f"{llm_count} grounded LLM {llm_label}."
+    )
+
+
+def summarize_documentation_for_memory(result: DocumentationResult) -> str:
+    """
+    Build a short documentation summary for ConversationMemory.
+
+    Args:
+        result: Documentation agent structured result.
+
+    Returns:
+        One-line outcome — never the README or docstring body.
+    """
+    name = (result.function_name or "").strip()
+    if not name or name.upper() == "README":
+        return "README generated."
+    return f"Documentation generated for {name}."
+
+
+def summarize_testing_for_memory(result: TestingResult) -> str:
+    """
+    Build a short testing summary for ConversationMemory.
+
+    Args:
+        result: Testing agent structured result.
+
+    Returns:
+        One-line outcome — never generated test source.
+    """
+    module_count = len(result.generated_tests or {})
+    module_label = "module" if module_count == 1 else "modules"
+    return f"Generated tests for {module_count} {module_label}."
+
+
 def run_code_analysis(
     agent: CodeAnalysisAgent,
     repository_path: str,
     question: str,
     color: Optional[bool],
+    memory: Optional[ConversationMemory] = None,
 ) -> None:
     """Run the existing CodeAnalysisAgent and print its report."""
+    record_memory_message(
+        memory,
+        "user",
+        f"Run Code Analysis\nQuestion: {question}",
+    )
     print(f"\nRunning Code Analysis Agent on {repository_path} ...")
     report = agent.analyze_repository(
         repository_path=repository_path,
         question=question,
     )
+    record_memory_message(
+        memory, "assistant", summarize_analysis_for_memory(report)
+    )
     print_report(report, color=color)
 
 
 def run_documentation_agent(
-    agent: DocumentationAgent, repository_path: str
+    agent: DocumentationAgent,
+    repository_path: str,
+    memory: Optional[ConversationMemory] = None,
 ) -> None:
     """Run the existing DocumentationAgent and print its result."""
+    record_memory_message(memory, "user", "Generate documentation")
     print(f"\nRunning Documentation Agent on {repository_path} ...")
     response = agent.handle(
         AgentRequest(
@@ -401,14 +581,23 @@ def run_documentation_agent(
 
     if not response.success:
         errors = response.errors or ["Documentation generation failed."]
+        record_memory_message(
+            memory, "assistant", "Documentation generation failed."
+        )
         print("Documentation Agent error:")
         for error in errors:
             print(f"  - {error}")
         return
 
     if isinstance(response.output, DocumentationResult):
+        record_memory_message(
+            memory,
+            "assistant",
+            summarize_documentation_for_memory(response.output),
+        )
         print_documentation_result(response.output)
     else:
+        record_memory_message(memory, "assistant", "Documentation generated.")
         print(response.output)
 
 
@@ -417,6 +606,7 @@ def run_testing_agent(
     repository_path: str,
     *,
     interactive: bool = True,
+    memory: Optional[ConversationMemory] = None,
 ) -> None:
     """
     Run the existing TestingAgent and print its result.
@@ -427,7 +617,9 @@ def run_testing_agent(
         interactive: When True, optionally prompt to view generated
             source. When False (``--agent`` mode), print the summary
             only so the CLI never blocks on stdin.
+        memory: Optional ConversationMemory for short session turns.
     """
+    record_memory_message(memory, "user", "Generate tests")
     print(f"\nRunning Testing Agent on {repository_path} ...")
     response = agent.handle(
         AgentRequest(
@@ -447,15 +639,20 @@ def run_testing_agent(
 
     if not response.success:
         errors = response.errors or ["Test generation failed."]
+        record_memory_message(memory, "assistant", "Test generation failed.")
         print("Testing Agent error:")
         for error in errors:
             print(f"  - {error}")
         return
 
     if not isinstance(response.output, TestingResult):
+        record_memory_message(memory, "assistant", "Tests generated.")
         print(response.output)
         return
 
+    record_memory_message(
+        memory, "assistant", summarize_testing_for_memory(response.output)
+    )
     print_testing_result(response.output, include_source=False)
     if (
         interactive
@@ -515,32 +712,74 @@ def interactive_loop(
     analysis_agent, documentation_agent, testing_agent = resolve_agents(
         supervisor
     )
+    memory = supervisor.conversation_memory
 
     print(f"\nRepository ready: {repository_path}")
+    _cli_trace(
+        getattr(supervisor, "tracer", None),
+        "selected_agents",
+        agents=["interactive_menu"],
+        mode="interactive",
+    )
 
     while True:
         choice = prompt_choice()
 
         if choice == "1":
+            _cli_trace(
+                getattr(supervisor, "tracer", None),
+                "selected_agents",
+                agents=["analysis"],
+                mode="interactive",
+            )
             try:
                 run_code_analysis(
-                    analysis_agent, repository_path, question, color
+                    analysis_agent,
+                    repository_path,
+                    question,
+                    color,
+                    memory=memory,
                 )
             except Exception as exc:
+                record_memory_message(
+                    memory, "assistant", f"Code Analysis failed: {exc}"
+                )
                 print(f"Code Analysis Agent error:\n  - {exc}")
             continue
 
         if choice == "2":
+            _cli_trace(
+                getattr(supervisor, "tracer", None),
+                "selected_agents",
+                agents=["documentation"],
+                mode="interactive",
+            )
             try:
-                run_documentation_agent(documentation_agent, repository_path)
+                run_documentation_agent(
+                    documentation_agent, repository_path, memory=memory
+                )
             except Exception as exc:
+                record_memory_message(
+                    memory, "assistant", f"Documentation failed: {exc}"
+                )
                 print(f"Documentation Agent error:\n  - {exc}")
             continue
 
         if choice == "3":
+            _cli_trace(
+                getattr(supervisor, "tracer", None),
+                "selected_agents",
+                agents=["testing"],
+                mode="interactive",
+            )
             try:
-                run_testing_agent(testing_agent, repository_path)
+                run_testing_agent(
+                    testing_agent, repository_path, memory=memory
+                )
             except Exception as exc:
+                record_memory_message(
+                    memory, "assistant", f"Testing failed: {exc}"
+                )
                 print(f"Testing Agent error:\n  - {exc}")
             continue
 
@@ -572,6 +811,7 @@ def run_noninteractive(
     analysis_agent, documentation_agent, testing_agent = resolve_agents(
         supervisor
     )
+    memory = supervisor.conversation_memory
     selected = (
         ("analysis", "documentation", "testing")
         if agent == "all"
@@ -580,20 +820,38 @@ def run_noninteractive(
 
     print(f"\nRepository ready: {repository_path}")
     print(f"Running agent(s): {', '.join(selected)}")
+    _cli_trace(
+        getattr(supervisor, "tracer", None),
+        "selected_agents",
+        agents=list(selected),
+        mode="noninteractive",
+    )
 
     for name in selected:
         try:
             if name == "analysis":
                 run_code_analysis(
-                    analysis_agent, repository_path, question, color
+                    analysis_agent,
+                    repository_path,
+                    question,
+                    color,
+                    memory=memory,
                 )
             elif name == "documentation":
-                run_documentation_agent(documentation_agent, repository_path)
+                run_documentation_agent(
+                    documentation_agent, repository_path, memory=memory
+                )
             else:
                 run_testing_agent(
-                    testing_agent, repository_path, interactive=False
+                    testing_agent,
+                    repository_path,
+                    interactive=False,
+                    memory=memory,
                 )
         except Exception as exc:
+            record_memory_message(
+                memory, "assistant", f"{name} agent failed: {exc}"
+            )
             print(f"{name} agent error:\n  - {exc}")
 
 
@@ -603,7 +861,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     Without ``--agent``, the interactive menu is used. With ``--agent``,
     the selected agent runs once and the process exits. Temporary GitHub
-    clones are cleaned up when the process exits.
+    clones are cleaned up when the process exits. Short conversation
+    turns are recorded on the Supervisor's ConversationMemory so history
+    persists across runs via MemoryStore.
 
     Args:
         argv: Optional argument list for tests. Defaults to
@@ -620,7 +880,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     print("Starting Codebase Assistant...")
     supervisor = Supervisor(config=Config.load())
+    _cli_trace(supervisor.tracer, "application_started")
     repository_path = prepare_repository(supervisor, reference)
+    record_repository_loaded(
+        supervisor.conversation_memory, reference, repository_path
+    )
 
     try:
         if args.agent:
@@ -636,6 +900,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 supervisor, repository_path, args.question, color
             )
     finally:
+        _cli_trace(supervisor.tracer, "application_exit")
         cleanup_temporary_clones()
 
 

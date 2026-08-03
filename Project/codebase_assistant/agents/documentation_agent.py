@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..rag.indexer import Indexer
@@ -27,6 +28,7 @@ from ..schemas.schemas import (
     RetrievedChunk,
 )
 from ..tools.filesystem_tools import FilesystemTools
+from ..tracing.events import TraceEventType
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -415,15 +417,45 @@ class DocumentationAgent(BaseAgent):
             logger.info("Documentation model unavailable; skipping generation.")
             return empty
 
+        self._trace(
+            "documentation_started",
+            mode=mode,
+            target_path=target_path,
+            workspace=workspace,
+        )
+
         # Index first so retrieval can prioritize grounded chunks.
         logger.info("Indexing repository for documentation retrieval...")
+        self._trace("indexing", event_type=TraceEventType.INGESTION, workspace=workspace)
+        index_started = time.perf_counter()
         self._ensure_index(workspace)
+        self._trace(
+            "indexing",
+            event_type=TraceEventType.INGESTION,
+            success=True,
+            duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            phase="finished",
+        )
 
         logger.info("Retrieving documentation context...")
+        self._trace(
+            "retrieval",
+            event_type=TraceEventType.RETRIEVAL,
+            phase="started",
+        )
+        retrieval_started = time.perf_counter()
         query = " ".join(
             part for part in (instruction, function_name, target_path, mode) if part
         )
         chunks = self._retrieve_context(query, target_path)
+        self._trace(
+            "retrieval",
+            event_type=TraceEventType.RETRIEVAL,
+            success=True,
+            duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+            chunks=len(chunks),
+            phase="finished",
+        )
 
         logger.info("Reading repository...")
         filesystem = self._filesystem_tools(workspace)
@@ -454,6 +486,12 @@ class DocumentationAgent(BaseAgent):
         )
 
         logger.info("Calling documentation model...")
+        self._trace(
+            "model_request",
+            event_type=TraceEventType.MODEL_CALL,
+            chunks=len(chunks),
+        )
+        model_started = time.perf_counter()
         try:
             response = self.model_client.generate(
                 [
@@ -465,7 +503,27 @@ class DocumentationAgent(BaseAgent):
             )
         except Exception as exc:
             logger.warning("Documentation model call failed: %s", exc)
+            self._trace(
+                "model_response",
+                event_type=TraceEventType.MODEL_CALL,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            )
+            self._trace(
+                "documentation_finished",
+                success=False,
+                error=str(exc),
+            )
             return empty
+
+        self._trace(
+            "model_response",
+            event_type=TraceEventType.MODEL_CALL,
+            success=True,
+            duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            content_chars=len(response.content or ""),
+        )
 
         result = self._parse_response(
             response.content,
@@ -473,6 +531,12 @@ class DocumentationAgent(BaseAgent):
             default_function_name=function_name,
         )
         logger.info("Documentation generated.")
+        self._trace(
+            "documentation_finished",
+            success=True,
+            function_name=result.function_name,
+            summary_chars=len(result.summary or ""),
+        )
         return result
 
     def _model_available(self) -> bool:

@@ -25,6 +25,7 @@ from ..schemas.schemas import MemoryRecord, ModelMessage
 if TYPE_CHECKING:
     from ..models.model_client import LLMClient
     from .memory_store import MemoryStore
+    from ..tracing.tracer import Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class ConversationMemory:
         memory_store: Optional["MemoryStore"] = None,
         conversation_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        tracer: Optional["Tracer"] = None,
     ) -> None:
         """
         Initialize ConversationMemory.
@@ -95,6 +97,7 @@ class ConversationMemory:
                 Defaults to ``\"default\"``.
             metadata: Optional metadata merged into the persisted
                 snapshot (e.g. repository path).
+            tracer: Optional shared Tracer for summarize/persist events.
         """
         if max_messages < 2:
             raise ValueError("max_messages must be at least 2.")
@@ -107,11 +110,26 @@ class ConversationMemory:
             (conversation_id or "").strip() or _DEFAULT_CONVERSATION_ID
         )
         self.metadata: Dict[str, Any] = dict(metadata or {})
+        self.tracer = tracer
         self._history: List[ModelMessage] = []
         self._summary: str = ""
 
         if self.memory_store is not None:
             self._load_from_store()
+
+    def _trace(self, name: str, *, success: Optional[bool] = True, **metadata: Any) -> None:
+        """Emit a ConversationMemory lifecycle event when tracing is on."""
+        if self.tracer is None:
+            return
+        from ..tracing.events import TraceEventType
+
+        self.tracer.record(
+            TraceEventType.MEMORY,
+            name,
+            component="ConversationMemory",
+            success=success,
+            **metadata,
+        )
 
     def add_message(self, message: ModelMessage) -> None:
         """
@@ -178,11 +196,19 @@ class ConversationMemory:
         if len(self._history) <= self.max_messages:
             return ""
 
+        self._trace("summarize_started", messages=len(self._history))
+
         if not self._model_available():
             logger.info(
                 "ConversationMemory: provider unavailable; leaving %d "
                 "message(s) unchanged.",
                 len(self._history),
+            )
+            self._trace(
+                "summarize_finished",
+                success=False,
+                error="provider unavailable",
+                messages=len(self._history),
             )
             return ""
 
@@ -198,12 +224,22 @@ class ConversationMemory:
                 "history unchanged: %s",
                 exc,
             )
+            self._trace(
+                "summarize_finished",
+                success=False,
+                error=str(exc),
+            )
             return ""
 
         if not summary or not summary.strip():
             logger.warning(
                 "ConversationMemory: empty summary returned; leaving "
                 "history unchanged."
+            )
+            self._trace(
+                "summarize_finished",
+                success=False,
+                error="empty summary",
             )
             return ""
 
@@ -221,6 +257,13 @@ class ConversationMemory:
             "kept %d recent message(s).",
             len(old_messages),
             len(recent_messages),
+        )
+        self._trace(
+            "summarize_finished",
+            success=True,
+            old_messages=len(old_messages),
+            kept_recent=len(recent_messages),
+            summary_chars=len(summary),
         )
         self._save_to_store()
         return summary
@@ -373,6 +416,12 @@ class ConversationMemory:
                 self.conversation_id,
                 exc,
             )
+            self._trace(
+                "persisted",
+                success=False,
+                conversation_id=self.conversation_id,
+                error=str(exc),
+            )
             return
 
         if not saved:
@@ -380,6 +429,20 @@ class ConversationMemory:
                 "ConversationMemory: MemoryStore refused save for %r.",
                 self.conversation_id,
             )
+            self._trace(
+                "persisted",
+                success=False,
+                conversation_id=self.conversation_id,
+                error="store refused save",
+            )
+            return
+
+        self._trace(
+            "persisted",
+            success=True,
+            conversation_id=self.conversation_id,
+            messages=len(self._history),
+        )
 
     @staticmethod
     def _format_transcript(messages: List[ModelMessage]) -> str:

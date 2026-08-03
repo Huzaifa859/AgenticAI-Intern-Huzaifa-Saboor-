@@ -12,6 +12,8 @@ temporary repository on disk.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, List, Optional
 from unittest.mock import MagicMock, patch
@@ -113,7 +115,9 @@ def test_successful_test_generation(_mock_index: Any, sample_repo: Path) -> None
     assert response.success is True
     assert response.errors == []
     assert isinstance(response.output, TestingResult)
-    assert response.output.summary == VALID_TEST_PAYLOAD["summary"]
+    assert VALID_TEST_PAYLOAD["summary"] in response.output.summary
+    assert "Execution:" in response.output.summary
+    assert "passed" in response.output.summary
     assert "test_math_utils.py" in response.output.generated_tests
     assert "def test_add_happy_path" in response.output.generated_tests["test_math_utils.py"]
     assert response.output.coverage_estimate == pytest.approx(0.72)
@@ -473,3 +477,130 @@ def test_generate_receives_configured_temperature_and_max_tokens(
     kwargs = client.generate.call_args.kwargs
     assert kwargs.get("temperature") == 0.0
     assert kwargs.get("max_tokens") == _TEST_MAX_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# Generated-test execution
+# ---------------------------------------------------------------------------
+
+
+def test_execute_passing_tests_reports_passes(sample_repo: Path) -> None:
+    """Passing generated tests should report passed > 0 and failed == 0."""
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {
+        "test_math_utils.py": (
+            "from math_utils import add\n\n"
+            "def test_add_happy_path():\n"
+            "    assert add(1, 2) == 3\n"
+        )
+    }
+
+    summary = agent._execute_generated_tests(str(sample_repo), generated)
+
+    assert "Execution:" in summary
+    assert "1 passed" in summary
+    assert "0 failed" in summary
+    assert generated["test_math_utils.py"].startswith("from math_utils")
+
+
+def test_execute_failing_tests_reports_failures(sample_repo: Path) -> None:
+    """Intentionally failing asserts should surface as failed counts."""
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {
+        "test_math_utils.py": (
+            "from math_utils import add\n\n"
+            "def test_add_wrong_expectation():\n"
+            "    assert add(1, 2) == 999\n"
+        )
+    }
+
+    summary = agent._execute_generated_tests(str(sample_repo), generated)
+
+    assert "Execution:" in summary
+    assert "1 failed" in summary
+    assert "0 passed" in summary
+
+
+def test_execute_syntax_errors_reported_without_crash(
+    sample_repo: Path,
+) -> None:
+    """Syntax errors must not raise; errors are reported in the summary."""
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {
+        "test_broken.py": "def test_oops(\n    assert True\n"
+    }
+
+    summary = agent._execute_generated_tests(str(sample_repo), generated)
+
+    assert "Execution:" in summary
+    assert "errors" in summary
+    # Source mapping left untouched.
+    assert generated["test_broken.py"] == "def test_oops(\n    assert True\n"
+
+
+def test_execute_cleans_up_temp_directory(
+    sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Temporary test directories must be removed after execution."""
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {
+        "test_math_utils.py": (
+            "from math_utils import add\n\n"
+            "def test_add():\n"
+            "    assert add(2, 2) == 4\n"
+        )
+    }
+    created: List[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _tracking_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
+
+    agent._execute_generated_tests(str(sample_repo), generated)
+
+    assert created, "expected a temp directory to be created"
+    assert all(not os.path.isdir(path) for path in created)
+
+def test_execute_missing_pytest_still_returns_generated_tests(
+    sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing pytest skips execution but leaves generated_tests intact."""
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {"test_math_utils.py": "def test_ok():\n    assert True\n"}
+    original = generated["test_math_utils.py"]
+
+    real_import = __import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "pytest":
+            raise ImportError("No module named pytest")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", _fake_import)
+
+    summary = agent._execute_generated_tests(str(sample_repo), generated)
+
+    assert "skipped" in summary.lower()
+    assert "pytest" in summary.lower()
+    assert generated["test_math_utils.py"] == original
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_pipeline_appends_execution_and_keeps_source(
+    _mock_index: Any, sample_repo: Path
+) -> None:
+    """Full handle() path executes tests and preserves generated source."""
+    client = _mock_client(content=json.dumps(VALID_TEST_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+    original_source = VALID_TEST_PAYLOAD["generated_tests"]["test_math_utils.py"]
+
+    response = agent.handle(_request(sample_repo))
+
+    assert response.success is True
+    assert response.output.generated_tests["test_math_utils.py"] == original_source
+    assert "Execution:" in response.output.summary
+    assert "2 passed" in response.output.summary or "passed" in response.output.summary

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
@@ -23,6 +24,8 @@ from ..models.model_client import LLMClient
 from ..rag.retriever import Retriever
 from ..schemas.schemas import AgentRequest, AgentResponse, AgentType
 from ..tools.registry import ToolRegistry
+from ..tracing.events import TraceEventType
+from ..tracing.tracer import Tracer
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -49,6 +52,7 @@ class BaseAgent(ABC):
         tool_registry: Optional[ToolRegistry] = None,
         retriever: Optional[Retriever] = None,
         memory_store: Optional[MemoryStore] = None,
+        tracer: Optional[Tracer] = None,
     ) -> None:
         """
         Initialize the BaseAgent with its shared dependencies.
@@ -58,11 +62,112 @@ class BaseAgent(ABC):
             tool_registry: Registry used to invoke tools.
             retriever: RAG retriever used to fetch relevant context.
             memory_store: Long-term memory store.
+            tracer: Optional shared Tracer for lifecycle events.
         """
         self.model_client = model_client
         self.tool_registry = tool_registry
         self.retriever = retriever
         self.memory_store = memory_store
+        self.tracer = tracer
+
+    def _trace(
+        self,
+        name: str,
+        *,
+        component: Optional[str] = None,
+        event_type: TraceEventType = TraceEventType.AGENT_RUN,
+        success: Optional[bool] = True,
+        duration_ms: Optional[float] = None,
+        error: Optional[str] = None,
+        **metadata: Any,
+    ) -> None:
+        """
+        Record one trace event without affecting agent business logic.
+
+        Tracing failures are swallowed by the Tracer itself.
+        """
+        if self.tracer is None:
+            return
+        self.tracer.record(
+            event_type,
+            name,
+            component=component or self.__class__.__name__,
+            success=success,
+            duration_ms=duration_ms,
+            error=error,
+            **metadata,
+        )
+
+    def _trace_span_start(
+        self, name: str, *, component: Optional[str] = None, **metadata: Any
+    ) -> str:
+        """Begin a timed span; returns "" when tracing is unavailable."""
+        if self.tracer is None:
+            return ""
+        meta = dict(metadata)
+        meta["component"] = component or self.__class__.__name__
+        return self.tracer.start_span(name, meta)
+
+    def _trace_span_end(
+        self,
+        span_id: str,
+        *,
+        success: bool = True,
+        error: Optional[str] = None,
+        **metadata: Any,
+    ) -> None:
+        """Close a timed span started by ``_trace_span_start``."""
+        if self.tracer is None or not span_id:
+            return
+        meta = dict(metadata)
+        meta["success"] = success
+        if error:
+            meta["error"] = error
+        self.tracer.end_span(span_id, meta)
+
+    def _timed_trace(
+        self,
+        name: str,
+        *,
+        component: Optional[str] = None,
+        event_type: TraceEventType = TraceEventType.AGENT_RUN,
+        **metadata: Any,
+    ):
+        """
+        Context manager that records started/finished style durations.
+
+        Yields a mutable dict the caller may update with result metadata
+        before exit. Never raises into the agent.
+        """
+        agent = self
+
+        class _Timer:
+            def __init__(self) -> None:
+                self.meta: Dict[str, Any] = dict(metadata)
+                self.success: bool = True
+                self.error: Optional[str] = None
+                self._started = time.perf_counter()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, _tb) -> bool:
+                duration_ms = (time.perf_counter() - self._started) * 1000.0
+                if exc_type is not None:
+                    self.success = False
+                    self.error = str(exc)
+                agent._trace(
+                    name,
+                    component=component,
+                    event_type=event_type,
+                    success=self.success,
+                    duration_ms=duration_ms,
+                    error=self.error,
+                    **self.meta,
+                )
+                return False
+
+        return _Timer()
 
     def get_tool(self, name: str) -> Optional[Callable[..., Any]]:
         """

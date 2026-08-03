@@ -39,6 +39,8 @@ from .schemas.schemas import AgentRequest, AgentResponse, AgentType
 from .tools.filesystem_tools import FilesystemTools
 from .tools.github_tools import GitHubTools
 from .tools.registry import ToolRegistry
+from .tracing.events import TraceEventType
+from .tracing.tracer import Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,13 @@ class Supervisor:
         """
         self.config = config or Config.load()
 
+        # Shared run tracer — never aborts startup if construction fails.
+        try:
+            self.tracer = Tracer(run_id=str(uuid.uuid4()))
+        except Exception as exc:
+            logger.warning("Tracer construction failed; continuing without tracing: %s", exc)
+            self.tracer = Tracer(enabled=False)
+
         # Shared OpenRouter provider for code analysis. Construction
         # failures never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
@@ -115,13 +124,17 @@ class Supervisor:
         self.tool_registry = ToolRegistry()
         self.indexer = Indexer(vector_store_path=self.config.vector_store_path)
         self.retriever = Retriever(vector_store_path=self.config.vector_store_path)
-        self.memory_store = MemoryStore(storage_path=self.config.memory_store_path)
+        self.memory_store = MemoryStore(
+            storage_path=self.config.memory_store_path,
+            tracer=self.tracer,
+        )
         # Short-term session history. Uses the OpenRouter-backed client
         # for summarization and the shared MemoryStore so conversations
         # reload across runs.
         self.conversation_memory = ConversationMemory(
             model_client=self.model_client,
             memory_store=self.memory_store,
+            tracer=self.tracer,
         )
 
         # Tools.
@@ -134,6 +147,18 @@ class Supervisor:
 
         # TODO: register MCP-based tools once MCP integration is implemented
 
+    def _trace(self, name: str, *, success: Optional[bool] = True, **metadata: object) -> None:
+        """Record a Supervisor lifecycle event; never raises."""
+        try:
+            self.tracer.record(
+                TraceEventType.LIFECYCLE,
+                name,
+                component="Supervisor",
+                success=success,
+                **metadata,
+            )
+        except Exception as exc:
+            logger.warning("Supervisor tracing failed for %r: %s", name, exc)
     def _register_tools(self) -> None:
         """
         Expose the shared tool instances through the ToolRegistry.
@@ -294,6 +319,7 @@ class Supervisor:
             tool_registry=self.tool_registry,
             retriever=self.retriever,
             memory_store=self.memory_store,
+            tracer=self.tracer,
         )
         logger.info(
             "DocumentationAgent received an OpenRouter-backed LLMClient "
@@ -306,6 +332,7 @@ class Supervisor:
                 model_client=self.model_client,
                 tool_registry=self.tool_registry,
                 memory_store=self.memory_store,
+                tracer=self.tracer,
             ),
             AgentType.DOCUMENTATION: documentation_agent,
             AgentType.TESTING: TestingAgent(
@@ -313,6 +340,7 @@ class Supervisor:
                 tool_registry=self.tool_registry,
                 retriever=self.retriever,
                 memory_store=self.memory_store,
+                tracer=self.tracer,
             ),
         }
 
@@ -345,7 +373,13 @@ class Supervisor:
             result it managed to produce.
         """
         target = str(repo_path or self.config.workspace_root or ".")
+        self._trace("goal_received", goal=goal, repo_path=target)
         agent_types = self._select_agent_types(goal)
+        self._trace(
+            "routing_decision",
+            goal=goal,
+            agents=[agent_type.value for agent_type in agent_types],
+        )
 
         logger.info(
             "Goal routed to %d agent(s): %s",
@@ -357,7 +391,19 @@ class Supervisor:
         for agent_type in agent_types:
             request = self._build_request(agent_type, goal, target)
             logger.info("Dispatching %s for goal.", agent_type.value)
+            self._trace(
+                "dispatch_start",
+                agent=agent_type.value,
+                task_id=request.task_id,
+            )
             response = self._dispatch_safely(request)
+            self._trace(
+                "dispatch_finish",
+                agent=agent_type.value,
+                task_id=request.task_id,
+                success=response.success,
+                errors=list(response.errors or []),
+            )
             if not response.success:
                 logger.warning(
                     "%s reported failure; continuing with the remaining agents.",
@@ -366,6 +412,12 @@ class Supervisor:
             responses.append(response)
 
         self._log_aggregate(responses)
+        self._trace(
+            "aggregation_complete",
+            agents=[r.agent_type.value for r in responses],
+            succeeded=sum(1 for r in responses if r.success),
+            failed=sum(1 for r in responses if not r.success),
+        )
         return responses
 
     @staticmethod
@@ -534,13 +586,55 @@ class Supervisor:
             supported task types; nothing is raised.
         """
         agent_type = self._route_task_strict(task_name)
+        self._trace(
+            "task_received",
+            task_name=task_name,
+            repo_path=str(repo_path or ""),
+        )
         if agent_type is None:
-            return self._unknown_task_response(task_name)
+            self._trace(
+                "routing_decision",
+                task_name=task_name,
+                agents=[],
+                success=False,
+            )
+            response = self._unknown_task_response(task_name)
+            self._trace(
+                "aggregation_complete",
+                agents=[],
+                succeeded=0,
+                failed=1,
+            )
+            return response
 
         target = str(repo_path or self.config.workspace_root or ".")
         request = self._build_request(agent_type, task_name, target)
+        self._trace(
+            "routing_decision",
+            task_name=task_name,
+            agents=[agent_type.value],
+        )
         logger.info("Dispatching %s for task %r.", agent_type.value, task_name)
-        return self._dispatch_safely(request)
+        self._trace(
+            "dispatch_start",
+            agent=agent_type.value,
+            task_id=request.task_id,
+        )
+        response = self._dispatch_safely(request)
+        self._trace(
+            "dispatch_finish",
+            agent=agent_type.value,
+            task_id=request.task_id,
+            success=response.success,
+            errors=list(response.errors or []),
+        )
+        self._trace(
+            "aggregation_complete",
+            agents=[response.agent_type.value],
+            succeeded=1 if response.success else 0,
+            failed=0 if response.success else 1,
+        )
+        return response
 
     @staticmethod
     def _route_task_strict(task_name: str) -> Optional[AgentType]:

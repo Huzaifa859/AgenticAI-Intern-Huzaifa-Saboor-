@@ -39,16 +39,36 @@ class MemoryStore:
     consult across multiple sessions.
     """
 
-    def __init__(self, storage_path: str = "./.codebase_assistant/memory_store") -> None:
+    def __init__(
+        self,
+        storage_path: str = "./.codebase_assistant/memory_store",
+        tracer: Optional["Tracer"] = None,
+    ) -> None:
         """
         Initialize the MemoryStore and ensure its directory exists.
 
         Args:
             storage_path: Filesystem path where memory records are
                 persisted.
+            tracer: Optional shared Tracer for load/save/delete events.
         """
         self.storage_path = storage_path
+        self.tracer = tracer
         self._ensure_storage()
+
+    def _trace(self, name: str, *, success: Optional[bool] = True, **metadata: Any) -> None:
+        """Emit a MemoryStore lifecycle event when a Tracer is attached."""
+        if self.tracer is None:
+            return
+        from ..tracing.events import TraceEventType
+
+        self.tracer.record(
+            TraceEventType.MEMORY,
+            name,
+            component="MemoryStore",
+            success=success,
+            **metadata,
+        )
 
     def save(self, record: MemoryRecord) -> bool:
         """
@@ -63,6 +83,7 @@ class MemoryStore:
         """
         if not record or not str(record.key or "").strip():
             logger.warning("MemoryStore.save: refusing to persist a record without a key.")
+            self._trace("save", success=False, error="missing key")
             return False
 
         try:
@@ -74,11 +95,13 @@ class MemoryStore:
                 "metadata": dict(record.metadata or {}),
             }
             self._atomic_write(path, payload)
+            self._trace("save", success=True, key=record.key)
             return True
         except Exception as exc:
             logger.warning(
                 "MemoryStore.save failed for key %r: %s", record.key, exc
             )
+            self._trace("save", success=False, key=getattr(record, "key", ""), error=str(exc))
             return False
 
     def load(self, key: str) -> Optional[MemoryRecord]:
@@ -95,10 +118,12 @@ class MemoryStore:
             The MemoryRecord if found and valid, else None.
         """
         if not key or not str(key).strip():
+            self._trace("load", success=False, key=key or "", error="missing key")
             return None
 
         path = self._path_for(key)
         if not path.is_file():
+            self._trace("load", success=True, key=key, found=False)
             return None
 
         try:
@@ -111,6 +136,7 @@ class MemoryStore:
                 exc,
             )
             self._recreate_corrupt(path)
+            self._trace("load", success=False, key=key, error=str(exc))
             return None
 
         if not isinstance(data, dict):
@@ -119,14 +145,17 @@ class MemoryStore:
                 path,
             )
             self._recreate_corrupt(path)
+            self._trace("load", success=False, key=key, error="invalid shape")
             return None
 
         try:
-            return MemoryRecord(
+            record = MemoryRecord(
                 key=str(data.get("key") or key),
                 value=data.get("value"),
                 metadata=dict(data.get("metadata") or {}),
             )
+            self._trace("load", success=True, key=key, found=True)
+            return record
         except Exception as exc:
             logger.warning(
                 "MemoryStore: could not build MemoryRecord from %s (%s); "
@@ -135,6 +164,7 @@ class MemoryStore:
                 exc,
             )
             self._recreate_corrupt(path)
+            self._trace("load", success=False, key=key, error=str(exc))
             return None
 
     def search(self, query: str, top_k: int = 5) -> List[MemoryRecord]:
@@ -183,14 +213,17 @@ class MemoryStore:
             unexpected I/O failure.
         """
         if not key or not str(key).strip():
+            self._trace("delete", success=False, key=key or "", error="missing key")
             return False
         path = self._path_for(key)
         try:
             if path.is_file():
                 path.unlink()
+            self._trace("delete", success=True, key=key)
             return True
         except OSError as exc:
             logger.warning("MemoryStore.delete failed for key %r: %s", key, exc)
+            self._trace("delete", success=False, key=key, error=str(exc))
             return False
 
     def clear(self) -> bool:

@@ -28,9 +28,6 @@ unreachable, an unparseable response, an empty index -- each of these
 costs the LLM half of the analysis and leaves the static half intact,
 because a partial answer built from verified findings is worth more than
 an exception.
-
-TODO: Emit each stage to the tracing layer once `tracing/` is
-implemented; the pipeline is currently observable only through logs.
 """
 
 from __future__ import annotations
@@ -64,6 +61,8 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tools.registry import ToolRegistry
+from ..tracing.events import TraceEventType
+from ..tracing.tracer import Tracer
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -277,6 +276,7 @@ class CodeAnalysisAgent(BaseAgent):
         static_analyzer: Optional[StaticAnalyzer] = None,
         grounding_checker: Optional[GroundingChecker] = None,
         filesystem: Optional[FilesystemTools] = None,
+        tracer: Optional[Tracer] = None,
     ) -> None:
         """
         Initialize the agent and record its collaborators.
@@ -305,12 +305,14 @@ class CodeAnalysisAgent(BaseAgent):
                 repository when omitted.
             filesystem: Sandboxed file access. Built per repository when
                 omitted.
+            tracer: Optional shared Tracer for lifecycle events.
         """
         super().__init__(
             model_client=model_client,
             tool_registry=tool_registry,
             retriever=retriever,
             memory_store=memory_store,
+            tracer=tracer,
         )
         self.config = config or Config.load()
         self._indexer = indexer
@@ -380,6 +382,13 @@ class CodeAnalysisAgent(BaseAgent):
         pipeline = self._bind(repository_path)
         scope = self._scope(pipeline, repository_path)
 
+        self._trace(
+            "analysis_started",
+            repository_path=pipeline.root,
+            question=question,
+            use_rag=use_rag,
+        )
+
         # Retrieval exists to fill the prompt. With no model to prompt,
         # indexing a repository would be minutes of embedding work whose
         # only consumer is absent, so it is skipped rather than wasted.
@@ -414,6 +423,21 @@ class CodeAnalysisAgent(BaseAgent):
         report.findings = merged
         report.duplicates_removed = removed
         report.duration_seconds = time.time() - started
+
+        self._trace(
+            "merge_completed",
+            findings=len(merged),
+            duplicates_removed=removed,
+            static_findings=len(static_findings),
+            llm_findings=len(llm_findings),
+            duration_ms=report.duration_seconds * 1000.0,
+        )
+        self._trace(
+            "analysis_finished",
+            findings=len(report.findings),
+            duration_ms=report.duration_seconds * 1000.0,
+            success=True,
+        )
 
         logger.info("Analysis complete: %s", report.summary())
         return report
@@ -672,6 +696,13 @@ class CodeAnalysisAgent(BaseAgent):
         if pipeline.indexer is None:
             return None
 
+        self._trace(
+            "indexing_started",
+            event_type=TraceEventType.INGESTION,
+            repository_path=pipeline.root,
+            scope=scope,
+        )
+        index_started = time.perf_counter()
         try:
             update = pipeline.indexer.update_index(scope)
         except CodebaseAssistantError as exc:
@@ -681,9 +712,23 @@ class CodeAnalysisAgent(BaseAgent):
             note = f"Indexing failed, continuing without retrieval: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "indexing_finished",
+                event_type=TraceEventType.INGESTION,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            )
             return None
 
         logger.info("Index: %s", update.summary())
+        self._trace(
+            "indexing_finished",
+            event_type=TraceEventType.INGESTION,
+            success=True,
+            duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            summary=update.summary(),
+        )
         return update
 
     def _run_static(
@@ -715,9 +760,19 @@ class CodeAnalysisAgent(BaseAgent):
 
         # Hash the cited files now, so an edit between this point and
         # verification is detected rather than silently tolerated.
+        self._trace("grounding_started", findings=len(static.findings), source="static")
+        ground_started = time.perf_counter()
         pipeline.checker.snapshot_reports(static.findings)
         verified = pipeline.checker.verify_reports(static.findings)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        self._trace(
+            "grounding_finished",
+            success=True,
+            duration_ms=(time.perf_counter() - ground_started) * 1000.0,
+            grounded=len(verified.grounded),
+            rejected=len(verified.rejected),
+            source="static",
+        )
 
         if verified.rejected:
             note = (
@@ -754,12 +809,27 @@ class CodeAnalysisAgent(BaseAgent):
         if pipeline.retriever is None:
             return []
 
+        self._trace(
+            "retrieval_started",
+            event_type=TraceEventType.RETRIEVAL,
+            question=question,
+            scope=scope,
+        )
+        retrieval_started = time.perf_counter()
         try:
             chunks = pipeline.retriever.retrieve(question, top_k=top_k)
         except CodebaseAssistantError as exc:
             note = f"Retrieval failed, prompting without code context: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "retrieval_finished",
+                event_type=TraceEventType.RETRIEVAL,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+                chunks=0,
+            )
             return []
 
         if not chunks:
@@ -769,9 +839,23 @@ class CodeAnalysisAgent(BaseAgent):
             )
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "retrieval_finished",
+                event_type=TraceEventType.RETRIEVAL,
+                success=True,
+                duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+                chunks=0,
+            )
             return []
 
         logger.info("Retrieved %d chunk(s) for %r in %s", len(chunks), question, scope)
+        self._trace(
+            "retrieval_finished",
+            event_type=TraceEventType.RETRIEVAL,
+            success=True,
+            duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+            chunks=len(chunks),
+        )
         return chunks
 
     def _model_will_run(self) -> bool:
@@ -836,6 +920,13 @@ class CodeAnalysisAgent(BaseAgent):
 
         prompt = self.build_prompt(question, context, static_findings)
 
+        self._trace(
+            "model_request",
+            event_type=TraceEventType.MODEL_CALL,
+            chunks=len(context),
+            static_findings=len(static_findings),
+        )
+        model_started = time.perf_counter()
         try:
             response = self.model_client.generate(
                 [
@@ -850,7 +941,22 @@ class CodeAnalysisAgent(BaseAgent):
             note = f"Model call failed, keeping static findings only: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "model_response",
+                event_type=TraceEventType.MODEL_CALL,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            )
             return []
+
+        self._trace(
+            "model_response",
+            event_type=TraceEventType.MODEL_CALL,
+            success=True,
+            duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            content_chars=len(response.content or ""),
+        )
 
         report.model_used = True
         answer, proposed = self.parse_response(response.content)
@@ -868,8 +974,18 @@ class CodeAnalysisAgent(BaseAgent):
                 logger.info("Model proposed no findings.")
             return []
 
+        self._trace("grounding_started", findings=len(proposed), source="llm")
+        ground_started = time.perf_counter()
         verified = pipeline.checker.verify_reports(proposed)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        self._trace(
+            "grounding_finished",
+            success=True,
+            duration_ms=(time.perf_counter() - ground_started) * 1000.0,
+            grounded=len(verified.grounded),
+            rejected=len(verified.rejected),
+            source="llm",
+        )
 
         for result in verified.results:
             if not result.grounded:

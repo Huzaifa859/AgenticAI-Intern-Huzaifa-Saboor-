@@ -7,15 +7,25 @@ coverage, and suggesting testing strategies for a codebase.
 
 Uses the injected OpenRouter-backed LLMClient, Retriever for RAG
 context, and ToolRegistry-resolved FilesystemTools for reading
-repository source.
+repository source. After generation succeeds, tests are written to a
+temporary directory and executed via pytest's Python API; pass/fail
+counts are appended to TestingResult.summary without changing schemas
+or mutating generated_tests.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import logging
 import os
 import re
+import shutil
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..rag.indexer import Indexer
@@ -28,6 +38,7 @@ from ..schemas.schemas import (
     TestingResult,
 )
 from ..tools.filesystem_tools import FilesystemTools
+from ..tracing.events import TraceEventType
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -122,6 +133,65 @@ Style:
 - one behavior per test function; no duplicate scenarios
 - import only modules/symbols that exist in the evidence
 - never invent APIs"""
+
+
+@dataclass
+class _PytestExecutionStats:
+    """Counters collected from one pytest.main run."""
+
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    duration_seconds: float = 0.0
+    exit_code: int = 0
+    detail: str = ""
+
+
+class _PytestStatsPlugin:
+    """
+    Minimal pytest plugin that records pass/fail/skip/error counts.
+
+    Kept private to TestingAgent execution — not part of the public API.
+    """
+
+    def __init__(self) -> None:
+        self.stats = _PytestExecutionStats()
+        self._failure_messages: List[str] = []
+
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        """Accumulate per-phase test reports into ``self.stats``."""
+        if report.when == "call":
+            if report.passed:
+                self.stats.passed += 1
+            elif report.failed:
+                self.stats.failed += 1
+                self._capture_failure(report)
+            elif report.skipped:
+                self.stats.skipped += 1
+            return
+
+        # Setup/teardown failures count as errors; skipped setup as skipped.
+        if report.failed:
+            self.stats.errors += 1
+            self._capture_failure(report)
+        elif report.skipped:
+            self.stats.skipped += 1
+
+    def pytest_collectreport(self, report: Any) -> None:
+        """Count collection failures (e.g. syntax errors) as errors."""
+        if report.failed:
+            self.stats.errors += 1
+            self._capture_failure(report)
+
+    def _capture_failure(self, report: Any) -> None:
+        """Keep a short human-readable failure snippet for the summary."""
+        if self.stats.detail:
+            return
+        longrepr = getattr(report, "longrepr", None)
+        text = str(longrepr or "").strip()
+        if text:
+            self.stats.detail = text
 
 
 class TestingAgent(BaseAgent):
@@ -309,10 +379,31 @@ class TestingAgent(BaseAgent):
             logger.info("Calling OpenRouter... unavailable.")
             return empty
 
+        self._trace(
+            "testing_started",
+            workspace=workspace,
+            target_path=target_path,
+        )
+
         logger.info("Indexing repository for testing retrieval...")
+        self._trace("indexing", event_type=TraceEventType.INGESTION, phase="started")
+        index_started = time.perf_counter()
         self._ensure_index(workspace)
+        self._trace(
+            "indexing",
+            event_type=TraceEventType.INGESTION,
+            success=True,
+            duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            phase="finished",
+        )
 
         logger.info("Retrieving testing context...")
+        self._trace(
+            "retrieval",
+            event_type=TraceEventType.RETRIEVAL,
+            phase="started",
+        )
+        retrieval_started = time.perf_counter()
         query = " ".join(
             part
             for part in (
@@ -323,6 +414,14 @@ class TestingAgent(BaseAgent):
             if part
         )
         chunks = self._retrieve_context(query, target_path)
+        self._trace(
+            "retrieval",
+            event_type=TraceEventType.RETRIEVAL,
+            success=True,
+            duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+            chunks=len(chunks),
+            phase="finished",
+        )
 
         logger.info("Reading repository...")
         filesystem = self._filesystem_tools(workspace)
@@ -344,6 +443,12 @@ class TestingAgent(BaseAgent):
         )
 
         logger.info("Calling OpenRouter...")
+        self._trace(
+            "model_request",
+            event_type=TraceEventType.MODEL_CALL,
+            chunks=len(chunks),
+        )
+        model_started = time.perf_counter()
         try:
             response = self.model_client.generate(
                 [
@@ -355,7 +460,23 @@ class TestingAgent(BaseAgent):
             )
         except Exception as exc:
             logger.warning("OpenRouter testing call failed: %s", exc)
+            self._trace(
+                "model_response",
+                event_type=TraceEventType.MODEL_CALL,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            )
+            self._trace("testing_finished", success=False, error=str(exc))
             return empty
+
+        self._trace(
+            "model_response",
+            event_type=TraceEventType.MODEL_CALL,
+            success=True,
+            duration_ms=(time.perf_counter() - model_started) * 1000.0,
+            content_chars=len(response.content or ""),
+        )
 
         result = self._parse_response(response.content)
         logger.info(
@@ -363,7 +484,309 @@ class TestingAgent(BaseAgent):
             len(result.generated_tests),
             result.coverage_estimate,
         )
+
+        if result.generated_tests:
+            execution_summary = self._execute_generated_tests(
+                workspace, result.generated_tests
+            )
+            if execution_summary:
+                existing = (result.summary or "").strip()
+                combined = (
+                    f"{existing}\n{execution_summary}".strip()
+                    if existing
+                    else execution_summary
+                )
+                result = TestingResult(
+                    summary=combined,
+                    generated_tests=result.generated_tests,
+                    coverage_estimate=result.coverage_estimate,
+                )
+
+        self._trace(
+            "testing_finished",
+            success=True,
+            generated_tests=len(result.generated_tests),
+            coverage_estimate=result.coverage_estimate,
+        )
         return result
+
+    def _execute_generated_tests(
+        self,
+        workspace: str,
+        generated_tests: Dict[str, str],
+    ) -> str:
+        """
+        Write generated tests to a temp directory and run pytest on them.
+
+        Never raises. Never mutates ``generated_tests``. Failures
+        (missing pytest, I/O errors, collection/runtime errors) are
+        reported as an execution summary string.
+
+        Args:
+            workspace: Repository root used for imports (added to
+                ``sys.path`` for the duration of the run).
+            generated_tests: Mapping of filename -> source produced by
+                the LLM. Values are written unchanged.
+
+        Returns:
+            A short execution summary suitable for appending to
+            ``TestingResult.summary``.
+        """
+        if not generated_tests:
+            return ""
+
+        try:
+            import pytest as pytest_api
+        except ImportError:
+            logger.info("pytest is not installed; skipping test execution.")
+            return "Execution: skipped (pytest is not installed)."
+
+        temp_dir: Optional[str] = None
+        try:
+            temp_dir = self._create_temp_test_dir(workspace)
+        except Exception as exc:
+            logger.warning("Could not create temp test directory: %s", exc)
+            return f"Execution: skipped (could not create temp directory: {exc})."
+
+        written: List[str] = []
+        try:
+            try:
+                written = self._write_generated_tests(temp_dir, generated_tests)
+            except Exception as exc:
+                logger.warning("Failed writing generated tests: %s", exc)
+                return f"Execution: skipped (could not write tests: {exc})."
+
+            if not written:
+                return "Execution: skipped (no test files were written)."
+
+            self._trace(
+                "generated_tests_written",
+                files=len(written),
+                temp_dir=temp_dir,
+            )
+
+            self._trace("pytest_execution_started", files=len(written))
+            pytest_started = time.perf_counter()
+            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            summary = self._format_execution_summary(stats)
+            self._trace(
+                "pytest_execution_finished",
+                success=stats.failed == 0 and stats.errors == 0,
+                duration_ms=(time.perf_counter() - pytest_started) * 1000.0,
+                passed=stats.passed,
+                failed=stats.failed,
+                skipped=stats.skipped,
+                errors=stats.errors,
+                exit_code=stats.exit_code,
+            )
+            return summary
+        finally:
+            self._cleanup_temp_test_dir(temp_dir)
+
+    def _create_temp_test_dir(self, workspace: str) -> str:
+        """
+        Create a temporary directory for generated tests.
+
+        Uses an isolated system temp directory so generated modules do
+        not pollute the repository tree or confuse nested pytest runs.
+        The repository ``workspace`` is used only for imports via
+        ``sys.path`` during execution.
+        """
+        _ = workspace
+        return tempfile.mkdtemp(prefix="codebase_assistant_temp_tests_")
+
+    def _write_generated_tests(
+        self,
+        temp_dir: str,
+        generated_tests: Dict[str, str],
+    ) -> List[str]:
+        """
+        Write each generated test module into ``temp_dir``.
+
+        Args:
+            temp_dir: Destination directory.
+            generated_tests: Filename -> source mapping (unchanged).
+
+        Returns:
+            Absolute paths of files successfully written.
+        """
+        written: List[str] = []
+        used_names: set[str] = set()
+        for raw_name, source in generated_tests.items():
+            filename = self._safe_test_filename(raw_name, used_names)
+            used_names.add(filename)
+            path = os.path.join(temp_dir, filename)
+            # Keep LLM source exactly as generated.
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(source if source is not None else "")
+            written.append(path)
+            logger.info("Wrote generated test file: %s", path)
+        return written
+
+    @staticmethod
+    def _safe_test_filename(raw_name: str, used: set[str]) -> str:
+        """
+        Flatten a generated_tests key into a safe basename under temp_dir.
+
+        Args:
+            raw_name: Original key from the LLM payload.
+            used: Filenames already claimed in this write pass.
+
+        Returns:
+            A unique ``*.py`` basename with no path separators.
+        """
+        name = (raw_name or "").replace("\\", "/").strip()
+        base = os.path.basename(name) or "test_generated.py"
+        base = base.replace("..", "_")
+        if not base.endswith(".py"):
+            base = f"{base}.py"
+        if not base.startswith("test_") and not base.endswith("_test.py"):
+            # Keep LLM names as-is when already pytest-discoverable;
+            # otherwise leave unchanged — discovery still finds test_* defs.
+            pass
+        candidate = base
+        counter = 2
+        while candidate in used:
+            stem, ext = os.path.splitext(base)
+            candidate = f"{stem}_{counter}{ext}"
+            counter += 1
+        return candidate
+
+    def _run_pytest(
+        self,
+        pytest_api: Any,
+        workspace: str,
+        temp_dir: str,
+    ) -> "_PytestExecutionStats":
+        """
+        Execute pytest against ``temp_dir`` using the Python API.
+
+        Args:
+            pytest_api: The imported ``pytest`` module.
+            workspace: Repository root to put on ``sys.path``.
+            temp_dir: Directory containing the written test modules.
+
+        Returns:
+            Collected pass/fail/skip/error counts and duration.
+        """
+        plugin = _PytestStatsPlugin()
+        path_inserted = False
+        workspace_abs = os.path.abspath(workspace)
+        previous_cwd = os.getcwd()
+        started = time.perf_counter()
+        loaded_modules = self._test_module_names(temp_dir)
+
+        try:
+            if workspace_abs not in sys.path:
+                sys.path.insert(0, workspace_abs)
+                path_inserted = True
+
+            # Run from the workspace so relative imports and package
+            # discovery behave like a developer running tests locally.
+            try:
+                os.chdir(workspace_abs)
+            except OSError:
+                pass
+
+            # importlib mode avoids "import file mismatch" when the same
+            # generated basename is executed more than once in-process
+            # (e.g. nested pytest while the suite tests TestingAgent).
+            args = [
+                temp_dir,
+                "-q",
+                "--tb=line",
+                "--import-mode=importlib",
+                "-p",
+                "no:cacheprovider",
+                f"--rootdir={temp_dir}",
+                "-o",
+                "addopts=",
+            ]
+            try:
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
+                    sink
+                ):
+                    exit_code = int(
+                        pytest_api.main(args, plugins=[plugin])  # type: ignore[arg-type]
+                    )
+            except SystemExit as exc:
+                code = exc.code
+                exit_code = int(code) if isinstance(code, int) else 1
+            except Exception as exc:
+                logger.warning("pytest.main raised: %s", exc)
+                plugin.stats.errors += 1
+                plugin.stats.detail = str(exc)
+                exit_code = 3
+
+            plugin.stats.exit_code = exit_code
+            plugin.stats.duration_seconds = time.perf_counter() - started
+            if (
+                plugin.stats.passed == 0
+                and plugin.stats.failed == 0
+                and plugin.stats.skipped == 0
+                and plugin.stats.errors == 0
+                and exit_code not in (0, 5)
+            ):
+                # Collection crashed before any reports (e.g. syntax).
+                plugin.stats.errors = max(plugin.stats.errors, 1)
+                if not plugin.stats.detail:
+                    plugin.stats.detail = (
+                        f"pytest exited with code {exit_code}"
+                    )
+            return plugin.stats
+        finally:
+            for module_name in loaded_modules:
+                sys.modules.pop(module_name, None)
+            try:
+                os.chdir(previous_cwd)
+            except OSError:
+                pass
+            if path_inserted:
+                try:
+                    sys.path.remove(workspace_abs)
+                except ValueError:
+                    pass
+
+    @staticmethod
+    def _test_module_names(temp_dir: str) -> List[str]:
+        """Return importable module names for ``*.py`` files under temp_dir."""
+        names: List[str] = []
+        try:
+            entries = os.listdir(temp_dir)
+        except OSError:
+            return names
+        for entry in entries:
+            if entry.endswith(".py") and entry != "__init__.py":
+                names.append(os.path.splitext(entry)[0])
+        return names
+
+    @staticmethod
+    def _format_execution_summary(stats: "_PytestExecutionStats") -> str:
+        """Render a one-line (plus optional detail) execution summary."""
+        line = (
+            "Execution: "
+            f"{stats.passed} passed, {stats.failed} failed, "
+            f"{stats.skipped} skipped, {stats.errors} errors "
+            f"in {stats.duration_seconds:.2f}s."
+        )
+        detail = (stats.detail or "").strip()
+        if detail:
+            # Keep detail short so TestingResult.summary stays compact.
+            if len(detail) > 240:
+                detail = detail[:237].rstrip() + "..."
+            return f"{line} Detail: {detail}"
+        return line
+
+    @staticmethod
+    def _cleanup_temp_test_dir(temp_dir: Optional[str]) -> None:
+        """Remove the temporary test directory; never raise."""
+        if not temp_dir:
+            return
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("Failed cleaning temp test dir %s: %s", temp_dir, exc)
 
     def _model_available(self) -> bool:
         """Report whether the injected model client can serve requests."""
