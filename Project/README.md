@@ -1,367 +1,582 @@
-# Codebase Assistant
+# AI Software Engineering Assistant
 
-A multi-agent assistant that ingests a Python repository and helps a
-developer understand, debug, test, and document it through structured
-analysis and natural-language queries.
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![pytest](https://img.shields.io/badge/tests-pytest-green.svg)](https://docs.pytest.org/)
+[![RAG](https://img.shields.io/badge/RAG-ChromaDB-orange.svg)](https://www.trychroma.com/)
+[![MCP](https://img.shields.io/badge/MCP-local%20server-purple.svg)](#mcp-architecture)
 
-> **Status: Week 6 complete.** The foundation layer, tool layer, RAG
-> pipeline, static analysis, grounding check, and Code Analysis Agent are
-> implemented. LLM providers, the Documentation Agent, the Testing
-> Agent, and MCP integration remain placeholders.
+A multi-agent AI assistant that helps developers understand, debug, document, and test Python repositories.
 
-## Project Overview
+It ingests a local path or public GitHub URL, indexes the codebase with RAG, and routes work through a Supervisor to specialized agents — Code Analysis, Documentation, and Testing — while grounding LLM claims against real source text.
 
-Developers frequently inherit codebases they do not fully understand.
-Finding bugs, tracing logic, and assessing code quality are slow and
-manual tasks.
+> **Problem it solves:** inherited or unfamiliar codebases are slow to audit by hand. This project turns repository analysis, documentation drafts, and pytest generation into a single, structured multi-agent pipeline with retrieval, tracing, and memory.
 
-**Codebase Assistant** targets that problem with a supervisor/worker
-architecture:
+---
 
-- **Code Analysis Agent** (implemented) — runs deterministic static
-  analysis, optionally augments it with retrieved context and an LLM,
-  and returns only **grounded** `BugReport` objects whose evidence has
-  been verified against the real source.
-- **Documentation Agent** (placeholder) — intended to generate docstrings
-  and README sections.
-- **Testing Agent** (placeholder) — intended to generate and execute
-  pytest tests.
+## Table of Contents
 
-**Current scope:** Python source files (`.py`), Markdown (`.md`), and
-plain text (`.txt`) for indexing. Up to 100 files, 20,000 lines, and
-500 KB per file. Binary files, notebooks, and configured ignore
-directories (`.git`, `__pycache__`, `venv`, `node_modules`) are skipped.
+- [Features](#features)
+- [Architecture](#architecture)
+- [Multi-Agent Architecture](#multi-agent-architecture)
+- [RAG Pipeline](#rag-pipeline)
+- [MCP Architecture](#mcp-architecture)
+- [Conversation Memory](#conversation-memory)
+- [Tracing](#tracing)
+- [Supported Models](#supported-models)
+- [GitHub Integration](#github-integration)
+- [Installation](#installation)
+- [Environment Variables](#environment-variables)
+- [CLI Usage](#cli-usage)
+- [Screenshots](#screenshots)
+- [Example Outputs](#example-outputs)
+- [Testing](#testing)
+- [Project Structure](#project-structure)
+- [Current Limitations](#current-limitations)
+- [Future Work](#future-work)
+- [License](#license)
+
+---
+
+## Features
+
+| Area | Capability |
+|---|---|
+| Analysis | Repository analysis with static (`pyflakes` + `ast`) and optional LLM passes |
+| Documentation | Documentation generation grounded in retrieved code context |
+| Testing | Pytest test generation with local execution of generated tests |
+| Repositories | Local paths and GitHub HTTPS URLs |
+| RAG | Chunking, embeddings, ChromaDB vector store, semantic retrieval |
+| Indexing | Incremental indexing via content-hash manifest |
+| Quality | Grounding checker rejects hallucinated evidence before it reaches the user |
+| Models | OpenRouter with automatic model fallback; optional local Ollama |
+| Retrieval | Optional cross-encoder reranking (disabled by default) |
+| Memory | Short-term conversation memory with automatic summarization and disk persistence |
+| Observability | End-to-end tracing with ordered events and JSON export |
+| Tools | Shared `ToolRegistry` for filesystem and GitHub tools |
+| MCP | Local MCP server exposing Supervisor agent pipelines (`analysis.run`, `documentation.run`, `testing.run`, `goal.run`) |
+| Interfaces | Interactive CLI menu, non-interactive `--agent` mode, and Jupyter demo notebook |
+
+---
 
 ## Architecture
 
-The system is organized in layers:
-
-| Layer | Components | Status |
-|---|---|---|
-| Entry | `app/main.py`, `Project.ipynb` | CLI demo implemented; notebook still scaffold |
-| Orchestration | `Supervisor` | Wires agents and shared services |
-| Agents | `CodeAnalysisAgent`, `DocumentationAgent`, `TestingAgent` | Analysis agent implemented |
-| Analysis | `StaticAnalyzer`, `GroundingChecker` | Implemented |
-| RAG | `Chunker`, `EmbeddingGenerator`, `VectorDB`, `Ingestor`, `Indexer`, `Retriever` | Implemented |
-| Tools | `FilesystemTools`, `GitHubTools`, `ToolRegistry` | Implemented (GitHub API methods except clone/validate are placeholders) |
-| Models | `ModelClient`, `BaseProvider` | Client implemented; OpenRouter/Ollama providers are placeholders |
-| Schemas | `BugReport`, `CodeAnalysisReport`, … | Implemented |
-
-Shared services (`Config`, memory, tracing, hooks, plugins, skills) are
-scaffolded for later weeks.
-
-## Pipeline Diagram
-
-### Code analysis pipeline (Week 6)
-
 ```mermaid
 flowchart TD
-    User[User / CLI] --> Supervisor
-    Supervisor --> Agent[CodeAnalysisAgent]
-
-    Agent --> Index[Indexer.update_index]
-    Index --> Ingest[Ingestor]
-    Ingest --> Chunk[Chunker]
-    Chunk --> Embed[EmbeddingGenerator]
-    Embed --> Store[VectorDB / ChromaDB]
-
-    Agent --> Static[StaticAnalyzer]
-    Static --> Ground1[GroundingChecker]
-
-    Agent --> Retrieve[Retriever]
-    Retrieve --> Store
-
-    Agent --> Model[ModelClient]
-    Model --> Ground2[GroundingChecker]
-
-    Ground1 --> Merge[Merge & deduplicate]
-    Ground2 --> Merge
-    Merge --> Report[CodeAnalysisReport]
-    Report --> Output[Terminal report]
+    CLI[CLI / Notebook / MCP Client]
+    CLI --> Supervisor[Supervisor]
+    Supervisor --> Routing[Agent Routing]
+    Routing --> CAA[Code Analysis Agent]
+    Routing --> DA[Documentation Agent]
+    Routing --> TA[Testing Agent]
+    CAA --> Shared[Shared Components]
+    DA --> Shared
+    TA --> Shared
+    Shared --> Retriever[Retriever]
+    Shared --> Indexer[Indexer]
+    Shared --> Registry[Tool Registry]
+    Shared --> Memory[Conversation Memory]
+    Shared --> Tracer[Tracing]
+    Shared --> Providers[OpenRouter / Ollama Providers]
 ```
 
-When no LLM provider is configured, the agent runs **static analysis
-only** and skips indexing/retrieval (nothing consumes retrieved
-context without a model).
+The Supervisor owns shared services and dispatches each request to the correct agent. Agents do not invent a second routing layer — CLI and MCP both call the same Supervisor pipelines.
 
-### Grounding rule
+Editable architecture references also live under [`docs/architecture.excalidraw`](docs/architecture.excalidraw) and [`docs/architecture.png`](docs/architecture.png).
 
-Every finding must quote exact source text at a real line range. The
-`GroundingChecker` reads the file and rejects any report whose evidence
-does not match. Hallucinated LLM findings are logged and excluded, not
-downgraded.
+---
 
-## Current Week 6 Capabilities
+## Multi-Agent Architecture
 
-### Configuration (`config.py`)
+### Supervisor
 
-Centralized settings for ingestion limits, ChromaDB paths, embedding
-model, retrieval `top_k`, model identifiers, and logging. Environment
-variables override defaults via `Config.load()`.
-
-### Tools
-
-- **`FilesystemTools`** — sandboxed read/write/list/search with workspace
-  validation and size limits.
-- **`GitHubTools`** — `validate_repository()` and `clone_repository()`
-  (HTTPS GitHub URLs and local paths; GitPython with `git` CLI fallback).
-- **`ToolRegistry`** — register, lookup, and execute tools with structured
-  error results.
-
-### RAG pipeline
-
-- **`Chunker`** — AST-aware chunking for Python (one chunk per
-  function/class); section chunking for Markdown and plain text.
-- **`EmbeddingGenerator`** — `sentence-transformers` (`all-mpnet-base-v2`
-  by default), lazy-loaded and cached.
-- **`VectorDB`** — persistent ChromaDB storage with similarity search
-  and metadata filtering.
-- **`Ingestor`** — traverses a repository, respects limits, chunks,
-  embeds, and stores.
-- **`Indexer`** — incremental indexing via content-hash manifest.
-- **`Retriever`** — semantic search returning `RetrievedChunk` objects.
-
-### Static analysis
-
-- **`StaticAnalyzer`** — `pyflakes` + `ast` detection of:
-  - syntax errors
-  - undefined variables
-  - unused imports
-  - unreachable code
-  - duplicate definitions
-  - wrong argument counts (conservative, intra-module)
-  - mutable default arguments
-  - bare `except:` clauses
-
-### Grounding
-
-- **`GroundingChecker`** — byte-for-byte evidence verification, stale-file
-  detection, batch verification, optional ANSI-safe formatting helpers in
-  the CLI layer.
+Top-level orchestrator. It prepares the repository, wires providers and tools, routes `handle_task(...)` / `handle_goal(...)` to agents, aggregates responses, and records lifecycle traces.
 
 ### Code Analysis Agent
 
-- **`analyze_repository()`** — full pipeline: index (when a model is
-  available), static analysis, grounding, retrieval, optional LLM pass,
-  merge, deduplicate, sort by severity.
-- **`analyze_query()`** — natural-language questions over retrieved
-  context.
-- **`analyze_file()`** — deterministic single-file analysis.
+Runs the bug-finding pipeline:
 
-Without a configured provider, the agent completes successfully with
-static findings only.
+1. Optional index update when a model is available
+2. Deterministic static analysis
+3. Grounding of static findings
+4. Retrieval + LLM analysis (when a provider is available)
+5. Grounding of LLM findings
+6. Merge, deduplicate, and return a `CodeAnalysisReport`
 
-### CLI demo
+Without a configured LLM, analysis still completes using static findings only.
 
-- **`app/main.py`** — accepts a repository path (argument or prompt),
-  validates it, runs the agent, prints a formatted report.
-- **`app/report_formatter.py`** — severity grouping, wrapped evidence,
-  summary table, optional color (`--color` / `--no-color`).
+### Documentation Agent
 
-### Tests
+Retrieves relevant context for a target (for example `README` or a module) and asks the model to produce a structured `DocumentationResult` (summary, parameters, returns, example usage).
 
-- **`tests/test_week6_integration.py`** — end-to-end pipeline test on a
-  temporary buggy repository (no LLM required).
+### Testing Agent
 
-## Requirements
+Generates pytest tests for a target module/function, writes them to a temporary location, executes them with `pytest`, and returns a `TestingResult` that includes generated sources plus an execution summary.
 
-- Python 3.11+ (developed on 3.13)
-- Dependencies in [`codebase_assistant/requirements.txt`](codebase_assistant/requirements.txt):
+### ToolRegistry
 
-| Package | Purpose |
+Canonical registry of callable tools. Filesystem helpers, GitHub helpers, and MCP agent tools are registered here so agents and the MCP server resolve capabilities through one interface.
+
+---
+
+## RAG Pipeline
+
+```mermaid
+flowchart TD
+    Repo[Repository]
+    Repo --> Indexer[Indexer]
+    Indexer --> Chunker[Chunker]
+    Chunker --> Embed[Embedding Generator]
+    Embed --> Store[Vector Store / ChromaDB]
+    Store --> Retriever[Retriever]
+    Retriever --> Prompt[Prompt Builder]
+    Prompt --> LLM[LLM Provider]
+    LLM --> Ground[Grounding Checker]
+    Ground --> Report[Structured Report]
+```
+
+**How it works**
+
+1. **Indexer** walks the repository (respecting size/file caps and ignore directories) and updates the index incrementally.
+2. **Chunker** produces AST-aware chunks for Python and section chunks for Markdown/text.
+3. **Embeddings** are generated with `sentence-transformers` (`all-mpnet-base-v2` by default).
+4. **Vector store** persists chunks in ChromaDB.
+5. **Retriever** returns the top-k semantically similar chunks (optional cross-encoder rerank).
+6. **Prompt builder** packs retrieved context into grounded prompts for the agents.
+7. **LLM** proposes findings or documentation/tests.
+8. **Grounding checker** verifies quoted evidence against the real source before results are accepted.
+
+---
+
+## MCP Architecture
+
+The MCP layer is another frontend for the existing Supervisor — it does not reimplement agent logic or routing.
+
+```mermaid
+flowchart TD
+    Client[MCP Client]
+    Client --> Server[MCP Server]
+    Server --> Supervisor[Supervisor]
+    Supervisor --> Registry[Tool Registry]
+    Registry --> Agents[Code Analysis / Documentation / Testing]
+```
+
+**Exposed agent tools**
+
+| Tool | Supervisor call | Result |
+|---|---|---|
+| `analysis.run` | `handle_task("analysis: …")` | `CodeAnalysisReport` |
+| `documentation.run` | `handle_task("documentation …")` | `DocumentationResult` |
+| `testing.run` | `handle_task("testing …")` | `TestingResult` |
+| `goal.run` | `handle_goal(...)` | Ordered `AgentResponse` list |
+
+Transport is **local / in-process** for the current foundation. The server owns a Supervisor instance, mirrors its `ToolRegistry`, and records MCP request/response/tool traces.
+
+---
+
+## Conversation Memory
+
+| Component | Role |
 |---|---|
-| `pydantic` | Structured schemas |
-| `python-dotenv` | Environment loading (listed; wiring optional) |
-| `GitPython` | Repository cloning |
-| `chromadb` | Vector store |
-| `sentence-transformers` | Embeddings |
-| `pyflakes` | Static analysis |
-| `requests` | Planned for OpenRouter (Week 7) |
-| `jupyter` | Notebook interface |
-| `pytest`, `pytest-cov` | Testing |
+| `ConversationMemory` | Short-term turn history used during a CLI/session run |
+| `MemoryStore` | Persistent on-disk store for conversation snapshots |
+| Summarization | When history exceeds the configured message cap, older turns are condensed via the LLM into a system summary |
+| Persistence | After each update (and after successful summarization), state is saved through `MemoryStore` |
 
-First run downloads the embedding model (~400 MB) when indexing is
-triggered.
+If the provider is unavailable during summarization, history is left unchanged so no turns are lost.
+
+---
+
+## Tracing
+
+`Tracer` records ordered lifecycle events for a run.
+
+**What gets traced**
+
+- CLI start / agent selection
+- Supervisor routing and agent runs
+- Ingestion / retrieval / model / tool calls
+- Memory summarization
+- MCP request, tool invoked, and MCP response (with duration and success)
+
+**Event model**
+
+- Typed categories (`lifecycle`, `agent_run`, `retrieval`, `model_call`, `tool_call`, `memory`, `error`, …)
+- Monotonic sequence numbers for deterministic ordering
+- Optional duration, success flag, component name, and error text
+
+**Export**
+
+```python
+supervisor.tracer.export("trace.json")
+```
+
+Writes deterministic JSON with `run_id`, ordered `events`, and an aggregate `summary`.
+
+---
+
+## Supported Models
+
+### OpenRouter
+
+Primary remote provider. Used for analysis and as the general LLM backend when `OPENROUTER_API_KEY` is configured.
+
+Default primary model: `anthropic/claude-sonnet-4`.
+
+### Claude
+
+Reached through OpenRouter (`anthropic/claude-sonnet-4`). Preferred for code analysis and grounded bug finding.
+
+### Llama
+
+OpenRouter fallback candidate: `meta-llama/llama-3.1-8b-instruct`.
+
+Also available locally via Ollama as `llama3` (default Ollama model).
+
+### Gemma
+
+OpenRouter fallback candidate: `google/gemma-3-27b-it`.
+
+### Nemotron
+
+OpenRouter fallback candidate: `nvidia/nemotron-nano-9b-v2`.
+
+### Ollama
+
+Local provider for models served at `OLLAMA_BASE_URL` (default `http://localhost:11434`). Default model: `llama3`. Used when a local documentation/runtime path is preferred.
+
+### Automatic model fallback
+
+`OpenRouterProvider` retries across a fixed fallback chain when the API returns selected recoverable statuses (for example payment/model-unavailable cases). Authentication and malformed-request failures do **not** walk the chain — they fail fast.
+
+Fallback order:
+
+1. Primary model (default Claude Sonnet 4)
+2. Llama 3.1 8B Instruct
+3. Gemma 3 27B IT
+4. Nemotron Nano 9B
+
+---
+
+## GitHub Integration
+
+| Capability | Behavior |
+|---|---|
+| Supported URLs | HTTPS GitHub repository URLs |
+| Local paths | Existing directories on disk |
+| Clone | Validated, then cloned with GitPython (CLI `git` fallback) |
+| Temporary workspace | Remote repos are cloned into a temp directory for the run |
+| Cleanup | Temporary clones are removed when the CLI/MCP session finishes |
+| REST reads | `get_file_contents`, `list_issues`, `list_pull_requests` |
+| REST writes | `create_branch`, `commit_file`, `create_pull_request` (require `GITHUB_TOKEN`) |
+
+Public clone/validate works without a token. Authenticated GitHub write operations require `GITHUB_TOKEN`.
+
+---
 
 ## Installation
 
-From the `Project/` directory:
+All commands assume you are inside the `Project/` directory of this repository.
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Huzaifa859/AgenticAI-Intern-Huzaifa-Saboor-.git
+cd AgenticAI-Intern-Huzaifa-Saboor-/Project
+```
+
+### 2. Create a virtual environment
+
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+### 3. Install requirements
 
 ```bash
 pip install -r codebase_assistant/requirements.txt
 ```
 
-Optional environment variables (see `config.py`):
+> First RAG indexing download may pull the embedding model (~400 MB).
+
+### 4. Create `.env`
+
+Create `Project/.env`:
 
 ```bash
-export OPENROUTER_API_KEY=...          # when a provider is implemented
-export CHROMA_PERSIST_DIR=./.codebase_assistant/chroma
-export MEMORY_STORE_PATH=./.codebase_assistant/memory_store
+OPENROUTER_API_KEY=your_key_here
+# Optional:
+# GITHUB_TOKEN=ghp_...
+# OLLAMA_BASE_URL=http://localhost:11434
+# RERANK_ENABLED=false
 ```
 
-Runtime data under `.codebase_assistant/` is gitignored.
-
-## Running the Demo
-
-All commands assume your current directory is `Project/`.
-
-**Analyze a repository:**
+### 5. Run
 
 ```bash
-python app/main.py /path/to/repository
+# Interactive menu
+python app/main.py .
+
+# Non-interactive analysis
+python app/main.py . --agent analysis --question "Find security bugs"
 ```
 
-**Analyze the current project:**
+---
+
+## Environment Variables
+
+Variables below are loaded by `Config.load()` (from `Project/.env` and the process environment).
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | For LLM features | unset | OpenRouter API key |
+| `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
+| `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Local Ollama service URL |
+| `GITHUB_TOKEN` | For authenticated GitHub API writes | unset | GitHub personal access token |
+| `WORKSPACE_ROOT` | No | `.` | Default workspace root |
+| `CHROMA_PERSIST_DIR` | No | `./.codebase_assistant/chroma` | ChromaDB persistence directory |
+| `MEMORY_STORE_PATH` | No | `./.codebase_assistant/memory_store` | Persistent conversation memory path |
+| `RETRIEVAL_TOP_K` | No | `8` | Chunks returned per retrieval query |
+| `RERANK_ENABLED` | No | `false` | Enable cross-encoder reranking |
+| `RERANK_MODEL_NAME` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
+| `RERANK_CANDIDATES` | No | `24` | Candidate pool size before rerank |
+| `LOG_LEVEL` | No | `INFO` | Logging threshold |
+
+Model identifiers (`openrouter_model`, `claude_model`, `ollama_model`) are Config defaults (`anthropic/claude-sonnet-4` and `llama3`) unless changed in code/configuration objects.
+
+---
+
+## CLI Usage
+
+### Interactive menu
 
 ```bash
-python app/main.py codebase_assistant
+python app/main.py .
 ```
 
-**Ask a specific question:**
+Omitting `--agent` prepares the repository once and opens a menu for Code Analysis, Documentation, or Testing.
+
+### Analyze
 
 ```bash
-python app/main.py . --question "Find security bugs"
+python app/main.py . --agent analysis --question "Find security bugs"
 ```
 
-**Disable color output:**
+### Generate documentation
 
 ```bash
-python app/main.py codebase_assistant --no-color
+python app/main.py . --agent documentation
 ```
 
-**Run the integration test:**
+### Generate tests
 
 ```bash
-PYTHONPATH=. python -m pytest codebase_assistant/tests/test_week6_integration.py -v
+python app/main.py . --agent testing
 ```
 
-**Run the scaffold notebook** (still uses placeholder supervisor flow):
+### Run all agents
+
+```bash
+python app/main.py . --agent all
+```
+
+### GitHub URL
+
+```bash
+python app/main.py https://github.com/owner/repo --agent analysis
+```
+
+The URL is validated, cloned to a temporary workspace, analyzed, then cleaned up on exit.
+
+### Non-interactive mode
+
+Passing `--agent` runs the selected pipeline once and exits. Color can be forced or disabled:
+
+```bash
+python app/main.py codebase_assistant --agent analysis --no-color
+```
+
+### Notebook demo
 
 ```bash
 jupyter notebook Project.ipynb
 ```
 
-## Example Output
+---
 
+## Screenshots
+
+Add real screenshots under [`docs/images/`](docs/images/) when available. Placeholder captions:
+
+### CLI menu
+
+![CLI menu](docs/images/cli-menu.png)
+
+_Interactive agent selection after repository preparation._
+
+### Analysis output
+
+![Analysis output](docs/images/analysis-output.png)
+
+_Severity-grouped findings with grounded evidence snippets._
+
+### Documentation output
+
+![Documentation output](docs/images/documentation-output.png)
+
+_Structured documentation result for a target module or README._
+
+### Testing output
+
+![Testing output](docs/images/testing-output.png)
+
+_Generated pytest sources and local execution summary._
+
+> Image files are not bundled yet. See [`docs/images/README.md`](docs/images/README.md) for suggested filenames.
+
+---
+
+## Example Outputs
+
+### CodeAnalysisReport (shortened)
+
+```json
+{
+  "repository_path": "/tmp/demo-repo",
+  "question": "Find likely bugs and correctness problems in this code.",
+  "model_used": true,
+  "duplicates_removed": 1,
+  "duration_seconds": 4.82,
+  "findings": [
+    {
+      "bug_type": "unused_import",
+      "severity": "low",
+      "confidence": 0.95,
+      "file_path": "math_utils.py",
+      "function_name": "<module>",
+      "line_start": 1,
+      "line_end": 1,
+      "evidence": "from typing import Optional",
+      "detection_method": "static",
+      "description": "'typing.Optional' imported but unused"
+    }
+  ],
+  "notes": []
+}
 ```
-Analyzing .../codebase_assistant ...
-=================================================================
-Code Analysis Report
-=================================================================
 
-Repository              .../codebase_assistant
-Duration                0.44s
-Static findings         1
-LLM findings            0
-Rejected hallucinations 0
+### DocumentationResult (shortened)
 
-Notes:
-  - No model provider is available; ran deterministic analysis only.
-
-Findings
------------------------------------------------------------------
-
-LOW  (1 finding)
------------------------------------------------------------------
-  [1] unused_import  models/providers/base.py:16  static  conf=0.95
-
-  File:        models/providers/base.py
-  Lines:       16
-  Type:        unused_import
-  Method:      static
-  Confidence:  0.95
-  Function:    <module>
-  Description:
-    'typing.Optional' imported but unused
-  Evidence:
-    | from typing import List, Optional
-
-=================================================================
-Summary Statistics
-=================================================================
-
-Metric                      Value
-----------------------------------------
-Total verified findings     1
-  static                    1
-  llm                       0
-Files analyzed              65
-Severity: low               1
-Type: unused_import         1
+```json
+{
+  "file_path": "math_utils.py",
+  "function_name": "add",
+  "summary": "Return the sum of two numbers.",
+  "parameters": [
+    {"name": "a", "type": "int | float", "description": "First addend."},
+    {"name": "b", "type": "int | float", "description": "Second addend."}
+  ],
+  "returns": "The numeric sum of a and b.",
+  "example_usage": "add(2, 3)  # 5"
+}
 ```
 
-## Current Limitations
+### TestingResult (shortened)
 
-These are intentional Week 6 boundaries or not-yet-implemented pieces:
+```json
+{
+  "summary": "Generated tests for add.\n\nExecution: 1 passed, 0 failed.",
+  "generated_tests": {
+    "test_math_utils.py": "from math_utils import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+  },
+  "coverage_estimate": 0.5
+}
+```
 
-- **No live LLM provider** — `OpenRouterProvider` and `OllamaProvider`
-  are placeholders; analysis is static-only until Week 7.
-- **Documentation and Testing agents** — scaffold only.
-- **GitHub API** — only clone/validate work; PR/issue/branch methods are
-  stubs.
-- **MCP integration** — scaffold only.
-- **Memory persistence** — `MemoryStore` is a placeholder.
-- **`ReportBuilder`** — not wired into the agent output path yet.
-- **Tracing** — scaffold only.
-- **Docker** — `Dockerfile` / `docker-compose.yml` exist but are not
-  end-to-end runnable.
-- **`Project.ipynb`** — still demonstrates the old scaffold flow, not the
-  Week 6 CLI pipeline.
-- **Python-only bug detection** — static analysis targets `.py` files.
-- **Indexing cost** — first index downloads embeddings model and writes
-  to ChromaDB; skipped when no model is available.
+---
 
-## Week 7 Roadmap
+## Testing
 
-Based on the proposal and remaining placeholders:
+From `Project/`:
 
-1. **Implement `OpenRouterProvider`** — real Claude calls for code
-   analysis and grounded LLM findings.
-2. **Implement `OllamaProvider`** — local Llama 3 for documentation
-   generation.
-3. **Wire providers into `Supervisor`** — inject configured providers
-   into `ModelClient` and share `Indexer`/`Retriever` with agents.
-4. **Implement Documentation Agent** — generate `DocumentationResult`
-   objects from retrieved context.
-5. **Implement Testing Agent** — generate and execute pytest tests,
-   return `TestGenerationResult`.
-6. **Update `Project.ipynb`** — ingest → analyze → document → test flow.
-7. **Implement `ReportBuilder`** — assemble final user-facing reports
-   from verified findings.
-8. **GitHub API methods** — file retrieval, PR/issue listing (if needed
-   for MVP).
-9. **Tracing layer** — observability for pipeline stages.
-10. **Docker end-to-end** — runnable Jupyter + Ollama stack.
+```bash
+PYTHONPATH=. python -m pytest codebase_assistant/tests -q
+```
 
-## Folder Structure
+| Suite | Focus |
+|---|---|
+| Unit tests | Agents, tools, providers, schemas, memory, tracing |
+| Integration tests | Week 6 end-to-end static analysis pipeline on a seeded repo |
+| Mocked LLM tests | Documentation/testing/analysis with fake providers (no network) |
+| RAG / retrieval tests | Indexing and retrieval behavior where covered |
+| MCP tests | Server lifecycle, registry exposure, agent tools, tracing, errors |
+| GitHub tests | REST read/write helpers with mocked HTTP |
+
+Providers are mocked in automated tests; Supervisor and agent pipelines run for real where the suite requires it.
+
+---
+
+## Project Structure
 
 ```
 Project/
 ├── app/
-│   ├── main.py                 # CLI demo entry point
+│   ├── main.py                 # CLI entry point
 │   └── report_formatter.py     # Terminal report formatting
-├── Project.ipynb               # Notebook (scaffold demo)
+├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
 │   ├── architecture.excalidraw
-│   └── architecture.png
+│   ├── architecture.png
+│   └── images/                 # Screenshot drop zone
 └── codebase_assistant/
     ├── config.py
     ├── supervisor.py
-    ├── agents/
+    ├── agents/                 # Analysis, Documentation, Testing
     ├── analysis/               # StaticAnalyzer, GroundingChecker
-    ├── rag/                    # Full indexing/retrieval pipeline
-    ├── tools/
-    ├── models/
+    ├── rag/                    # Chunk → Embed → Store → Retrieve
+    ├── tools/                  # Filesystem, GitHub, ToolRegistry
+    ├── models/                 # LLMClient + OpenRouter/Ollama providers
+    ├── memory/                 # ConversationMemory + MemoryStore
+    ├── tracing/                # Tracer + TraceEvent
+    ├── mcp/                    # Local MCP server/client
     ├── schemas/
-    ├── memory/                 # Placeholder persistence
     ├── tests/
-    │   └── test_week6_integration.py
     └── requirements.txt
 ```
 
-## Design References
+---
 
-- Editable architecture diagram:
-  [`docs/architecture.excalidraw`](docs/architecture.excalidraw)
-- Rendered preview:
-  [`docs/architecture.png`](docs/architecture.png)
+## Current Limitations
+
+- Static and LLM analysis focus on **Python** repositories (Markdown/text are indexed, but bug detection targets `.py`).
+- Repository ingestion respects configured ceilings (default: 100 files, 20k LOC, 500 KB per file).
+- Generated tests can fail or need manual refinement for complex modules.
+- Cross-encoder reranking is optional and **disabled by default**.
+- MCP currently runs as a **local in-process** server (not a remote stdio/HTTP deployment).
+- GitHub **write** operations require authentication via `GITHUB_TOKEN`.
+- Docker files exist as deployment scaffolding and are not yet a polished one-command production stack.
+- Supervisor routing is keyword/goal based, not full LLM task planning.
+
+---
+
+## Future Work
+
+- LLM-driven planning and task decomposition in the Supervisor
+- Broader language support beyond Python bug detection
+- Richer coverage measurement for generated tests
+- Production-ready Docker / Compose deployment with Jupyter + Ollama
+- Lightweight web UI for report browsing
+- CI integration for repository checks on pull requests
+- Deeper semantic code search and explanation skills
+- Networked MCP transport (stdio / HTTP) for external host applications
+
+---
+
+## License
+
+No `LICENSE` file is currently published in this repository. Treat the project as source-available for internship/portfolio review unless the repository owner adds an explicit license.
