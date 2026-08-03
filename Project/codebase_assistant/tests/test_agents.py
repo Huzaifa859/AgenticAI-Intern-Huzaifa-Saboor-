@@ -33,9 +33,30 @@ def test_code_analysis_agent_returns_bug_reports() -> None:
     """Analysis should produce reports that passed the grounding check."""
 
 
-@pytest.mark.skip(reason="TODO: assert the agent abstains when retrieved context is insufficient")
-def test_code_analysis_agent_abstains_on_low_confidence() -> None:
-    """Insufficient context should abstain rather than guess."""
+def test_code_analysis_agent_abstains_on_low_confidence(tmp_path: Path) -> None:
+    """Insufficient grounded evidence should abstain rather than guess."""
+    from unittest.mock import MagicMock, patch
+
+    from codebase_assistant.agents.code_analysis_agent import CodeAnalysisAgent
+    from codebase_assistant.schemas.schemas import ModelResponse
+
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.generate.return_value = ModelResponse(
+        content='{"answer": "", "findings": []}', usage={}, raw={}
+    )
+    retriever = MagicMock()
+    retriever.retrieve.return_value = []
+    agent = CodeAnalysisAgent(model_client=client, retriever=retriever)
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+    assert report.abstention is not None
+    assert report.findings == []
+    assert "No grounded evidence was found." in report.abstention.reason
 
 
 @pytest.mark.skip(reason="TODO: assert zero findings on the clean benchmark repo")

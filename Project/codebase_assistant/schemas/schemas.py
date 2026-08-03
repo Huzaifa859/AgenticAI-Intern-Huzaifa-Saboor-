@@ -152,6 +152,27 @@ class BugReport(BaseModel):
     detection_method: Literal["static", "llm", "hybrid", "dynamic"]
 
 
+class AbstentionResult(BaseModel):
+    """
+    Explicit "cannot determine" outcome when grounded evidence is insufficient.
+
+    Distinguishes abstention from an empty findings list (which can mean
+    clean code). Agents attach this instead of inventing unsupported claims.
+
+    Attributes:
+        reason: Why the assistant abstained.
+        confidence: Confidence in the abstention decision (0.0-1.0).
+        evidence_available: Short descriptions of any evidence that was
+            available but insufficient.
+        recommended_next_steps: Concrete actions the user can take next.
+    """
+
+    reason: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_available: List[str] = Field(default_factory=list)
+    recommended_next_steps: List[str] = Field(default_factory=list)
+
+
 class DocumentationResult(BaseModel):
     """
     Represents generated documentation for a single function.
@@ -166,6 +187,7 @@ class DocumentationResult(BaseModel):
             carry "name", "type", and "description" keys.
         returns: Description of the function's return value.
         example_usage: A short example showing how to call the function.
+        abstention: Set when documentation cannot be grounded.
     """
 
     file_path: str
@@ -174,6 +196,7 @@ class DocumentationResult(BaseModel):
     parameters: List[Dict[str, Any]]
     returns: str
     example_usage: str
+    abstention: Optional[AbstentionResult] = None
 
 
 class TestingResult(BaseModel):
@@ -189,11 +212,13 @@ class TestingResult(BaseModel):
         summary: High-level summary of testing activity.
         generated_tests: Mapping of file path -> generated test code.
         coverage_estimate: Placeholder coverage estimate (0.0 - 1.0).
+        abstention: Set when tests cannot be grounded in source evidence.
     """
 
     summary: str = ""
     generated_tests: Dict[str, str] = Field(default_factory=dict)
     coverage_estimate: float = 0.0
+    abstention: Optional[AbstentionResult] = None
 
 
 class TestGenerationResult(BaseModel):

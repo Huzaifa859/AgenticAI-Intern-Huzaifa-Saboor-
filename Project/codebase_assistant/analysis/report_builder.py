@@ -2,109 +2,135 @@
 report_builder.py
 ==================
 
-Defines ReportBuilder, which assembles verified findings into the
-BugReport objects the user finally sees.
+Defines ReportBuilder helpers for labelling and abstention.
 
-This is where the proposal's labelling rules are enforced: every report
-carries a confidence score and a detection method (`static`, `llm`,
-`hybrid`, or `dynamic`) so a reader can weight static-confirmed issues
-above LLM-only suggestions.
-
-TODO: Implement real construction and merging. Note that the proposal's
-"explicit abstention over guessing" path has no schema yet — BugReport
-cannot represent "cannot determine", and an empty result list does not
-distinguish clean code from insufficient context.
-
-TODO: Add an abstention schema and return it from `abstain()`.
+Verified findings are assembled by CodeAnalysisAgent; this module owns
+the proposal's explicit abstention path so "cannot determine" is
+distinguishable from "no bugs found".
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import List, Optional, Sequence
 
-from ..schemas.schemas import BugReport
+from ..schemas.schemas import AbstentionResult, BugReport
+
+#: Default next steps when callers do not supply their own.
+_DEFAULT_NEXT_STEPS = (
+    "Add or point at the relevant source files.",
+    "Ask a more specific question about a file or function.",
+    "Ensure the repository index can retrieve the target code.",
+)
 
 
 class ReportBuilder:
     """
-    Builds and merges BugReport objects from analysis findings.
+    Builds abstention records and filters low-confidence findings.
     """
 
-    def __init__(self, min_confidence: float = 0.0) -> None:
+    def __init__(self, min_confidence: float = 0.4) -> None:
         """
         Initialize the ReportBuilder.
 
         Args:
-            min_confidence: Reports below this confidence are withheld
-                in favor of abstention.
+            min_confidence: Findings below this confidence are withheld
+                in favor of abstention when nothing stronger remains.
         """
         self.min_confidence = min_confidence
 
-    def from_static_finding(self, finding: Any) -> Optional[BugReport]:
+    def from_static_finding(self, finding: BugReport) -> Optional[BugReport]:
         """
-        Build a report from a deterministic static analysis finding.
+        Pass through a grounded static BugReport when confidence is enough.
 
         Args:
-            finding: Raw finding produced by StaticAnalyzer.
+            finding: Already-constructed BugReport from static analysis.
 
         Returns:
-            A BugReport labelled `detection_method="static"`, or None
-            (placeholder always returns None).
-
-        TODO: Implement real construction.
+            The finding, or None when it falls below ``min_confidence``.
         """
-        # TODO: implement real static finding conversion
-        return None
+        if finding is None:
+            return None
+        if float(getattr(finding, "confidence", 0.0) or 0.0) < self.min_confidence:
+            return None
+        return finding
 
-    def from_llm_finding(self, finding: Any) -> Optional[BugReport]:
+    def from_llm_finding(self, finding: BugReport) -> Optional[BugReport]:
         """
-        Build a report from an LLM-proposed finding.
+        Pass through a grounded LLM BugReport when confidence is enough.
 
         Args:
-            finding: Raw finding produced by the Code Analysis Agent.
+            finding: Already-constructed BugReport from the model path.
 
         Returns:
-            A BugReport labelled `detection_method="llm"`, or None
-            (placeholder always returns None).
-
-        TODO: Implement real construction. Anything built here must
-        still pass GroundingChecker before reaching the user.
+            The finding, or None when it falls below ``min_confidence``.
         """
-        # TODO: implement real LLM finding conversion
-        return None
+        if finding is None:
+            return None
+        if float(getattr(finding, "confidence", 0.0) or 0.0) < self.min_confidence:
+            return None
+        return finding
 
-    def merge(self, static_reports: List[BugReport], llm_reports: List[BugReport]) -> List[BugReport]:
+    def merge(
+        self, static_reports: List[BugReport], llm_reports: List[BugReport]
+    ) -> List[BugReport]:
         """
-        Combine static and LLM findings into one deduplicated list.
+        Combine static and LLM findings, dropping low-confidence items.
 
         Args:
             static_reports: Reports from the deterministic pass.
             llm_reports: Reports proposed by the model.
 
         Returns:
-            The merged report list (placeholder empty list).
-
-        TODO: Implement real merging. Where both passes describe the
-        same issue, the result should be relabelled `hybrid` and its
-        confidence raised.
+            Concatenated reports that clear ``min_confidence``.
         """
-        # TODO: implement real report merging
-        return []
+        merged: List[BugReport] = []
+        for report in list(static_reports or []) + list(llm_reports or []):
+            if float(getattr(report, "confidence", 0.0) or 0.0) >= self.min_confidence:
+                merged.append(report)
+        return merged
 
-    def abstain(self, reason: str) -> None:
+    def abstain(
+        self,
+        reason: str,
+        *,
+        confidence: float = 1.0,
+        evidence_available: Optional[Sequence[str]] = None,
+        recommended_next_steps: Optional[Sequence[str]] = None,
+    ) -> AbstentionResult:
         """
-        Record that the system cannot determine whether a bug exists.
+        Build an explicit abstention record.
 
         Args:
-            reason: Why the determination could not be made (e.g.
-                insufficient retrieved context, confidence below
-                threshold).
+            reason: Why the determination could not be made.
+            confidence: Confidence in the abstention decision.
+            evidence_available: Evidence that was present but insufficient.
+            recommended_next_steps: Suggested follow-up actions.
 
         Returns:
-            Nothing yet — there is no schema to return.
-
-        TODO: Introduce an abstention schema and return it here, so
-        "cannot determine" is distinguishable from "no bugs found".
+            An AbstentionResult suitable for attaching to agent outputs.
         """
-        # TODO: implement real abstention once a schema exists
-        return None
+        steps = list(recommended_next_steps or _DEFAULT_NEXT_STEPS)
+        evidence = [str(item) for item in (evidence_available or []) if str(item).strip()]
+        return AbstentionResult(
+            reason=str(reason or "No grounded evidence was found.").strip()
+            or "No grounded evidence was found.",
+            confidence=min(max(float(confidence), 0.0), 1.0),
+            evidence_available=evidence,
+            recommended_next_steps=steps,
+        )
+
+    def filter_confident(self, findings: Sequence[BugReport]) -> List[BugReport]:
+        """
+        Keep only findings at or above ``min_confidence``.
+
+        Args:
+            findings: Candidate grounded findings.
+
+        Returns:
+            Filtered findings list.
+        """
+        return [
+            finding
+            for finding in findings or []
+            if float(getattr(finding, "confidence", 0.0) or 0.0) >= self.min_confidence
+        ]

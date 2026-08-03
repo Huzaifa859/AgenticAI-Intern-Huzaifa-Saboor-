@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..analysis.grounding_checker import GroundingChecker, GroundingResult
+from ..analysis.report_builder import ReportBuilder
 from ..analysis.static_analyzer import AnalysisReport as StaticAnalysisReport
 from ..analysis.static_analyzer import StaticAnalyzer
 from ..config import Config
@@ -51,6 +52,7 @@ from ..models.model_client import LLMClient
 from ..rag.indexer import IndexUpdate, Indexer
 from ..rag.retriever import Retriever
 from ..schemas.schemas import (
+    AbstentionResult,
     AgentRequest,
     AgentResponse,
     AgentType,
@@ -174,6 +176,14 @@ class CodeAnalysisReport:
             index, unparseable response. Read this before trusting an
             empty result.
         duration_seconds: Wall-clock duration.
+        abstention: Explicit "cannot determine" outcome when grounded
+            evidence is insufficient. Distinct from an empty findings
+            list on a clean repository.
+        llm_proposed_count: How many findings the model proposed before
+            grounding (internal signal for abstention decisions).
+        llm_grounded_count: How many model findings survived grounding.
+        llm_parse_failed: True when the model response could not be
+            parsed as structured findings JSON.
     """
 
     repository_path: str = ""
@@ -188,6 +198,10 @@ class CodeAnalysisReport:
     duplicates_removed: int = 0
     notes: List[str] = field(default_factory=list)
     duration_seconds: float = 0.0
+    abstention: Optional[AbstentionResult] = None
+    llm_proposed_count: int = 0
+    llm_grounded_count: int = 0
+    llm_parse_failed: bool = False
 
     @property
     def static_findings(self) -> List[BugReport]:
@@ -221,6 +235,8 @@ class CodeAnalysisReport:
             A readable summary suitable for logs, a notebook cell, or
             the Supervisor's `run` payload.
         """
+        if self.abstention is not None:
+            return f"abstained: {self.abstention.reason}"
         parts = [
             f"{len(self.findings)} verified finding(s)",
             f"{len(self.static_findings)} static",
@@ -422,21 +438,24 @@ class CodeAnalysisAgent(BaseAgent):
         merged, removed = self._merge(static_findings, llm_findings)
         report.findings = merged
         report.duplicates_removed = removed
+        self._apply_abstention(report, used_rag=use_rag)
         report.duration_seconds = time.time() - started
 
         self._trace(
             "merge_completed",
-            findings=len(merged),
+            findings=len(report.findings),
             duplicates_removed=removed,
             static_findings=len(static_findings),
             llm_findings=len(llm_findings),
             duration_ms=report.duration_seconds * 1000.0,
+            abstained=report.abstention is not None,
         )
         self._trace(
             "analysis_finished",
             findings=len(report.findings),
             duration_ms=report.duration_seconds * 1000.0,
             success=True,
+            abstained=report.abstention is not None,
         )
 
         logger.info("Analysis complete: %s", report.summary())
@@ -674,6 +693,143 @@ class CodeAnalysisAgent(BaseAgent):
     # ------------------------------------------------------------------
     # Pipeline stages
     # ------------------------------------------------------------------
+
+    def _apply_abstention(
+        self, report: CodeAnalysisReport, *, used_rag: bool
+    ) -> None:
+        """
+        Attach an explicit abstention when grounded evidence is insufficient.
+
+        Clean repositories with supported files and zero verified findings
+        do not abstain — that is a successful empty result. Abstention is
+        reserved for missing inputs, unverifiable LLM claims, empty
+        retrieval with no static support, or only-too-uncertain findings.
+        """
+        builder = ReportBuilder()
+        files_analyzed = 0
+        if report.static_report is not None:
+            files_analyzed = int(getattr(report.static_report, "files_analyzed", 0) or 0)
+
+        evidence: List[str] = []
+        if files_analyzed:
+            evidence.append(f"{files_analyzed} Python file(s) analyzed")
+        if report.context:
+            evidence.append(f"{len(report.context)} retrieved chunk(s)")
+        if report.rejected:
+            evidence.append(f"{len(report.rejected)} ungrounded claim(s) discarded")
+        if report.llm_proposed_count:
+            evidence.append(
+                f"{report.llm_proposed_count} model finding(s) proposed"
+            )
+
+        confident = builder.filter_confident(report.findings)
+        uncertain = [
+            finding
+            for finding in report.findings
+            if finding not in confident
+        ]
+        report.findings = confident
+
+        if files_analyzed == 0:
+            report.abstention = builder.abstain(
+                "Repository contains no supported Python files.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Provide a repository that includes .py source files.",
+                    "Confirm ignore rules are not excluding the entire tree.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        if confident:
+            return
+
+        if uncertain:
+            report.abstention = builder.abstain(
+                "Model output is too uncertain to report grounded findings.",
+                confidence=max(
+                    (float(item.confidence) for item in uncertain),
+                    default=0.0,
+                ),
+                evidence_available=evidence
+                + [f"{len(uncertain)} low-confidence finding(s) withheld"],
+                recommended_next_steps=[
+                    "Ask about a specific file or function.",
+                    "Re-run after indexing the repository with a model available.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        if report.model_used and (
+            (
+                report.llm_proposed_count > 0
+                and report.llm_grounded_count == 0
+            )
+            or report.llm_parse_failed
+        ):
+            report.abstention = builder.abstain(
+                "LLM response could not be verified.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Inspect the retrieved source for the claimed lines.",
+                    "Ask a narrower question tied to a concrete file.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        # Empty retrieval with no model findings/answer is insufficient
+        # evidence — not the same as a clean static pass.
+        if (
+            used_rag
+            and report.model_used
+            and not report.context
+            and report.llm_proposed_count == 0
+            and not str(report.answer or "").strip()
+        ):
+            report.abstention = builder.abstain(
+                "No grounded evidence was found.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Ensure the repository was indexed successfully.",
+                    "Ask about a concrete module that exists in the repo.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
 
     def _sync_index(
         self, pipeline: _Pipeline, scope: str, report: CodeAnalysisReport
@@ -959,11 +1115,15 @@ class CodeAnalysisAgent(BaseAgent):
         )
 
         report.model_used = True
-        answer, proposed = self.parse_response(response.content)
+        raw_content = response.content or ""
+        report.llm_parse_failed = self._extract_json(raw_content) is None
+        answer, proposed = self.parse_response(raw_content)
         report.answer = answer
+        report.llm_proposed_count = len(proposed)
 
         if not proposed:
-            if not answer:
+            report.llm_grounded_count = 0
+            if report.llm_parse_failed or not answer:
                 note = (
                     "The model's response could not be parsed into findings; "
                     "keeping static findings only."
@@ -978,6 +1138,7 @@ class CodeAnalysisAgent(BaseAgent):
         ground_started = time.perf_counter()
         verified = pipeline.checker.verify_reports(proposed)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        report.llm_grounded_count = len(verified.grounded)
         self._trace(
             "grounding_finished",
             success=True,

@@ -18,8 +18,10 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..analysis.report_builder import ReportBuilder
 from ..rag.indexer import Indexer
 from ..schemas.schemas import (
+    AbstentionResult,
     AgentRequest,
     AgentResponse,
     AgentType,
@@ -307,6 +309,14 @@ class DocumentationAgent(BaseAgent):
                 errors=[str(exc)],
             )
 
+        if result.abstention is not None:
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=self.agent_type,
+                success=False,
+                output=result,
+                errors=[result.abstention.reason],
+            )
         success = bool(result.summary and result.summary.strip())
         return AgentResponse(
             task_id=request.task_id,
@@ -473,6 +483,32 @@ class DocumentationAgent(BaseAgent):
         inventory = self._repository_inventory(filesystem) if repository_wide else []
         project_files = self._read_project_files(filesystem) if repository_wide else []
 
+        if not chunks and not source_excerpts and not project_files:
+            abstained = self._abstain_result(
+                empty,
+                reason=(
+                    "Repository contains no supported Python files."
+                    if not inventory
+                    else "No grounded evidence was found."
+                ),
+                evidence_available=(
+                    [f"inventory listed {len(inventory)} path(s)"]
+                    if inventory
+                    else []
+                ),
+                recommended_next_steps=[
+                    "Point documentation at a Python module or package.",
+                    "Confirm the target path contains readable source files.",
+                ],
+            )
+            self._trace(
+                "documentation_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
         logger.info("Building prompt...")
         prompt = self._build_prompt(
             mode=mode,
@@ -530,6 +566,29 @@ class DocumentationAgent(BaseAgent):
             default_file_path=target_path,
             default_function_name=function_name,
         )
+        if not (result.summary and result.summary.strip()):
+            evidence = []
+            if chunks:
+                evidence.append(f"{len(chunks)} retrieved chunk(s)")
+            if source_excerpts:
+                evidence.append(f"{len(source_excerpts)} source excerpt(s)")
+            result = self._abstain_result(
+                empty,
+                reason="LLM response could not be verified.",
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Retry with a narrower documentation target.",
+                    "Confirm the model returned valid DocumentationResult JSON.",
+                ],
+            )
+            self._trace(
+                "documentation_finished",
+                success=False,
+                abstained=True,
+                reason=result.abstention.reason if result.abstention else "",
+            )
+            return result
+
         logger.info("Documentation generated.")
         self._trace(
             "documentation_finished",
@@ -918,6 +977,32 @@ class DocumentationAgent(BaseAgent):
             parameters=[],
             returns="",
             example_usage="",
+            abstention=None,
+        )
+
+    @staticmethod
+    def _abstain_result(
+        empty: DocumentationResult,
+        *,
+        reason: str,
+        evidence_available: Optional[List[str]] = None,
+        recommended_next_steps: Optional[List[str]] = None,
+    ) -> DocumentationResult:
+        """Attach an AbstentionResult to an empty documentation payload."""
+        abstention: AbstentionResult = ReportBuilder().abstain(
+            reason,
+            confidence=1.0,
+            evidence_available=evidence_available,
+            recommended_next_steps=recommended_next_steps,
+        )
+        return DocumentationResult(
+            file_path=empty.file_path,
+            function_name=empty.function_name,
+            summary="",
+            parameters=[],
+            returns="",
+            example_usage="",
+            abstention=abstention,
         )
 
     @staticmethod

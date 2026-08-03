@@ -28,8 +28,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from ..analysis.report_builder import ReportBuilder
 from ..rag.indexer import Indexer
 from ..schemas.schemas import (
+    AbstentionResult,
     AgentRequest,
     AgentResponse,
     AgentType,
@@ -283,6 +285,14 @@ class TestingAgent(BaseAgent):
                 errors=[str(exc)],
             )
 
+        if result.abstention is not None:
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=self.agent_type,
+                success=False,
+                output=result,
+                errors=[result.abstention.reason],
+            )
         success = bool(result.generated_tests) or bool(
             result.summary and result.summary.strip()
         )
@@ -434,6 +444,37 @@ class TestingAgent(BaseAgent):
             prefer_target_only=bool(chunks),
         )
 
+        if not chunks and not source_excerpts:
+            abstained = self._abstain_result(
+                reason="No grounded evidence was found.",
+                evidence_available=[],
+                recommended_next_steps=[
+                    "Point testing at a Python module with readable source.",
+                    "Confirm the repository contains supported .py files.",
+                ],
+            )
+            # Distinguish empty/unsupported trees for clearer messaging.
+            try:
+                listed = filesystem.list_files(".", pattern="*.py", recursive=True)
+            except Exception:
+                listed = []
+            if not listed:
+                abstained = self._abstain_result(
+                    reason="Repository contains no supported Python files.",
+                    evidence_available=[],
+                    recommended_next_steps=[
+                        "Provide a repository that includes .py source files.",
+                        "Confirm ignore rules are not excluding the entire tree.",
+                    ],
+                )
+            self._trace(
+                "testing_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
         logger.info("Building prompt...")
         prompt = self._build_prompt(
             instruction=instruction,
@@ -479,6 +520,28 @@ class TestingAgent(BaseAgent):
         )
 
         result = self._parse_response(response.content)
+        if not result.generated_tests:
+            evidence = []
+            if chunks:
+                evidence.append(f"{len(chunks)} retrieved chunk(s)")
+            if source_excerpts:
+                evidence.append(f"{len(source_excerpts)} source excerpt(s)")
+            abstained = self._abstain_result(
+                reason="LLM response could not be verified.",
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Retry with a narrower target module.",
+                    "Confirm the model returned valid TestingResult JSON.",
+                ],
+            )
+            self._trace(
+                "testing_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
         logger.info(
             "Test generation finished: %d file(s), coverage≈%.2f",
             len(result.generated_tests),
@@ -500,6 +563,7 @@ class TestingAgent(BaseAgent):
                     summary=combined,
                     generated_tests=result.generated_tests,
                     coverage_estimate=result.coverage_estimate,
+                    abstention=None,
                 )
 
         self._trace(
@@ -1121,6 +1185,28 @@ class TestingAgent(BaseAgent):
             summary="",
             generated_tests={},
             coverage_estimate=0.0,
+            abstention=None,
+        )
+
+    @staticmethod
+    def _abstain_result(
+        *,
+        reason: str,
+        evidence_available: Optional[List[str]] = None,
+        recommended_next_steps: Optional[List[str]] = None,
+    ) -> TestingResult:
+        """Build a TestingResult that carries an explicit abstention."""
+        abstention: AbstentionResult = ReportBuilder().abstain(
+            reason,
+            confidence=1.0,
+            evidence_available=evidence_available,
+            recommended_next_steps=recommended_next_steps,
+        )
+        return TestingResult(
+            summary="",
+            generated_tests={},
+            coverage_estimate=0.0,
+            abstention=abstention,
         )
 
     @staticmethod
