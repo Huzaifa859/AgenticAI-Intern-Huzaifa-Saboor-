@@ -1,0 +1,48 @@
+# docker-compose.yml
+# ==================
+#
+# Brings up the two services the proposal's Deployment section calls
+# for: the Jupyter environment running the notebook, and an Ollama
+# container serving local llama3 for documentation generation.
+#
+# Claude is reached over the network via OpenRouter, so it needs no
+# service here -- only the API key passed through to the notebook.
+#
+#     docker compose up
+#
+# NOTE: Placeholder. The Jupyter image is not yet runnable end-to-end
+# (see the TODO in Dockerfile about requirements.txt).
+
+services:
+  jupyter:
+    build: .
+    container_name: codebase-assistant-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      # Mount the project so notebook edits persist on the host.
+      - .:/app
+    environment:
+      # TODO: supply via a .env file rather than the host environment,
+      # and keep it out of version control.
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: codebase-assistant-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist pulled models so llama3 is not re-downloaded on every
+      # restart.
+      - ollama_models:/root/.ollama
+
+    # TODO: llama3 must be pulled before first use:
+    #     docker compose exec ollama ollama pull llama3
+    # Automate this with an entrypoint or init container.
+
+volumes:
+  ollama_models:
