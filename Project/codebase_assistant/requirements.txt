@@ -1,0 +1,46 @@
+# Codebase Assistant -- Week 6 dependencies
+#
+# Scope: the ingestion pipeline, the Code Analysis Agent, and the
+# notebook surface. Week 7/8 additions (Ollama client, deployment
+# tooling) are deliberately excluded until those features land.
+
+# --- Structured output -------------------------------------------------
+# Pydantic models for BugReport / DocumentationResult /
+# TestGenerationResult and the internal agent, tool, and RAG schemas.
+pydantic>=2.0
+
+# --- Configuration -----------------------------------------------------
+# Loads OPENROUTER_API_KEY and other overrides from a .env file so
+# credentials stay out of source control.
+python-dotenv>=1.0
+
+# --- Ingestion ---------------------------------------------------------
+# Cloning target repositories by URL. Public repos only; no API auth.
+GitPython>=3.1
+
+# --- RAG ---------------------------------------------------------------
+# Vector store for embedded code chunks, and the embedding model
+# (all-mpnet-base-v2) selected in the Week 3 embedding comparison.
+chromadb>=0.4
+sentence-transformers>=2.2
+
+# --- Static analysis ---------------------------------------------------
+# Deterministic first pass of the bug detection pipeline. Python's `ast`
+# and `inspect` modules cover the rest and are part of the standard
+# library.
+pyflakes>=3.0
+
+# --- Model access ------------------------------------------------------
+# HTTP client for the OpenRouter API, used to reach Claude for code
+# analysis. Ollama is not needed until the Week 7 documentation agent.
+requests>=2.31
+
+# --- Notebook interface ------------------------------------------------
+# The user-facing surface: ingest -> ask questions -> view bug report.
+jupyter>=1.0
+
+# --- Testing -----------------------------------------------------------
+# Test suite plus coverage measurement, against the Week 6 target of
+# >= 70% on ingestion and the Code Analysis Agent.
+pytest>=7.4
+pytest-cov>=4.1
