@@ -22,5 +22,11 @@ LLMClient does not route to them yet.
 from .base import BaseProvider
 from .ollama_provider import OllamaProvider
 from .openrouter_provider import OpenRouterProvider
+from .provider_manager import ProviderManager
 
-__all__ = ["BaseProvider", "OpenRouterProvider", "OllamaProvider"]
+__all__ = [
+    "BaseProvider",
+    "OpenRouterProvider",
+    "OllamaProvider",
+    "ProviderManager",
+]

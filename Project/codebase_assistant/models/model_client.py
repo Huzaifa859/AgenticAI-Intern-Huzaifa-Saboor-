@@ -16,9 +16,8 @@ Because providers are injected rather than constructed internally,
 swapping Claude for a local llama3, or stubbing a fake provider in
 tests, requires no change to calling code.
 
-TODO: Add multi-provider routing and fallback (try the configured
-provider, fall back to the next available one) once more than one
-provider is implemented.
+Multi-provider routing and OpenRouter → Ollama failover live in
+ProviderManager, which is injected here as the BaseProvider.
 """
 
 from __future__ import annotations

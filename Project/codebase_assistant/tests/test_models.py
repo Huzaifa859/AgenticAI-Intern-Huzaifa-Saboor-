@@ -2,56 +2,47 @@
 test_models.py
 ===============
 
-Placeholder tests for the model layer — LLMClient and its providers.
-
-Covers the proposal's two-model split (Claude via OpenRouter for
-analysis, local llama3 via Ollama for documentation), provider
-fallback, and the Week 7 retry-on-malformed-output path.
-
-TODO: Replace every skip below with real assertions as each provider is
-implemented.
+Lightweight ModelClient / LLMClient checks. Provider failover coverage
+lives in ``test_provider_manager.py``.
 """
 
 from __future__ import annotations
 
 import pytest
 
-
-@pytest.mark.skip(reason="TODO: assert analysis routes to Claude and documentation to llama3")
-def test_client_routes_task_to_correct_provider() -> None:
-    """The cost/quality split should be enforced by routing, not by hand."""
-
-
-@pytest.mark.skip(reason="TODO: assert the client falls back when a provider is unavailable")
-def test_client_falls_back_when_provider_unavailable() -> None:
-    """An unreachable provider should not abort the run."""
+from codebase_assistant.exceptions.model_exceptions import ProviderUnavailableError
+from codebase_assistant.models.model_client import LLMClient, ModelClient
+from codebase_assistant.models.providers.base import BaseProvider
+from codebase_assistant.schemas.schemas import ModelMessage, ModelResponse
 
 
-@pytest.mark.skip(reason="TODO: assert switch_model rejects unknown model identifiers")
-def test_client_rejects_unknown_model() -> None:
-    """Switching to an unsupported model should be refused."""
+class _StubProvider(BaseProvider):
+    name = "stub"
+
+    def __init__(self) -> None:
+        super().__init__(model="stub-model", max_tokens=64)
+
+    def is_available(self) -> bool:
+        return True
+
+    def generate(self, messages, **kwargs) -> ModelResponse:
+        return ModelResponse(content="stub-ok", raw={"model": self.model})
 
 
-@pytest.mark.skip(reason="TODO: assert the provider returns a populated ModelResponse")
-def test_openrouter_provider_returns_model_response() -> None:
-    """A generation should come back as a valid ModelResponse."""
+def test_model_client_requires_provider() -> None:
+    client = ModelClient(provider=None)
+    with pytest.raises(ProviderUnavailableError, match="No provider configured"):
+        client.generate([ModelMessage(role="user", content="hi")])
 
 
-@pytest.mark.skip(reason="TODO: assert RateLimitError triggers retry with backoff")
-def test_openrouter_provider_retries_on_rate_limit() -> None:
-    """Rate limits should back off and retry rather than fail outright."""
+def test_model_client_delegates_to_provider() -> None:
+    client = ModelClient(provider=_StubProvider())
+    response = client.generate([ModelMessage(role="user", content="hi")])
+    assert response.content == "stub-ok"
+    assert client.is_available() is True
 
 
-@pytest.mark.skip(reason="TODO: assert is_available is False when Ollama is not running")
-def test_ollama_provider_detects_unavailable_service() -> None:
-    """A stopped Ollama service should be reported, not raise obscurely."""
-
-
-@pytest.mark.skip(reason="TODO: assert malformed JSON raises MalformedOutputError and retries")
-def test_malformed_output_is_retried() -> None:
-    """Invalid structured output should be retried before surfacing."""
-
-
-@pytest.mark.skip(reason="TODO: assert both models answer the same documentation prompt")
-def test_multi_model_comparison_runs_both_providers() -> None:
-    """Backs the Week 7 Claude vs. llama3 side-by-side comparison."""
+def test_llm_client_keeps_legacy_fields() -> None:
+    client = LLMClient(model_name="x", max_tokens=10, provider=_StubProvider())
+    assert client.model_name == "x"
+    assert client.max_tokens == 10

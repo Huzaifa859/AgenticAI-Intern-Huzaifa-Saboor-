@@ -52,8 +52,8 @@ _INITIAL_BACKOFF_SECONDS = 1.0
 #: Models tried in order when the configured model is not usable.
 _FALLBACK_MODELS = (
     "anthropic/claude-sonnet-4",
-    "meta-llama/llama-3.1-8b-instruct",
     "google/gemma-3-27b-it",
+    "meta-llama/llama-3.1-8b-instruct",
     "nvidia/nemotron-nano-9b-v2",
 )
 

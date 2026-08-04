@@ -149,6 +149,10 @@ class Config:
         model_name: Legacy single-model identifier, superseded by
             `claude_model` and `ollama_model`. Retained because existing
             callers still read it.
+        preferred_provider: Primary LLM backend name (default openrouter).
+        fallback_provider: Secondary LLM backend name (default ollama).
+        provider_cache_seconds: TTL for preferred-provider availability
+            caching before re-probing.
 
         github_token: Optional GitHub token. Not required for the MVP,
             which clones public repositories only.
@@ -192,6 +196,9 @@ class Config:
     ollama_model: str = "llama3"
     max_tokens: int = 2048
     model_name: str = "anthropic/claude-sonnet-4"
+    preferred_provider: str = "openrouter"
+    fallback_provider: str = "ollama"
+    provider_cache_seconds: int = 60
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -276,4 +283,13 @@ class Config:
                 "RERANK_CANDIDATES", defaults.rerank_candidates
             ),
             log_level=_env_str("LOG_LEVEL", defaults.log_level),
+            preferred_provider=_env_str(
+                "PREFERRED_PROVIDER", defaults.preferred_provider
+            ),
+            fallback_provider=_env_str(
+                "FALLBACK_PROVIDER", defaults.fallback_provider
+            ),
+            provider_cache_seconds=_env_int(
+                "PROVIDER_CACHE_SECONDS", defaults.provider_cache_seconds
+            ),
         )

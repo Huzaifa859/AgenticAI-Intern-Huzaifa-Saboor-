@@ -32,7 +32,7 @@ MESSAGES = [ModelMessage(role="user", content="hello")]
 
 FALLBACK_CHAIN = _FALLBACK_MODELS
 
-CLAUDE, LLAMA, GEMMA, NEMOTRON = FALLBACK_CHAIN
+CLAUDE, GEMMA, LLAMA, NEMOTRON = FALLBACK_CHAIN
 
 
 def _models_called(mock_post: MagicMock) -> List[str]:
@@ -272,43 +272,43 @@ def test_whitespace_only_model_output_raises(
 @pytest.mark.parametrize("status_code", [402, 404])
 @patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
 @patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
-def test_falls_back_to_llama_on_402_and_404(
+def test_falls_back_to_gemma_on_402_and_404(
     mock_post: MagicMock, mock_sleep: MagicMock, status_code: int
 ) -> None:
-    """Insufficient credits or a missing model should switch to Llama."""
+    """Insufficient credits or a missing model should switch to Gemma."""
     mock_post.side_effect = [
         _http_response(status_code, {"error": {"message": f"http {status_code}"}}),
-        _http_response(200, _success_payload(content="Answer from Llama.")),
+        _http_response(200, _success_payload(content="Answer from Gemma.")),
     ]
-    provider = _provider()
-
-    result = provider.generate(MESSAGES)
-
-    assert result.content == "Answer from Llama."
-    assert result.raw["model_used"] == LLAMA
-    assert _models_called(mock_post) == [CLAUDE, LLAMA]
-    # Credits and unknown models never recover, so no backoff is spent.
-    mock_sleep.assert_not_called()
-
-
-@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
-@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
-def test_falls_back_to_gemma_when_claude_rate_limited(
-    mock_post: MagicMock, mock_sleep: MagicMock
-) -> None:
-    """A rate-limited Claude and an unusable Llama should reach Gemma."""
-    mock_post.side_effect = (
-        [_http_response(429, {"error": {"message": "rate limited"}})] * 4
-        + [_http_response(402, {"error": {"message": "no credits"}})]
-        + [_http_response(200, _success_payload(content="Answer from Gemma."))]
-    )
     provider = _provider()
 
     result = provider.generate(MESSAGES)
 
     assert result.content == "Answer from Gemma."
     assert result.raw["model_used"] == GEMMA
-    assert _models_called(mock_post) == [CLAUDE] * 4 + [LLAMA, GEMMA]
+    assert _models_called(mock_post) == [CLAUDE, GEMMA]
+    # Credits and unknown models never recover, so no backoff is spent.
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_falls_back_to_llama_when_claude_rate_limited_and_gemma_unusable(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A rate-limited Claude and an unusable Gemma should reach Llama."""
+    mock_post.side_effect = (
+        [_http_response(429, {"error": {"message": "rate limited"}})] * 4
+        + [_http_response(402, {"error": {"message": "no credits"}})]
+        + [_http_response(200, _success_payload(content="Answer from Llama."))]
+    )
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.content == "Answer from Llama."
+    assert result.raw["model_used"] == LLAMA
+    assert _models_called(mock_post) == [CLAUDE] * 4 + [GEMMA, LLAMA]
     assert mock_sleep.call_count == 3
 
 

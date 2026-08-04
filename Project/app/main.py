@@ -1593,6 +1593,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     print("Starting Codebase Assistant...")
     print_progress("Preparing repository...")
     supervisor = Supervisor(config=Config.load())
+    print(supervisor.provider_status_message())
     _cli_trace(supervisor.tracer, "application_started")
     repository_path = prepare_repository(supervisor, reference)
     record_repository_loaded(

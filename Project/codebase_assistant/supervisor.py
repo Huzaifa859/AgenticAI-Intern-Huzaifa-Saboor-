@@ -33,6 +33,7 @@ from .models.model_client import LLMClient
 from .models.providers.base import BaseProvider
 from .models.providers.ollama_provider import OllamaProvider
 from .models.providers.openrouter_provider import OpenRouterProvider
+from .models.providers.provider_manager import ProviderManager
 from .rag.indexer import Indexer
 from .rag.retriever import Retriever
 from .schemas.schemas import AgentRequest, AgentResponse, AgentType
@@ -99,22 +100,27 @@ class Supervisor:
             logger.warning("Tracer construction failed; continuing without tracing: %s", exc)
             self.tracer = Tracer(enabled=False)
 
-        # Shared OpenRouter provider for code analysis. Construction
-        # failures never abort startup; static-only mode still works.
+        # Shared OpenRouter + Ollama providers. Construction failures
+        # never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
-        # Shared Ollama provider, kept for local-model experiments. Not
-        # injected into any agent.
         self.ollama_provider: Optional[BaseProvider] = self._init_ollama_provider()
+        # Transparent OpenRouter → Ollama failover behind one client.
+        self.provider_manager = ProviderManager(
+            preferred=self.provider,
+            fallback=self.ollama_provider,
+            preferred_name=self.config.preferred_provider,
+            fallback_name=self.config.fallback_provider,
+            cache_seconds=self.config.provider_cache_seconds,
+            tracer=self.tracer,
+        )
         self.model_client = LLMClient(
             model_name=self.config.model_name,
             max_tokens=self.config.max_tokens,
-            provider=self.provider,
+            provider=self.provider_manager,
             config=self.config,
         )
-        # Local-model client kept separate from the OpenRouter client. No
-        # agent is wired to it by default. May have provider=None when
-        # Ollama construction failed; that must not prevent Supervisor
-        # construction.
+        # Direct Ollama client for local-model experiments. Agents use
+        # model_client (with failover), not this handle.
         self.ollama_model_client = LLMClient(
             model_name=self.config.ollama_model,
             max_tokens=self.config.max_tokens,
@@ -159,6 +165,21 @@ class Supervisor:
             )
         except Exception as exc:
             logger.warning("Supervisor tracing failed for %r: %s", name, exc)
+
+    def provider_status_message(self) -> str:
+        """
+        One-line CLI summary of the active LLM provider.
+
+        Returns:
+            Status such as ``Using OpenRouter (Claude Sonnet 4)`` or an
+            Ollama fallback / static-only message.
+        """
+        try:
+            return self.provider_manager.status_message()
+        except Exception as exc:
+            logger.warning("Provider status message failed: %s", exc)
+            return "LLM provider status unavailable"
+
     def _register_tools(self) -> None:
         """
         Expose the shared tool instances through the ToolRegistry.
@@ -257,9 +278,9 @@ class Supervisor:
         """
         Construct the shared OllamaProvider from Config.
 
-        Held on the Supervisor for local-model experiments. Not injected
-        into any agent. Construction or availability failures never abort
-        startup and never affect OpenRouter wiring.
+        Held on the Supervisor and used as the failover target behind
+        ProviderManager. Construction or availability failures never
+        abort startup.
 
         Returns:
             The OllamaProvider instance, or None if construction itself
