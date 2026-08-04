@@ -502,3 +502,206 @@ said it was mostly fine but i was missing the generated sample files from the de
 
 **result:**
 got a markdown block formatted the same as the week 2 and week 3 sections, ready to paste under week 3. also pointed out my env variables section at the bottom only mentions the openrouter key and i should probably add serpapi there too.
+
+
+# week 5 — model context protocol (mcp) and multi-agent systems
+
+---
+
+### understanding the assignment
+
+**prompt:**
+"these are my week 5 tasks. should i create separate notebooks or one notebook for everything? my mentor reviews notebooks."
+
+**result:**
+decided to implement the entire assignment in a single well-structured notebook with clear sections for the MCP server, client, supervisor, worker agents and tracing layer.
+
+---
+
+### generating the notebook
+
+**prompt:**
+"give me a prompt for claude to generate one notebook that implements my week 5 assignment. keep it concise because im using the free version."
+
+**result:**
+received a compact prompt instructing Claude to generate a single notebook implementing a custom MCP server, MCP client, supervisor–worker architecture and execution tracing.
+
+---
+
+### building the mcp server, client, agents and tracing in one notebook
+
+**prompt:**
+"Build a custom MCP server exposing one app resource and one tool. Connect the MCP server to a client (Claude Code or a custom client). Implement a supervisor + worker agent that routes tasks to ≥2 sub-agents. Add a tracing layer that logs every tool call across the agent graph. do all these in one single jupyter notebook"
+
+**result:**
+got a full notebook: a FastMCP server exposing one resource and one tool, a custom Python stdio client, a supervisor agent routing to three worker agents, and a tracing layer logging every MCP call, local tool call and routing decision. tested execution end to end before handing it back.
+
+---
+
+### reviewing the notebook
+
+**prompt:**
+"review this notebook and tell me if it satisfies all the assignment requirements."
+
+**result:**
+verified that the notebook covered the required tasks and suggested a few improvements for organization and documentation without changing the overall implementation.
+
+---
+
+### using the mcp python sdk
+
+**prompt:**
+"does this notebook use the python mcp sdk?"
+
+**result:**
+confirmed that the implementation uses the official MCP Python SDK for both the server and client while optionally using the Anthropic SDK for one worker agent.
+
+---
+
+### polishing notebook presentation
+
+**prompt:**
+"Review this Jupyter notebook and improve only its presentation, formatting, and documentation. Do NOT modify any Python code, logic, functionality, outputs, imports, or execution order. make it look like a polished internship submission"
+
+**result:**
+markdown cells were rewritten with a proper title, objective, requirements section and conclusion, checkmark emojis removed, headings made consistent, and short explanations added before each code section. code cells were left byte for byte identical, verified with a diff check before saving.
+
+---
+
+### removing the toc
+
+**prompt:**
+"remove toc"
+
+**result:**
+deleted the table of contents cell, left everything else untouched.
+
+---
+
+### formatting the notebook
+
+**prompt:**
+"give me a prompt to format the notebook documentation, remove the green check marks and make it professional for my mentor without changing any code."
+
+**result:**
+received a formatting prompt that improved headings, markdown, spacing and documentation while leaving the implementation unchanged.
+
+---
+
+### gitignore check
+
+**prompt:**
+"this is my current gitignore is there anything i need to add to this for my week 5 mcp assignment"
+
+**result:**
+got suggestions to add `.claude/`, `.mcp.json`, `trace_log.json`, `*.log`, `*.db`/`*.sqlite3` and `node_modules/`, plus a note not to accidentally ignore `uv.lock`/`poetry.lock`.
+
+---
+
+### debugging the windows fileno error
+
+**prompt:**
+pasted the full traceback from the mcp client connection cell, ending in "UnsupportedOperation: fileno"
+
+**result:**
+traced it to ipykernel's `sys.stderr` having no real `fileno()`, which breaks MCP's Windows subprocess fallback. fix was to pass `stdio_client` an `errlog` opened as a real file instead of the default `sys.stderr`.
+
+---
+
+### getting the full cell back
+
+**prompt:**
+"this is my previous one u removed the available tools and resources part"
+
+**result:**
+got the complete `connect_to_server` cell back with the `errlog` fix merged in, instead of just the isolated snippet.
+
+---
+
+### same error persisting
+
+**prompt:**
+pasted the same traceback again after applying the fix, still failing
+
+**result:**
+traceback showed the old code (no `errlog=`) was still what actually ran, pointed to stale cell/kernel state and asked for a kernel restart plus a full top-to-bottom rerun.
+
+---
+
+### step by step fix
+
+**prompt:**
+"what do i do?"
+
+**result:**
+got explicit click-by-click steps: replace the cell with the updated code, restart the kernel, then run all notebook cells from top to bottom.
+
+---
+
+### confirming the fix
+
+**prompt:**
+"ok it works now after these steps"
+
+**result:**
+confirmed the root cause (ipykernel's stderr has no `fileno()` on Windows) and that restarting the kernel was necessary for the updated code to take effect.
+
+---
+
+### project documentation
+
+**prompt:**
+"write a concise README section for my week 5 assignment including project overview, setup, run instructions, expected output and implemented features."
+
+**result:**
+created a professional README describing the project structure, execution steps, expected results and implemented MCP and multi-agent features.
+
+---
+
+### readme entry for week 5
+
+**prompt:**
+"give me markdown for week 5 just like i have done for rest of weeks give me only week 5 part so i can copy paste directly dont give me file"
+
+**result:**
+got a Week 5 section matching the style of previous weeks, including folder structure, setup, run instructions and expected output.
+
+---
+
+### making it about running, not explaining
+
+**prompt:**
+"markdown because this will go in .md file and make it more about how to run it instead of explanation need something brief"
+
+**result:**
+trimmed the section down to concise run instructions and expected output while keeping the formatting consistent with the rest of the README.
+
+---
+
+### updating gitignore
+
+**prompt:**
+"what should i add to my .gitignore for this mcp project, and should i keep trace_log.json in the repository?"
+
+**result:**
+updated the `.gitignore` to ignore local configuration, caches and databases while keeping `trace_log.json` tracked so the execution trace can be reviewed.
+
+---
+
+### git workflow
+
+**prompt:**
+"help me commit and push my week 5 assignment correctly after accidentally committing from inside the project folder."
+
+**result:**
+reset the local commit, recreated it from the repository root, verified the repository state and pushed the completed assignment with the correct history.
+
+---
+
+### pull request
+
+**prompt:**
+"give me a brief pull request description for my week 5 assignment."
+
+**result:**
+created a concise PR summary describing the MCP server, Python client, supervisor–worker architecture, execution tracing and documentation updates.

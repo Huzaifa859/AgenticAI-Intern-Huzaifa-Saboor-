@@ -35,3 +35,14 @@ Thumbs.db
 *.log
 .coverage
 htmlcov/
+
+# MCP / Claude Code local state
+.claude/
+.mcp.json
+
+# If any part of your MCP server persists data locally
+*.db
+*.sqlite3
+
+# If you end up with a JS/TS MCP server or client anywhere
+node_modules/
