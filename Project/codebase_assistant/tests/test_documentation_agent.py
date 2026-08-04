@@ -265,10 +265,12 @@ def project_repo(sample_repo: Path) -> Path:
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
-def test_readme_prompt_includes_inventory_and_project_files(
+def test_readme_prompt_is_symbol_scoped(
     _mock_index: Any, project_repo: Path
 ) -> None:
-    """README mode should ground layout and setup claims in real files."""
+    """README mode documents each public symbol with a focused prompt."""
+    from codebase_assistant.tracing.tracer import Tracer
+
     chunk = RetrievedChunk(
         source="math_utils.py",
         content="def add(a, b):\n    return a + b",
@@ -277,14 +279,23 @@ def test_readme_prompt_includes_inventory_and_project_files(
     )
     client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
     agent = _agent(client, _mock_retriever([chunk]))
+    agent.tracer = Tracer(run_id="readme-symbols")
 
-    agent.handle(_readme_request(project_repo))
+    response = agent.handle(_readme_request(project_repo))
 
-    prompt = client.generate.call_args.args[0][1].content
-    assert "REPOSITORY INVENTORY" in prompt
-    assert "app/main.py" in prompt
-    assert "PROJECT FILES" in prompt
-    assert "chromadb>=0.4" in prompt
+    assert response.success is True
+    assert client.generate.call_count >= 2  # add + main
+    prompts = [call.args[0][1].content for call in client.generate.call_args_list]
+    assert any("Document function add()" in prompt for prompt in prompts)
+    assert any("Document function main()" in prompt for prompt in prompts)
+    assert any("math_utils.py" in prompt for prompt in prompts)
+    assert any("app/main.py" in prompt for prompt in prompts)
+    # Per-symbol prompts must not dump the whole repository inventory listing.
+    assert all(
+        "REPOSITORY INVENTORY (every path that exists" not in prompt
+        for prompt in prompts
+    )
+    assert "documentation_merge_finished" in agent.tracer.event_names()
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
@@ -764,7 +775,7 @@ def test_grounding_nonexistent_function_removed(
     )
 
     assert response.success is True
-    assert response.output.function_name == ""
+    assert "ghost_login" not in (response.output.function_name or "")
     assert "ghost_login" not in response.output.summary
     names = [item["name"] for item in response.output.parameters]
     assert "ghost_login" not in names
@@ -885,3 +896,1021 @@ def test_grounding_abstains_when_nothing_can_be_verified(
     assert response.output.abstention is not None
     assert "could not be grounded" in response.output.abstention.reason.lower()
     assert "documentation_grounding_abstained" in agent.tracer.event_names()
+
+
+# ---------------------------------------------------------------------------
+# Optional write-back (README + docstrings)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def writeback_repo(tmp_path: Path) -> Path:
+    """Repository with an undocumented public function for write-back tests."""
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_readme_written_successfully(
+    _mock_index: Any, writeback_repo: Path
+) -> None:
+    """write_to_disk should create README.md from the generated summary."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = dict(VALID_DOC_PAYLOAD)
+    payload["function_name"] = "README"
+    payload["summary"] = "## Project Overview\n\nTiny math helpers repository."
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="write-readme")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="w1",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Generate a README summary.",
+            context={
+                "repo_path": str(writeback_repo),
+                "doc_type": "readme",
+                "write_to_disk": True,
+            },
+        )
+    )
+
+    readme = writeback_repo / "README.md"
+    assert response.success is True
+    assert readme.is_file()
+    assert "Tiny math helpers repository." in readme.read_text(encoding="utf-8")
+    assert "Write-back wrote README.md." in response.output.summary
+    names = agent.tracer.event_names()
+    assert "documentation_write_started" in names
+    assert "documentation_write_finished" in names
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_preserves_existing_readme_unless_replace(
+    _mock_index: Any, writeback_repo: Path
+) -> None:
+    """Existing README.md is preserved unless replace_existing=True."""
+    existing = "# Existing README\nKeep me.\n"
+    (writeback_repo / "README.md").write_text(existing, encoding="utf-8")
+    payload = dict(VALID_DOC_PAYLOAD)
+    payload["function_name"] = "README"
+    payload["summary"] = "## Project Overview\n\nReplacement body."
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+
+    preserved = agent.handle(
+        AgentRequest(
+            task_id="w2",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Generate a README summary.",
+            context={
+                "repo_path": str(writeback_repo),
+                "doc_type": "readme",
+                "write_to_disk": True,
+                "replace_existing": False,
+            },
+        )
+    )
+    assert preserved.success is True
+    assert (writeback_repo / "README.md").read_text(encoding="utf-8") == existing
+    assert "already exists" in preserved.output.summary.lower()
+
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    replaced = agent.handle(
+        AgentRequest(
+            task_id="w3",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Generate a README summary.",
+            context={
+                "repo_path": str(writeback_repo),
+                "doc_type": "readme",
+                "write_to_disk": True,
+                "replace_existing": True,
+            },
+        )
+    )
+    text = (writeback_repo / "README.md").read_text(encoding="utf-8")
+    assert replaced.success is True
+    assert "Replacement body." in text
+    assert "Keep me." not in text
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_inserts_function_docstring(
+    _mock_index: Any, writeback_repo: Path
+) -> None:
+    """Missing function docstrings should be inserted with indentation preserved."""
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="w4",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document the add function.",
+            context={
+                "repo_path": str(writeback_repo),
+                "file_path": str(writeback_repo / "math_utils.py"),
+                "function_name": "add",
+                "doc_type": "docstring",
+                "write_to_disk": True,
+            },
+        )
+    )
+
+    source = (writeback_repo / "math_utils.py").read_text(encoding="utf-8")
+    assert response.success is True
+    assert 'def add(a, b):' in source
+    assert '    """Return the sum of two numbers.' in source or (
+        '    """\n    Return the sum of two numbers.' in source
+    )
+    assert "return a + b" in source
+    assert "Write-back wrote docstring" in response.output.summary
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_leaves_existing_docstrings_untouched(
+    _mock_index: Any, sample_repo: Path
+) -> None:
+    """Existing function docstrings must not be overwritten by default."""
+    before = (sample_repo / "math_utils.py").read_text(encoding="utf-8")
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="w5",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document the add function.",
+            context={
+                "repo_path": str(sample_repo),
+                "file_path": str(sample_repo / "math_utils.py"),
+                "function_name": "add",
+                "doc_type": "docstring",
+                "write_to_disk": True,
+                "replace_existing": False,
+            },
+        )
+    )
+
+    after = (sample_repo / "math_utils.py").read_text(encoding="utf-8")
+    assert response.success is True
+    assert after == before
+    assert '"""Return a + b."""' in after
+    assert "skipped existing" in response.output.summary.lower()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_failures_are_graceful(
+    _mock_index: Any, writeback_repo: Path
+) -> None:
+    """Filesystem write failures must not fail the agent response."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = dict(VALID_DOC_PAYLOAD)
+    payload["function_name"] = "README"
+    payload["summary"] = "## Overview\n\nShould still return."
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="write-fail")
+
+    with patch(
+        "codebase_assistant.tools.filesystem_tools.FilesystemTools.write_file",
+        side_effect=RuntimeError("disk full"),
+    ):
+        response = agent.handle(
+            AgentRequest(
+                task_id="w6",
+                agent_type=AgentType.DOCUMENTATION,
+                instruction="Generate a README summary.",
+                context={
+                    "repo_path": str(writeback_repo),
+                    "doc_type": "readme",
+                    "write_to_disk": True,
+                },
+            )
+        )
+
+    assert response.success is True
+    assert "Should still return." in response.output.summary
+    assert "Write-back warning:" in response.output.summary
+    assert "documentation_write_failed" in agent.tracer.event_names()
+    assert not (writeback_repo / "README.md").exists()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_writeback_disabled_by_default_is_noop(
+    _mock_index: Any, writeback_repo: Path
+) -> None:
+    """Default write_to_disk=False must not create files."""
+    payload = dict(VALID_DOC_PAYLOAD)
+    payload["function_name"] = "README"
+    payload["summary"] = "## Overview\n\nNo disk writes."
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(_readme_request(writeback_repo))
+
+    assert response.success is True
+    assert not (writeback_repo / "README.md").exists()
+    source = (writeback_repo / "math_utils.py").read_text(encoding="utf-8")
+    assert '"""' not in source
+    assert "Write-back" not in response.output.summary
+
+
+def test_writeback_does_not_change_documentation_result_schema() -> None:
+    """DocumentationResult must keep the public field set unchanged."""
+    fields = set(DocumentationResult.model_fields)
+    assert fields == {
+        "file_path",
+        "function_name",
+        "summary",
+        "parameters",
+        "returns",
+        "example_usage",
+        "abstention",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Targeted documentation (file / function / class)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def targeted_repo(tmp_path: Path) -> Path:
+    """Repository with multiple modules for scoped documentation tests."""
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "app" / "auth.py").write_text(
+        '"""Auth helpers."""\n\n'
+        "class UserService:\n"
+        "    def create(self, name):\n"
+        "        return name\n\n"
+        "def authenticate(user):\n"
+        "    return bool(user)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app" / "billing.py").write_text(
+        "def charge(amount):\n"
+        "    return amount\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_repository_documentation_uses_per_symbol_prompts(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Absent targeting fields documents each public symbol then merges."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = dict(VALID_DOC_PAYLOAD)
+    payload["summary"] = "## Project Overview\n\nRepository docs."
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-repo")
+
+    response = agent.handle(_readme_request(targeted_repo))
+
+    assert response.success is True
+    assert client.generate.call_count >= 2
+    prompts = [call.args[0][1].content for call in client.generate.call_args_list]
+    assert any("Document function" in prompt for prompt in prompts)
+    assert all(
+        "REPOSITORY INVENTORY (every path that exists" not in prompt
+        for prompt in prompts
+    )
+    names = agent.tracer.event_names()
+    assert "documentation_target_selected" in names
+    assert "documentation_symbol_started" in names
+    assert "documentation_merge_finished" in names
+    assert "documentation_target_grounded" in names
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_file_documentation(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """file_path alone documents each public symbol in that file."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = {
+        "file_path": "auth.py",
+        "function_name": "authenticate",
+        "summary": "Auth helper symbol documentation.",
+        "parameters": [],
+        "returns": "",
+        "example_usage": "",
+    }
+    chunks = [
+        RetrievedChunk(
+            source="auth.py",
+            content="def authenticate(user): return bool(user)",
+            score=0.9,
+        ),
+        RetrievedChunk(
+            source="billing.py",
+            content="def charge(amount): return amount",
+            score=0.8,
+        ),
+    ]
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever(chunks))
+    agent.tracer = Tracer(run_id="target-file")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-file",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document app/auth.py",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count >= 2
+    prompts = [call.args[0][1].content for call in client.generate.call_args_list]
+    assert any("Document function authenticate()" in prompt for prompt in prompts)
+    assert any("Document class UserService." in prompt for prompt in prompts)
+    assert all("def charge" not in prompt for prompt in prompts)
+    assert all("REPOSITORY INVENTORY" not in prompt for prompt in prompts)
+    assert "documentation_target_selected" in agent.tracer.event_names()
+    assert "documentation_merge_finished" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_function_documentation(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """function_name + file_path documents only that function."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = {
+        "file_path": "auth.py",
+        "function_name": "authenticate",
+        "summary": "Validate whether a user credential is present.",
+        "parameters": [
+            {"name": "user", "type": "Any", "description": "User identifier."}
+        ],
+        "returns": "True when user is truthy.",
+        "example_usage": "authenticate('alice')",
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-fn")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-fn",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document function authenticate in app/auth.py",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "function_name": "authenticate",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count == 1
+    prompt = client.generate.call_args.args[0][1].content
+    assert "Document function authenticate()" in prompt
+    assert "def authenticate" in prompt
+    assert "class UserService" not in prompt
+    assert "def charge" not in prompt
+    assert "documentation_target_selected" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_class_documentation(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """class_name can be resolved via AST inventory without file_path."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = {
+        "file_path": "auth.py",
+        "function_name": "UserService",
+        "summary": "Service that creates user records.",
+        "parameters": [],
+        "returns": "",
+        "example_usage": "UserService().create('alice')",
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-class")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-class",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document class UserService",
+            context={
+                "repo_path": str(targeted_repo),
+                "class_name": "UserService",
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    prompt = client.generate.call_args.args[0][1].content
+    assert "Document class UserService." in prompt
+    assert "CLASS NAME" in prompt
+    assert "class UserService" in prompt
+    assert "def charge" not in prompt
+    assert "def add" not in prompt
+    assert "documentation_target_selected" in agent.tracer.event_names()
+    assert "documentation_target_grounded" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_nonexistent_file_abstains(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Missing files must abstain instead of inventing documentation."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-missing-file")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-miss-file",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document missing module",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "missing.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is False
+    assert response.output.abstention is not None
+    assert "target not found" in response.output.abstention.reason.lower()
+    assert "missing.py" in response.output.abstention.reason
+    assert client.generate.call_count == 0
+    assert "documentation_target_not_found" in agent.tracer.event_names()
+    assert "documentation_target_selected" not in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_nonexistent_function_abstains(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Missing functions must abstain with a searched-location hint."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    client = _mock_client(content=json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-missing-fn")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-miss-fn",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document missing function",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "function_name": "does_not_exist",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is False
+    assert response.output.abstention is not None
+    reason = response.output.abstention.reason.lower()
+    assert "target not found" in reason
+    assert "does_not_exist" in reason
+    assert "auth.py" in reason
+    assert client.generate.call_count == 0
+    assert "documentation_target_not_found" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_grounding_still_works(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Scoped documentation still strips hallucinated references."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = {
+        "file_path": "auth.py",
+        "function_name": "authenticate",
+        "summary": (
+            "authenticate validates users. "
+            "Also see FakeModule and the function ghost_helper."
+        ),
+        "parameters": [
+            {"name": "user", "type": "Any", "description": "User identifier."},
+            {
+                "name": "ghost_helper",
+                "type": "function",
+                "description": "Missing helper.",
+            },
+        ],
+        "returns": "True when user is truthy.",
+        "example_usage": "authenticate('alice')",
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-ground")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-ground",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document function authenticate",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "function_name": "authenticate",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert "authenticate" in response.output.summary.lower()
+    assert "ghost_helper" not in response.output.summary
+    assert "FakeModule" not in response.output.summary
+    param_names = [item["name"] for item in response.output.parameters]
+    assert "ghost_helper" not in param_names
+    assert "documentation_target_grounded" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_writeback_still_works(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Targeted function docs still support optional write-back."""
+    payload = {
+        "file_path": "auth.py",
+        "function_name": "authenticate",
+        "summary": "Return whether the user value is truthy.",
+        "parameters": [
+            {"name": "user", "type": "Any", "description": "User identifier."}
+        ],
+        "returns": "True when user is truthy.",
+        "example_usage": "authenticate('alice')",
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-write",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document authenticate",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "function_name": "authenticate",
+                "doc_type": "docstring",
+                "write_to_disk": True,
+            },
+        )
+    )
+
+    source = (targeted_repo / "app" / "auth.py").read_text(encoding="utf-8")
+    assert response.success is True
+    assert "def authenticate" in source
+    assert "Return whether the user value is truthy." in source
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_targeted_json_retry_still_works(
+    _mock_index: Any, targeted_repo: Path
+) -> None:
+    """Malformed JSON still gets exactly one repair retry in targeted mode."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    good = {
+        "file_path": "auth.py",
+        "function_name": "authenticate",
+        "summary": "Validate a user credential.",
+        "parameters": [],
+        "returns": "bool",
+        "example_usage": "authenticate('alice')",
+    }
+    client = _mock_client(content="not-json")
+    client.generate.side_effect = [
+        ModelResponse(content="not-json {{{", usage={}, raw={}),
+        ModelResponse(content=json.dumps(good), usage={}, raw={}),
+    ]
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="target-retry")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="t-retry",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document authenticate",
+            context={
+                "repo_path": str(targeted_repo),
+                "file_path": str(targeted_repo / "app" / "auth.py"),
+                "function_name": "authenticate",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count == 2
+    assert "documentation_retry_success" in agent.tracer.event_names()
+    assert "documentation_target_selected" in agent.tracer.event_names()
+
+
+# ---------------------------------------------------------------------------
+# Per-symbol documentation generation + merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def multi_symbol_repo(tmp_path: Path) -> Path:
+    """Repository with multiple public functions and classes."""
+    (tmp_path / "math.py").write_text(
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a - b\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "auth.py").write_text(
+        "class Gate:\n"
+        "    def login(self, user):\n"
+        "        return user\n\n"
+        "    def logout(self):\n"
+        "        return True\n\n"
+        "def ping():\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _symbol_payload(name: str, summary: str) -> Dict[str, Any]:
+    return {
+        "file_path": "math.py",
+        "function_name": name,
+        "summary": summary,
+        "parameters": [
+            {
+                "name": name,
+                "type": "function",
+                "description": f"Public function {name}.",
+            }
+        ],
+        "returns": f"Result of {name}.",
+        "example_usage": f"{name}(1, 2)",
+    }
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_multiple_public_functions(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Each public function should get its own LLM call."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    client = _mock_client(content=json.dumps(_symbol_payload("add", "Adds numbers.")))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="sym-fns")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s1",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document math.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count == 2
+    prompts = [call.args[0][1].content for call in client.generate.call_args_list]
+    assert any("Document function add()" in prompt for prompt in prompts)
+    assert any("Document function subtract()" in prompt for prompt in prompts)
+    assert "documentation_symbol_started" in agent.tracer.event_names()
+    assert "documentation_symbol_finished" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_multiple_classes_and_methods(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Classes and public methods are documented as independent symbols."""
+    client = _mock_client(
+        content=json.dumps(
+            {
+                "file_path": "auth.py",
+                "function_name": "Gate",
+                "summary": "Auth gate symbol.",
+                "parameters": [],
+                "returns": "",
+                "example_usage": "Gate().login('a')",
+            }
+        )
+    )
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s2",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document auth.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "auth.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    prompts = [call.args[0][1].content for call in client.generate.call_args_list]
+    assert any("Document class Gate." in prompt for prompt in prompts)
+    assert any("Document method Gate.login()" in prompt for prompt in prompts)
+    assert any("Document method Gate.logout()" in prompt for prompt in prompts)
+    assert any("Document function ping()" in prompt for prompt in prompts)
+    assert client.generate.call_count == 4
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_merge_correctness(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Merged DocumentationResult keeps ordered symbol sections and fields."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payloads = [
+        _symbol_payload("add", "Adds two numbers."),
+        _symbol_payload("subtract", "Subtracts two numbers."),
+    ]
+    client = _mock_client()
+    client.generate.side_effect = [
+        ModelResponse(content=json.dumps(item), usage={}, raw={}) for item in payloads
+    ]
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="sym-merge")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s3",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document math.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    summary = response.output.summary
+    assert summary.index("## add") < summary.index("## subtract")
+    assert "Adds two numbers." in summary
+    assert "Subtracts two numbers." in summary
+    names = [item["name"] for item in response.output.parameters]
+    assert names == ["add", "subtract"]
+    assert "add(1, 2)" in response.output.example_usage
+    assert "subtract(1, 2)" in response.output.example_usage
+    assert "Result of add." in response.output.returns
+    assert "Result of subtract." in response.output.returns
+    assert "documentation_merge_started" in agent.tracer.event_names()
+    assert "documentation_merge_finished" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_duplicate_removal(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Identical summaries/examples across symbols are deduplicated."""
+    shared = _symbol_payload("add", "Shared summary text.")
+    shared["example_usage"] = "shared_example()"
+    shared["returns"] = "shared return"
+    client = _mock_client(content=json.dumps(shared))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s4",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document math.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert response.output.summary.count("Shared summary text.") == 1
+    assert response.output.example_usage.count("shared_example()") == 1
+    assert response.output.returns.count("shared return") == 1
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_one_failure_keeps_others(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """One failing symbol should not discard successful documentation."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    good = _symbol_payload("add", "Adds values.")
+    client = _mock_client()
+    client.generate.side_effect = [
+        ModelResponse(content=json.dumps(good), usage={}, raw={}),
+        ModelResponse(content="not-json {", usage={}, raw={}),
+        ModelResponse(content="still-bad", usage={}, raw={}),
+    ]
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="sym-partial")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s5",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document math.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert "Adds values." in response.output.summary
+    assert "Generation Warnings" in response.output.summary
+    assert "documentation_symbol_failed" in agent.tracer.event_names()
+    assert "documentation_merge_finished" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_all_failures_abstain(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Abstain only when every symbol documentation attempt fails."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    client = _mock_client(content="not-json")
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="sym-all-fail")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s6",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document math.py",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "doc_type": "module",
+            },
+        )
+    )
+
+    assert response.success is False
+    assert response.output.abstention is not None
+    assert "every discovered public symbol" in response.output.abstention.reason.lower()
+    assert "documentation_symbol_failed" in agent.tracer.event_names()
+    assert "documentation_merge_started" not in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_grounding_still_works(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Per-symbol grounding still strips hallucinated references."""
+    payload = {
+        "file_path": "math.py",
+        "function_name": "add",
+        "summary": "add sums values. Also see FakeModule and the function ghost_helper.",
+        "parameters": [
+            {"name": "a", "type": "int", "description": "First."},
+            {
+                "name": "ghost_helper",
+                "type": "function",
+                "description": "Missing.",
+            },
+        ],
+        "returns": "sum",
+        "example_usage": "add(1, 2)",
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s7",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document add",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "function_name": "add",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert "ghost_helper" not in response.output.summary
+    assert "FakeModule" not in response.output.summary
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_json_retry_still_works(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Malformed JSON still triggers one repair retry per symbol."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    good = _symbol_payload("add", "Adds values.")
+    client = _mock_client()
+    client.generate.side_effect = [
+        ModelResponse(content="not-json {{{", usage={}, raw={}),
+        ModelResponse(content=json.dumps(good), usage={}, raw={}),
+    ]
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="sym-retry")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s8",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document add",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "function_name": "add",
+                "doc_type": "docstring",
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count == 2
+    assert "documentation_retry_success" in agent.tracer.event_names()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_per_symbol_writeback_still_works(
+    _mock_index: Any, multi_symbol_repo: Path
+) -> None:
+    """Write-back still inserts a docstring after per-symbol generation."""
+    payload = _symbol_payload("add", "Return the arithmetic sum.")
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="s9",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document add",
+            context={
+                "repo_path": str(multi_symbol_repo),
+                "file_path": str(multi_symbol_repo / "math.py"),
+                "function_name": "add",
+                "doc_type": "docstring",
+                "write_to_disk": True,
+            },
+        )
+    )
+
+    source = (multi_symbol_repo / "math.py").read_text(encoding="utf-8")
+    assert response.success is True
+    assert "Return the arithmetic sum." in source
+    assert "def subtract" in source

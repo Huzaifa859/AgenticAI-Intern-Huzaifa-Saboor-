@@ -1335,3 +1335,344 @@ def test_parse_coverage_term_fallback() -> None:
     assert measurement.statements == 12
     assert measurement.missing == 2
     assert measurement.files_measured == 2
+
+
+# ---------------------------------------------------------------------------
+# Import hygiene before pytest
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def auth_repo(tmp_path: Path) -> Path:
+    """Repository with auth helpers for import-validation tests."""
+    (tmp_path / "auth.py").write_text(
+        "def login(user):\n"
+        "    return user\n\n"
+        "def logout():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "app" / "services.py").write_text(
+        "def users():\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _import_agent(repo: Path) -> TestingAgent:
+    return TestingAgent(
+        model_client=_mock_client(content="{}"),
+        retriever=_mock_retriever(),
+    )
+
+
+def test_import_validation_allows_valid_repository_imports(auth_repo: Path) -> None:
+    """Real repository modules/symbols must pass validation."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+    from codebase_assistant.tracing.tracer import Tracer
+
+    agent = _import_agent(auth_repo)
+    agent.tracer = Tracer(run_id="imp-valid")
+    filesystem = FilesystemTools(str(auth_repo))
+    inventory = ["auth.py", "math_utils.py", "app/__init__.py", "app/services.py"]
+    source = (
+        "from auth import login, logout\n"
+        "from app.services import users\n"
+        "import math_utils\n\n"
+        "def test_login():\n"
+        "    assert login('a') == 'a'\n\n"
+        "def test_users():\n"
+        "    assert users() == []\n\n"
+        "def test_add():\n"
+        "    assert math_utils.add(1, 2) == 3\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_auth.py": source},
+        inventory=inventory,
+    )
+    assert report.invalid_imports == []
+    assert report.removed_imports == []
+    assert "test_auth.py" in report.executable_tests
+    assert "from auth import login, logout" in report.cleaned_tests["test_auth.py"]
+    assert "testing_import_validation_started" in agent.tracer.event_names()
+    assert "testing_import_validation_finished" in agent.tracer.event_names()
+
+
+def test_import_validation_removes_unused_invalid_symbol(auth_repo: Path) -> None:
+    """Unused hallucinated symbols are stripped before pytest."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+    from codebase_assistant.tracing.tracer import Tracer
+
+    agent = _import_agent(auth_repo)
+    agent.tracer = Tracer(run_id="imp-fake-symbol")
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "from auth import login\n"
+        "from auth import logout\n"
+        "from auth import fake_function\n\n"
+        "def test_login():\n"
+        "    assert login('a') == 'a'\n\n"
+        "def test_logout():\n"
+        "    assert logout() is True\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_auth.py": source},
+        inventory=["auth.py"],
+    )
+    cleaned = report.cleaned_tests["test_auth.py"]
+    assert "fake_function" not in cleaned
+    assert "login" in cleaned
+    assert "logout" in cleaned
+    assert report.removed_imports
+    assert "test_auth.py" in report.executable_tests
+    assert "testing_import_validation_failed" in agent.tracer.event_names()
+
+
+def test_import_validation_rejects_invalid_module(auth_repo: Path) -> None:
+    """Imports of modules that do not exist are invalid."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+
+    agent = _import_agent(auth_repo)
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "import totally_missing_mod\n\n"
+        "def test_ok():\n"
+        "    assert True\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_missing.py": source},
+        inventory=["auth.py"],
+    )
+    assert report.invalid_imports
+    assert report.invalid_imports[0].module == "totally_missing_mod"
+    assert "totally_missing_mod" not in report.cleaned_tests["test_missing.py"]
+    assert "test_missing.py" in report.executable_tests
+
+
+def test_import_validation_marks_used_invalid_symbol(auth_repo: Path) -> None:
+    """Used invalid symbols keep the module out of the executable set."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+
+    agent = _import_agent(auth_repo)
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "from auth import fake_function\n\n"
+        "def test_fake():\n"
+        "    assert fake_function() is None\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_fake.py": source},
+        inventory=["auth.py"],
+    )
+    assert report.rejected_files == ["test_fake.py"]
+    assert "test_fake.py" not in report.executable_tests
+    assert "fake_function" in report.cleaned_tests["test_fake.py"]
+
+
+def test_import_validation_allows_stdlib_imports(auth_repo: Path) -> None:
+    """Python stdlib imports must be accepted."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+
+    agent = _import_agent(auth_repo)
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "import json\n"
+        "import os.path\n"
+        "from collections import Counter\n\n"
+        "def test_stdlib():\n"
+        "    assert json.dumps({'a': 1})\n"
+        "    assert Counter('ab')['a'] == 1\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_stdlib.py": source},
+        inventory=["auth.py"],
+    )
+    assert report.invalid_imports == []
+    assert "test_stdlib.py" in report.executable_tests
+
+
+def test_import_validation_allows_third_party_imports(auth_repo: Path) -> None:
+    """Installed third-party packages (e.g. pytest) must be accepted."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+
+    agent = _import_agent(auth_repo)
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "import pytest\n\n"
+        "def test_raises():\n"
+        "    with pytest.raises(ValueError):\n"
+        "        raise ValueError('x')\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_third.py": source},
+        inventory=["auth.py"],
+    )
+    assert report.invalid_imports == []
+    assert "import pytest" in report.cleaned_tests["test_third.py"]
+
+
+def test_import_validation_handles_relative_imports(auth_repo: Path) -> None:
+    """Root-relative ``from .mod import`` imports resolve against the repo."""
+    from codebase_assistant.tools.filesystem_tools import FilesystemTools
+
+    agent = _import_agent(auth_repo)
+    filesystem = FilesystemTools(str(auth_repo))
+    source = (
+        "from .auth import login\n"
+        "from . import math_utils\n\n"
+        "def test_rel():\n"
+        "    assert login('x') == 'x'\n"
+        "    assert math_utils.add(1, 1) == 2\n"
+    )
+    report = agent._validate_generated_imports(
+        filesystem=filesystem,
+        generated_tests={"test_rel.py": source},
+        inventory=["auth.py", "math_utils.py"],
+    )
+    assert report.invalid_imports == []
+    assert "test_rel.py" in report.executable_tests
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_import_validation_pipeline_executes_remaining_tests(
+    _mock_index: Any, auth_repo: Path
+) -> None:
+    """After removing fake_function, remaining auth tests still execute."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    payload = {
+        "summary": "Auth login/logout tests.",
+        "generated_tests": {
+            "test_auth.py": (
+                "from auth import login\n"
+                "from auth import logout\n"
+                "from auth import fake_function\n\n"
+                "def test_login():\n"
+                "    assert login('a') == 'a'\n\n"
+                "def test_logout():\n"
+                "    assert logout() is True\n"
+            )
+        },
+        "coverage_estimate": 0.5,
+    }
+    client = _mock_client(content=json.dumps(payload))
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="imp-pipeline")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="imp-1",
+            agent_type=AgentType.TESTING,
+            instruction="Generate pytest unit tests.",
+            context={
+                "repo_path": str(auth_repo),
+                "file_path": str(auth_repo / "auth.py"),
+            },
+        )
+    )
+
+    assert response.success is True
+    cleaned = response.output.generated_tests["test_auth.py"]
+    assert "fake_function" not in cleaned
+    assert "login" in cleaned
+    assert "Execution:" in response.output.summary
+    assert "0 failed" in response.output.summary
+    names = agent.tracer.event_names()
+    assert "testing_import_validation_started" in names
+    assert "testing_import_validation_finished" in names
+    assert "testing_import_validation_failed" in names
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_import_validation_triggers_repair_when_all_used_invalid(
+    _mock_index: Any, tmp_path: Path
+) -> None:
+    """Used invalid imports with no executable suite still enter repair."""
+    from codebase_assistant.tracing.tracer import Tracer
+
+    # Single public symbol so generation uses one LLM call before repair.
+    (tmp_path / "auth.py").write_text(
+        "def login(user):\n"
+        "    return user\n",
+        encoding="utf-8",
+    )
+    bad = {
+        "summary": "Broken imports.",
+        "generated_tests": {
+            "test_auth.py": (
+                "from auth import fake_function\n\n"
+                "def test_fake():\n"
+                "    assert fake_function() == 1\n"
+            )
+        },
+        "coverage_estimate": 0.4,
+    }
+    repaired = {
+        "summary": "Repaired auth tests.",
+        "generated_tests": {
+            "test_auth.py": (
+                "from auth import login\n\n"
+                "def test_login():\n"
+                "    assert login('a') == 'a'\n"
+            )
+        },
+        "coverage_estimate": 0.8,
+    }
+    client = _mock_client()
+    client.generate.side_effect = [
+        ModelResponse(content=json.dumps(bad), usage={}, raw={}),
+        ModelResponse(content=json.dumps(repaired), usage={}, raw={}),
+    ]
+    agent = _agent(client, _mock_retriever())
+    agent.tracer = Tracer(run_id="imp-repair")
+
+    response = agent.handle(
+        AgentRequest(
+            task_id="imp-2",
+            agent_type=AgentType.TESTING,
+            instruction="Generate pytest unit tests.",
+            context={
+                "repo_path": str(tmp_path),
+                "file_path": str(tmp_path / "auth.py"),
+            },
+        )
+    )
+
+    assert response.success is True
+    assert client.generate.call_count == 2
+    assert "Repair: attempted one fix iteration." in response.output.summary
+    assert "fake_function" not in response.output.generated_tests["test_auth.py"]
+    assert "login" in response.output.generated_tests["test_auth.py"]
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_import_validation_does_not_break_existing_success_path(
+    _mock_index: Any, sample_repo: Path
+) -> None:
+    """Existing valid generated tests still succeed end-to-end."""
+    client = _mock_client(content=json.dumps(VALID_TEST_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(_request(sample_repo))
+
+    assert response.success is True
+    assert "def test_add_happy_path" in response.output.generated_tests[
+        "test_math_utils.py"
+    ]
+    assert "from math_utils import add" in response.output.generated_tests[
+        "test_math_utils.py"
+    ]

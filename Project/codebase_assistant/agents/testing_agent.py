@@ -26,12 +26,19 @@ After pytest execution, the agent measures real line coverage with
 pytest-cov (JSON report preferred) and stores that value in
 ``coverage_estimate``, falling back to the model estimate only when
 coverage tooling is unavailable.
+
+Before pytest runs, generated modules are AST-parsed and their imports
+are validated against the repository inventory, the Python stdlib, and
+installed third-party packages. Unused invalid imports are removed;
+modules with used invalid imports are skipped for the current run so
+remaining tests can still execute (or the existing repair loop can run).
 """
 
 from __future__ import annotations
 
 import ast
 import contextlib
+import importlib.util
 import io
 import json
 import logging
@@ -108,6 +115,18 @@ _SKIP_DIR_NAMES = frozenset(
         "site-packages",
         "node_modules",
         "generated",
+    }
+)
+
+#: Import roots always permitted in generated tests.
+_ALWAYS_ALLOWED_IMPORT_ROOTS = frozenset(
+    {
+        "pytest",
+        "_pytest",
+        "typing",
+        "typing_extensions",
+        "__future__",
+        "builtins",
     }
 )
 
@@ -267,6 +286,59 @@ class _ExecutionOutcome:
         if self.skipped_execution:
             return False
         return self.failed > 0 or self.errors > 0
+
+
+@dataclass
+class _ImportIssue:
+    """One invalid import discovered in a generated test module."""
+
+    file: str
+    module: str
+    symbol: str = ""
+    reason: str = ""
+    used: bool = False
+    bound_names: List[str] = field(default_factory=list)
+    node_id: int = 0
+
+
+@dataclass
+class _ImportValidationReport:
+    """Outcome of validating imports across generated test modules."""
+
+    cleaned_tests: Dict[str, str] = field(default_factory=dict)
+    executable_tests: Dict[str, str] = field(default_factory=dict)
+    invalid_imports: List[_ImportIssue] = field(default_factory=list)
+    removed_imports: List[str] = field(default_factory=list)
+    rejected_files: List[str] = field(default_factory=list)
+
+    @property
+    def has_issues(self) -> bool:
+        return bool(self.invalid_imports)
+
+
+@dataclass
+class _ImportCatalog:
+    """Repository modules/packages/symbols used to validate imports."""
+
+    modules: Set[str] = field(default_factory=set)
+    packages: Set[str] = field(default_factory=set)
+    symbols: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def has_module(self, dotted: str) -> bool:
+        name = (dotted or "").strip(".")
+        if not name:
+            return False
+        return name in self.modules or name in self.packages
+
+    def has_symbol(self, dotted_module: str, symbol: str) -> bool:
+        module = (dotted_module or "").strip(".")
+        name = (symbol or "").strip()
+        if not module or not name:
+            return False
+        if name in self.symbols.get(module, set()):
+            return True
+        # ``from pkg import sub`` where ``sub`` is a submodule.
+        return self.has_module(f"{module}.{name}")
 
 
 @dataclass
@@ -540,7 +612,7 @@ class TestingAgent(BaseAgent):
         Run the testing pipeline for one request.
 
         Stages: index → AST inventory/symbol scan → per-symbol generation →
-        merge → execute pytest → optional one-shot repair.
+        merge → import validation → execute pytest → optional one-shot repair.
         """
         empty = self._empty_result()
 
@@ -780,9 +852,58 @@ class TestingAgent(BaseAgent):
         source_excerpts = repair_excerpts[:_MAX_SOURCE_FILES]
 
         if result.generated_tests:
-            first_outcome = self._run_generated_tests(
-                workspace, result.generated_tests
+            result, import_report = self._apply_import_validation(
+                workspace=workspace,
+                result=result,
+                inventory=inventory,
             )
+            first_outcome = self._run_generated_tests(
+                workspace,
+                import_report.executable_tests or result.generated_tests,
+            )
+            # Used-invalid imports with no executable suite should enter repair.
+            if (
+                import_report.rejected_files
+                and not import_report.executable_tests
+                and not first_outcome.needs_repair
+                and not first_outcome.skipped_execution
+            ):
+                first_outcome = _ExecutionOutcome(
+                    summary=self._merge_summaries(
+                        first_outcome.summary,
+                        "Import validation: all generated modules had used "
+                        "invalid imports.",
+                    ),
+                    passed=first_outcome.passed,
+                    failed=max(first_outcome.failed, 1),
+                    skipped=first_outcome.skipped,
+                    errors=first_outcome.errors,
+                    output=first_outcome.output,
+                    skipped_execution=False,
+                    coverage=first_outcome.coverage,
+                )
+            elif (
+                import_report.rejected_files
+                and import_report.executable_tests
+                and not first_outcome.needs_repair
+            ):
+                # Remaining valid tests ran; keep going without abstaining.
+                first_outcome = _ExecutionOutcome(
+                    summary=self._merge_summaries(
+                        first_outcome.summary,
+                        "Import validation: skipped "
+                        f"{len(import_report.rejected_files)} module(s) with "
+                        "used invalid imports.",
+                    ),
+                    passed=first_outcome.passed,
+                    failed=first_outcome.failed,
+                    skipped=first_outcome.skipped,
+                    errors=first_outcome.errors,
+                    output=first_outcome.output,
+                    skipped_execution=first_outcome.skipped_execution,
+                    coverage=first_outcome.coverage,
+                )
+
             result = self._apply_execution_summary(result, first_outcome.summary)
 
             if first_outcome.needs_repair:
@@ -794,6 +915,7 @@ class TestingAgent(BaseAgent):
                     first_outcome=first_outcome,
                     chunks=chunks,
                     source_excerpts=source_excerpts,
+                    inventory=inventory,
                 )
             else:
                 result = self._apply_coverage_measurement(result, first_outcome)
@@ -929,6 +1051,7 @@ class TestingAgent(BaseAgent):
         first_outcome: _ExecutionOutcome,
         chunks: Sequence[RetrievedChunk],
         source_excerpts: Sequence[str],
+        inventory: Optional[Sequence[str]] = None,
     ) -> TestingResult:
         """
         Perform exactly one repair iteration after a failing pytest run.
@@ -994,8 +1117,14 @@ class TestingAgent(BaseAgent):
             content_chars=len(response.content or ""),
         )
 
+        repaired, repair_imports = self._apply_import_validation(
+            workspace=workspace,
+            result=repaired,
+            inventory=inventory or (),
+        )
         second_outcome = self._run_generated_tests(
-            workspace, repaired.generated_tests
+            workspace,
+            repair_imports.executable_tests or repaired.generated_tests,
         )
         coverage = (
             repaired.coverage_estimate
@@ -1570,6 +1699,564 @@ class TestingAgent(BaseAgent):
         except Exception as exc:
             logger.warning("Testing model availability check failed: %s", exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Import hygiene (validate before pytest)
+    # ------------------------------------------------------------------
+
+    def _apply_import_validation(
+        self,
+        *,
+        workspace: str,
+        result: TestingResult,
+        inventory: Sequence[str],
+    ) -> Tuple[TestingResult, _ImportValidationReport]:
+        """
+        Validate and sanitize imports in ``result.generated_tests``.
+
+        Unused invalid imports are removed. Modules that still reference
+        invalid imports are excluded from the executable set. Never
+        abstains; callers continue with remaining tests or repair.
+        """
+        generated = dict(result.generated_tests or {})
+        if not generated:
+            empty = _ImportValidationReport(cleaned_tests={}, executable_tests={})
+            return result, empty
+
+        filesystem = self._filesystem_tools(workspace)
+        report = self._validate_generated_imports(
+            filesystem=filesystem,
+            generated_tests=generated,
+            inventory=inventory,
+        )
+
+        note = ""
+        if report.removed_imports:
+            note = (
+                "Import validation: removed "
+                f"{len(report.removed_imports)} unused invalid import(s)."
+            )
+        if report.rejected_files:
+            skipped = ", ".join(report.rejected_files[:5])
+            skip_note = (
+                "Import validation: skipped invalid module(s) for execution: "
+                f"{skipped}."
+            )
+            note = self._merge_summaries(note, skip_note)
+
+        updated = TestingResult(
+            summary=self._merge_summaries(result.summary, note),
+            generated_tests=report.cleaned_tests,
+            coverage_estimate=result.coverage_estimate,
+            abstention=result.abstention,
+        )
+        return updated, report
+
+    def _validate_generated_imports(
+        self,
+        *,
+        filesystem: FilesystemTools,
+        generated_tests: Dict[str, str],
+        inventory: Sequence[str],
+    ) -> _ImportValidationReport:
+        """Parse generated tests and drop/reject invalid imports."""
+        self._trace(
+            "testing_import_validation_started",
+            files=len(generated_tests),
+            inventory=len(inventory),
+        )
+        started = time.perf_counter()
+        catalog = self._build_import_catalog(filesystem, inventory)
+
+        cleaned: Dict[str, str] = {}
+        executable: Dict[str, str] = {}
+        invalid: List[_ImportIssue] = []
+        removed: List[str] = []
+        rejected: List[str] = []
+
+        for filename, source in generated_tests.items():
+            text = source if source is not None else ""
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                cleaned[filename] = text
+                executable[filename] = text
+                continue
+
+            issues = self._collect_import_issues(
+                tree, filename=filename, catalog=catalog
+            )
+            invalid.extend(issues)
+            for issue in issues:
+                self._trace(
+                    "testing_import_validation_failed",
+                    file=issue.file,
+                    module=issue.module,
+                    symbol=issue.symbol,
+                    reason=issue.reason,
+                    used=issue.used,
+                )
+
+            unused_node_ids = {
+                issue.node_id for issue in issues if not issue.used
+            }
+            used_issues = [issue for issue in issues if issue.used]
+            new_source = text
+            if unused_node_ids:
+                new_source, removed_labels = self._strip_invalid_imports(
+                    text, tree, unused_node_ids, issues
+                )
+                removed.extend(removed_labels)
+
+            cleaned[filename] = new_source
+            if used_issues:
+                rejected.append(filename)
+            else:
+                executable[filename] = new_source
+
+        report = _ImportValidationReport(
+            cleaned_tests=cleaned,
+            executable_tests=executable,
+            invalid_imports=invalid,
+            removed_imports=removed,
+            rejected_files=rejected,
+        )
+        self._trace(
+            "testing_import_validation_finished",
+            success=not report.has_issues,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            files=len(generated_tests),
+            invalid_imports=len(invalid),
+            removed_imports=len(removed),
+            rejected_files=len(rejected),
+            executable_files=len(executable),
+        )
+        return report
+
+    def _build_import_catalog(
+        self,
+        filesystem: FilesystemTools,
+        inventory: Sequence[str],
+    ) -> _ImportCatalog:
+        """Build module/package/symbol sets from the AST inventory."""
+        catalog = _ImportCatalog()
+        paths = list(inventory)
+        if not paths:
+            try:
+                paths = filesystem.list_files(".", pattern="*.py", recursive=True)
+            except Exception as exc:
+                logger.warning("Import catalog could not list Python files: %s", exc)
+                paths = []
+
+        for raw in paths:
+            normalized = str(raw or "").replace("\\", "/").strip()
+            if not normalized.endswith(".py"):
+                continue
+            if self._should_skip_path(normalized):
+                continue
+            module = self._module_name_from_path(normalized)
+            if not module:
+                continue
+            catalog.modules.add(module)
+            parts = module.split(".")
+            for index in range(1, len(parts)):
+                catalog.packages.add(".".join(parts[:index]))
+            if normalized.endswith("/__init__.py") or normalized == "__init__.py":
+                catalog.packages.add(module)
+
+            try:
+                if not filesystem.file_exists(normalized):
+                    continue
+                source = filesystem.read_file(normalized)
+            except Exception:
+                continue
+            try:
+                tree = ast.parse(source or "", filename=normalized)
+            except SyntaxError:
+                continue
+            names = catalog.symbols.setdefault(module, set())
+            for node in getattr(tree, "body", []):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = []
+                    if isinstance(node, ast.Assign):
+                        targets = list(node.targets)
+                    elif node.target is not None:
+                        targets = [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+        return catalog
+
+    @staticmethod
+    def _module_name_from_path(path: str) -> str:
+        """Convert a repo-relative ``.py`` path into a dotted module name."""
+        normalized = (path or "").replace("\\", "/").strip().lstrip("./")
+        if not normalized.endswith(".py"):
+            return ""
+        without_ext = normalized[:-3]
+        if without_ext.endswith("/__init__"):
+            without_ext = without_ext[: -len("/__init__")]
+        elif without_ext == "__init__":
+            return ""
+        return without_ext.replace("/", ".").strip(".")
+
+    def _collect_import_issues(
+        self,
+        tree: ast.AST,
+        *,
+        filename: str,
+        catalog: _ImportCatalog,
+    ) -> List[_ImportIssue]:
+        """Return invalid import issues for one parsed test module."""
+        used_names = self._loaded_name_ids(tree)
+        issues: List[_ImportIssue] = []
+
+        for node in getattr(tree, "body", []):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module = (alias.name or "").strip()
+                    bound = alias.asname or module.split(".", 1)[0]
+                    ok, reason = self._import_module_allowed(module, catalog)
+                    if ok:
+                        continue
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=module,
+                            symbol="",
+                            reason=reason,
+                            used=bound in used_names,
+                            bound_names=[bound] if bound else [],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            if not isinstance(node, ast.ImportFrom):
+                continue
+
+            level = int(getattr(node, "level", 0) or 0)
+            if level >= 2:
+                bound = [
+                    (alias.asname or alias.name)
+                    for alias in node.names
+                    if alias.name and alias.name != "*"
+                ]
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=node.module or "",
+                        symbol=",".join(
+                            alias.name for alias in node.names if alias.name
+                        ),
+                        reason="relative import escapes repository root",
+                        used=bool(bound) and any(name in used_names for name in bound),
+                        bound_names=bound,
+                        node_id=id(node),
+                    )
+                )
+                continue
+
+            # ``from . import auth`` → each alias is a module under repo root.
+            if level == 1 and not (node.module or "").strip():
+                for alias in node.names:
+                    symbol = (alias.name or "").strip()
+                    if not symbol or symbol == "*":
+                        continue
+                    bound = alias.asname or symbol
+                    ok, reason = self._import_module_allowed(symbol, catalog)
+                    if ok:
+                        continue
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=symbol,
+                            symbol="",
+                            reason=reason,
+                            used=bound in used_names,
+                            bound_names=[bound],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            module = self._resolve_from_module(node)
+            root_ok, root_reason = self._import_module_allowed(module, catalog)
+            if node.names and any(alias.name == "*" for alias in node.names):
+                if not root_ok:
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=module or "",
+                            symbol="*",
+                            reason=root_reason,
+                            used=True,
+                            bound_names=["*"],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            if not root_ok:
+                bound = [
+                    (alias.asname or alias.name)
+                    for alias in node.names
+                    if alias.name and alias.name != "*"
+                ]
+                used = any(name in used_names for name in bound)
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=module or "",
+                        symbol=",".join(
+                            alias.name for alias in node.names if alias.name
+                        ),
+                        reason=root_reason,
+                        used=used,
+                        bound_names=bound,
+                        node_id=id(node),
+                    )
+                )
+                continue
+
+            for alias in node.names:
+                symbol = (alias.name or "").strip()
+                if not symbol or symbol == "*":
+                    continue
+                bound = alias.asname or symbol
+                if catalog.has_symbol(module, symbol):
+                    continue
+                if self._is_external_module(module, catalog):
+                    # Third-party/stdlib: do not invent or reject symbols.
+                    continue
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=module or "",
+                        symbol=symbol,
+                        reason=f"symbol {symbol!r} not found in module {module!r}",
+                        used=bound in used_names,
+                        bound_names=[bound] if bound else [],
+                        node_id=id(node),
+                    )
+                )
+        return issues
+
+    def _import_module_allowed(
+        self, module: str, catalog: _ImportCatalog
+    ) -> Tuple[bool, str]:
+        """Return ``(allowed, reason)`` for a dotted import module."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False, "empty import module"
+        root = name.split(".", 1)[0]
+        if root in _ALWAYS_ALLOWED_IMPORT_ROOTS:
+            return True, ""
+        if self._is_stdlib_module(root):
+            return True, ""
+        if catalog.has_module(name):
+            return True, ""
+        # ``import app.services`` requires the full dotted path in-repo.
+        if "." in name and catalog.has_module(root) and not catalog.has_module(name):
+            return False, f"module {name!r} not found in repository"
+        if catalog.has_module(root) and "." not in name:
+            return True, ""
+        if self._is_third_party_module(name) or self._is_third_party_module(root):
+            return True, ""
+        return False, f"module {name!r} not found in repository, stdlib, or environment"
+
+    def _is_external_module(
+        self, module: str, catalog: Optional[_ImportCatalog] = None
+    ) -> bool:
+        """True when ``module`` is stdlib/third-party rather than repo code."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False
+        # Repository modules win over similarly named installed packages.
+        if catalog is not None and (
+            catalog.has_module(name) or catalog.has_module(name.split(".", 1)[0])
+        ):
+            return False
+        root = name.split(".", 1)[0]
+        if root in _ALWAYS_ALLOWED_IMPORT_ROOTS:
+            return True
+        if self._is_stdlib_module(root):
+            return True
+        return self._is_third_party_module(name) or self._is_third_party_module(root)
+
+    @staticmethod
+    def _is_stdlib_module(root: str) -> bool:
+        """Return True for Python standard-library top-level modules."""
+        name = (root or "").strip()
+        if not name:
+            return False
+        stdlib = getattr(sys, "stdlib_module_names", None)
+        if stdlib is not None:
+            return name in stdlib
+        return name in {
+            "abc",
+            "ast",
+            "asyncio",
+            "collections",
+            "contextlib",
+            "copy",
+            "dataclasses",
+            "datetime",
+            "enum",
+            "functools",
+            "hashlib",
+            "io",
+            "itertools",
+            "json",
+            "logging",
+            "math",
+            "os",
+            "pathlib",
+            "re",
+            "sys",
+            "tempfile",
+            "threading",
+            "time",
+            "typing",
+            "unittest",
+            "uuid",
+            "warnings",
+        }
+
+    @staticmethod
+    def _is_third_party_module(module: str) -> bool:
+        """Return True when ``importlib`` can find an installed module."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ModuleNotFoundError, ValueError, ImportError):
+            return False
+
+    @staticmethod
+    def _resolve_from_module(node: ast.ImportFrom) -> str:
+        """Resolve ``from X import`` including relative imports."""
+        module = (node.module or "").strip()
+        level = int(getattr(node, "level", 0) or 0)
+        if level <= 0:
+            return module
+        # Generated tests are executed from an isolated temp dir with the
+        # repository on ``sys.path``; treat relative imports as repo-root
+        # absolute modules (``from .auth import x`` → ``auth``).
+        if level == 1:
+            return module
+        # ``from ..x`` escapes the repo root for our execution model.
+        return module
+
+    @staticmethod
+    def _loaded_name_ids(tree: ast.AST) -> Set[str]:
+        """Names loaded in the module body outside import statements."""
+        used: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                root = node.value
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                if isinstance(root, ast.Name):
+                    used.add(root.id)
+        return used
+
+    def _strip_invalid_imports(
+        self,
+        source: str,
+        tree: ast.Module,
+        unused_node_ids: Set[int],
+        issues: Sequence[_ImportIssue],
+    ) -> Tuple[str, List[str]]:
+        """
+        Remove unused invalid import statements / aliases from ``source``.
+
+        Returns ``(new_source, removed_labels)``.
+        """
+        unused_issues = [
+            issue
+            for issue in issues
+            if issue.node_id in unused_node_ids and not issue.used
+        ]
+        if not unused_issues:
+            return source, []
+
+        issues_by_node: Dict[int, List[_ImportIssue]] = {}
+        for issue in unused_issues:
+            issues_by_node.setdefault(issue.node_id, []).append(issue)
+
+        removed_labels: List[str] = []
+        new_body: List[ast.stmt] = []
+
+        for node in tree.body:
+            node_issues = issues_by_node.get(id(node))
+            if not node_issues:
+                new_body.append(node)
+                continue
+
+            if isinstance(node, ast.Import):
+                bad_modules = {issue.module for issue in node_issues}
+                keep = [
+                    alias
+                    for alias in node.names
+                    if (alias.name or "") not in bad_modules
+                ]
+                for issue in node_issues:
+                    removed_labels.append(f"{issue.file}:{issue.module}")
+                if keep:
+                    new_body.append(ast.Import(names=keep))
+                continue
+
+            if isinstance(node, ast.ImportFrom):
+                module_invalid = any(
+                    not issue.symbol or "," in issue.symbol for issue in node_issues
+                )
+                if module_invalid:
+                    for issue in node_issues:
+                        label = f"{issue.file}:{issue.module}"
+                        if issue.symbol:
+                            label = f"{label}.{issue.symbol}"
+                        removed_labels.append(label)
+                    continue
+
+                bad_symbols = {issue.symbol for issue in node_issues if issue.symbol}
+                keep = [
+                    alias
+                    for alias in node.names
+                    if (alias.name or "") not in bad_symbols
+                ]
+                for issue in node_issues:
+                    removed_labels.append(
+                        f"{issue.file}:{issue.module}.{issue.symbol}"
+                    )
+                if keep:
+                    new_body.append(
+                        ast.ImportFrom(
+                            module=node.module,
+                            names=keep,
+                            level=getattr(node, "level", 0) or 0,
+                        )
+                    )
+                continue
+
+            new_body.append(node)
+
+        new_module = ast.Module(body=new_body, type_ignores=[])
+        ast.fix_missing_locations(new_module)
+        try:
+            rendered = ast.unparse(new_module)
+        except Exception:
+            return source, removed_labels
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        return rendered, removed_labels
 
     # ------------------------------------------------------------------
     # AST inventory + symbol-scoped generation
