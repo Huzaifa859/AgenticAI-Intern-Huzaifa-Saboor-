@@ -480,6 +480,7 @@ class TestingAgent(BaseAgent):
             context.get("repo_path") or context.get("repository_path") or "."
         )
         file_path = str(context.get("file_path") or "")
+        function_name = str(context.get("function_name") or "")
         target = file_path or repo_path
 
         if not self._model_available():
@@ -496,15 +497,29 @@ class TestingAgent(BaseAgent):
             )
 
         try:
-            result = self._run_pipeline(
-                workspace=self._workspace_for(target),
-                target_path=target,
-                instruction=instruction
-                or (
+            if function_name and file_path:
+                default_instruction = (
+                    f"Generate pytest unit tests for function {function_name} "
+                    f"in {file_path}, covering happy paths, edge cases, "
+                    "invalid inputs, and common failure scenarios."
+                )
+            elif file_path:
+                default_instruction = (
+                    f"Generate pytest unit tests for {file_path}, covering "
+                    "functions, methods, edge cases, invalid inputs, and "
+                    "common failure scenarios."
+                )
+            else:
+                default_instruction = (
                     f"Generate pytest unit tests for {target}, covering "
                     "functions, methods, edge cases, invalid inputs, and "
                     "common failure scenarios."
-                ),
+                )
+            result = self._run_pipeline(
+                workspace=self._workspace_for(target),
+                target_path=target,
+                instruction=instruction or default_instruction,
+                focus_function=function_name,
             )
         except Exception as exc:
             logger.warning("TestingAgent.handle failed: %s", exc)
@@ -607,6 +622,7 @@ class TestingAgent(BaseAgent):
         workspace: str,
         target_path: str,
         instruction: str,
+        focus_function: str = "",
     ) -> TestingResult:
         """
         Run the testing pipeline for one request.
@@ -624,6 +640,7 @@ class TestingAgent(BaseAgent):
             "testing_started",
             workspace=workspace,
             target_path=target_path,
+            focus_function=focus_function or "",
         )
 
         logger.info("Indexing repository for testing retrieval...")
@@ -650,6 +667,22 @@ class TestingAgent(BaseAgent):
         symbols, skipped_symbols = self._collect_testable_symbols(
             filesystem, inventory
         )
+        focus = (focus_function or "").strip()
+        if focus:
+            focused = [
+                symbol
+                for symbol in symbols
+                if symbol.name == focus
+                or symbol.qualname == focus
+                or focus in symbol.qualname
+            ]
+            if focused:
+                symbols = focused
+            else:
+                skipped_symbols = list(skipped_symbols) + [
+                    f"{focus}:not_found_in_inventory"
+                ]
+                symbols = []
         self._trace(
             "testing_ast_scan_finished",
             success=True,
@@ -657,6 +690,7 @@ class TestingAgent(BaseAgent):
             files_scanned=len(inventory),
             symbols_discovered=len(symbols),
             symbols_skipped=len(skipped_symbols),
+            focus_function=focus,
         )
 
         if not inventory:

@@ -128,13 +128,18 @@ def test_record_repository_and_agent_summaries(
         memory=memory,
     )
     app_main.run_documentation_agent(
-        documentation_agent, str(tmp_path / "flask"), memory=memory
+        documentation_agent,
+        str(tmp_path / "flask"),
+        memory=memory,
+        interactive=False,
+        mode="readme",
     )
     app_main.run_testing_agent(
         testing_agent,
         str(tmp_path / "flask"),
         interactive=False,
         memory=memory,
+        mode="repository",
     )
 
     texts = _history_texts(memory)
@@ -143,9 +148,9 @@ def test_record_repository_and_agent_summaries(
     assert any("Run Code Analysis" in text for text in texts)
     assert any("Find security bugs" in text for text in texts)
     assert "7 static findings. 1 grounded LLM finding." in texts
-    assert "Generate documentation" in texts
+    assert any("Generate documentation" in text for text in texts)
     assert "README generated." in texts
-    assert "Generate tests" in texts
+    assert any("Generate tests" in text for text in texts)
     assert "Generated tests for 2 modules." in texts
 
     joined = "\n".join(texts)
@@ -254,8 +259,11 @@ def test_interactive_loop_records_chosen_agent(tmp_path: Path, monkeypatch) -> N
         AgentType.TESTING: MagicMock(spec=TestingAgent),
     }
 
-    answers = iter(["2", "4"])
-    monkeypatch.setattr(app_main, "prompt_choice", lambda: next(answers))
+    answers = iter(["2", "1", "4"])
+    monkeypatch.setattr(
+        app_main, "prompt_choice", lambda *a, **k: next(answers)
+    )
+    monkeypatch.setattr(app_main, "ask_yes_no", lambda *a, **k: False)
     monkeypatch.setattr(
         app_main, "print_documentation_result", lambda *a, **k: None
     )
@@ -265,7 +273,7 @@ def test_interactive_loop_records_chosen_agent(tmp_path: Path, monkeypatch) -> N
     )
 
     texts = _history_texts(memory)
-    assert "Generate documentation" in texts
+    assert any("Generate documentation" in text for text in texts)
     assert "README generated." in texts
     assert "body should not be stored" not in "\n".join(texts)
 
