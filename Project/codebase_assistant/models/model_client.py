@@ -22,12 +22,17 @@ ProviderManager, which is injected here as the BaseProvider.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+import time
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from ..config import Config
 from ..exceptions.model_exceptions import ModelResponseError, ProviderUnavailableError
+from ..hooks.events import HookEvent
 from ..schemas.schemas import ModelMessage, ModelResponse
 from .providers.base import BaseProvider
+
+if TYPE_CHECKING:
+    from ..hooks.manager import HookManager
 
 # Roles a ModelMessage may carry. Kept here rather than on the provider
 # because it is a property of the conversation format, not of any vendor.
@@ -46,6 +51,7 @@ class ModelClient:
         self,
         provider: Optional[BaseProvider] = None,
         config: Optional[Config] = None,
+        hook_manager: Optional["HookManager"] = None,
     ) -> None:
         """
         Initialize the ModelClient.
@@ -57,9 +63,12 @@ class ModelClient:
                 before any provider is configured.
             config: Optional Config instance. A default is loaded when
                 not supplied.
+            hook_manager: Optional HookManager for BEFORE/AFTER model
+                call lifecycle events.
         """
         self.config = config or Config.load()
         self._provider = provider
+        self.hook_manager = hook_manager
 
     @property
     def provider(self) -> Optional[BaseProvider]:
@@ -127,9 +136,63 @@ class ModelClient:
                 "Pass one to the constructor or call set_provider()."
             )
 
-        response = self._provider.generate(list(messages), **options)
-        self._validate_response(response)
+        model_name = getattr(self._provider, "model", "") or ""
+        self._trigger_hook(
+            HookEvent.BEFORE_MODEL_CALL,
+            {
+                "component": "ModelClient",
+                "model": model_name,
+                "message_count": len(messages),
+            },
+        )
+        started = time.perf_counter()
+        try:
+            response = self._provider.generate(list(messages), **options)
+            self._validate_response(response)
+        except Exception as exc:
+            self._trigger_hook(
+                HookEvent.AFTER_MODEL_CALL,
+                {
+                    "component": "ModelClient",
+                    "model": model_name,
+                    "success": False,
+                    "error": str(exc),
+                    "duration_ms": (time.perf_counter() - started) * 1000.0,
+                },
+            )
+            self._trigger_hook(
+                HookEvent.ON_ERROR,
+                {
+                    "component": "ModelClient",
+                    "model": model_name,
+                    "error": str(exc),
+                    "success": False,
+                },
+            )
+            raise
+
+        self._trigger_hook(
+            HookEvent.AFTER_MODEL_CALL,
+            {
+                "component": "ModelClient",
+                "model": getattr(self._provider, "model", model_name),
+                "success": True,
+                "duration_ms": (time.perf_counter() - started) * 1000.0,
+                "content_chars": len(getattr(response, "content", "") or ""),
+            },
+        )
         return response
+
+    def _trigger_hook(self, event: HookEvent, context: dict) -> None:
+        """Fire a lifecycle hook when a manager is configured."""
+        if self.hook_manager is None:
+            return
+        try:
+            self.hook_manager.trigger(event, context)
+        except Exception:
+            # HookManager already isolates hook failures; this is belt
+            # and braces so the client never breaks on instrumentation.
+            return
 
     def generate_from_prompt(
         self,
@@ -233,6 +296,7 @@ class LLMClient(ModelClient):
         max_tokens: Optional[int] = None,
         provider: Optional[BaseProvider] = None,
         config: Optional[Config] = None,
+        hook_manager: Optional["HookManager"] = None,
     ) -> None:
         """
         Initialize the deprecated client.
@@ -244,8 +308,11 @@ class LLMClient(ModelClient):
                 same reason.
             provider: Provider backend to delegate to.
             config: Optional Config instance.
+            hook_manager: Optional HookManager for model lifecycle hooks.
         """
-        super().__init__(provider=provider, config=config)
+        super().__init__(
+            provider=provider, config=config, hook_manager=hook_manager
+        )
         self.model_name = model_name or self.config.model_name
         self.max_tokens = max_tokens or self.config.max_tokens
 

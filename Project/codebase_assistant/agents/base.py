@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
+from ..hooks.events import HookEvent
 from ..memory.memory_store import MemoryStore
 from ..models.model_client import LLMClient
 from ..rag.retriever import Retriever
@@ -29,6 +30,7 @@ from ..tracing.tracer import Tracer
 
 if TYPE_CHECKING:
     from ..config import Config
+    from ..hooks.manager import HookManager
     from ..tools.filesystem_tools import FilesystemTools
     from ..tools.github_tools import GitHubTools
 
@@ -53,6 +55,7 @@ class BaseAgent(ABC):
         retriever: Optional[Retriever] = None,
         memory_store: Optional[MemoryStore] = None,
         tracer: Optional[Tracer] = None,
+        hook_manager: Optional["HookManager"] = None,
     ) -> None:
         """
         Initialize the BaseAgent with its shared dependencies.
@@ -63,12 +66,34 @@ class BaseAgent(ABC):
             retriever: RAG retriever used to fetch relevant context.
             memory_store: Long-term memory store.
             tracer: Optional shared Tracer for lifecycle events.
+            hook_manager: Optional HookManager for lifecycle hooks.
         """
         self.model_client = model_client
         self.tool_registry = tool_registry
         self.retriever = retriever
         self.memory_store = memory_store
         self.tracer = tracer
+        self.hook_manager = hook_manager
+
+    def _hook(self, event: HookEvent, **context: Any) -> None:
+        """Fire a lifecycle hook; never raises into agent logic."""
+        if self.hook_manager is None:
+            return
+        payload = dict(context)
+        payload.setdefault("component", self.__class__.__name__)
+        payload.setdefault(
+            "agent_type",
+            getattr(self.agent_type, "value", str(self.agent_type)),
+        )
+        try:
+            self.hook_manager.trigger(event, payload)
+        except Exception as exc:
+            logger.warning(
+                "%s hook %s failed: %s",
+                self.__class__.__name__,
+                getattr(event, "value", event),
+                exc,
+            )
 
     def _trace(
         self,

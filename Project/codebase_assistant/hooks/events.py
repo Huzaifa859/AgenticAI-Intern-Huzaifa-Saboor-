@@ -4,9 +4,8 @@ events.py
 
 Enumerates the lifecycle points at which hooks can fire.
 
-TODO: Emit these events from the Supervisor, agents, tools, and the
-ingestion pipeline once hook dispatch is implemented. Extend the
-enum as further instrumentation points are identified.
+Supervisor and agents emit these through HookManager.trigger.
+Extend the enum as further instrumentation points are identified.
 """
 
 from __future__ import annotations

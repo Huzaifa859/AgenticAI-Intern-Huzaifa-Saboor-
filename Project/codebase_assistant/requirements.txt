@@ -23,6 +23,10 @@ GitPython>=3.1
 # (all-mpnet-base-v2) selected in the Week 3 embedding comparison.
 chromadb>=0.4
 sentence-transformers>=2.2
+# jsonschema (pulled in by chromadb) prefers rfc3987 for URI checks.
+# Without it, jsonschema falls back to rfc3987_syntax + Lark, which can
+# hang or take a very long time on import under Python 3.13.
+rfc3987>=1.3.8
 
 # --- Static analysis ---------------------------------------------------
 # Deterministic first pass of the bug detection pipeline. Python's `ast`

@@ -27,6 +27,9 @@ from .agents.code_analysis_agent import CodeAnalysisAgent
 from .agents.documentation_agent import DocumentationAgent
 from .agents.testing_agent import TestingAgent
 from .config import Config
+from .hooks.defaults import install_default_hooks
+from .hooks.events import HookEvent
+from .hooks.manager import HookManager
 from .memory.conversation_memory import ConversationMemory
 from .memory.memory_store import MemoryStore
 from .models.model_client import LLMClient
@@ -100,6 +103,13 @@ class Supervisor:
             logger.warning("Tracer construction failed; continuing without tracing: %s", exc)
             self.tracer = Tracer(enabled=False)
 
+        # Lifecycle hooks (logging + tracer bridge). Safe if install fails.
+        self.hook_manager = HookManager()
+        try:
+            install_default_hooks(self.hook_manager, tracer=self.tracer)
+        except Exception as exc:
+            logger.warning("Default hook installation failed: %s", exc)
+
         # Shared OpenRouter + Ollama providers. Construction failures
         # never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
@@ -118,6 +128,7 @@ class Supervisor:
             max_tokens=self.config.max_tokens,
             provider=self.provider_manager,
             config=self.config,
+            hook_manager=self.hook_manager,
         )
         # Direct Ollama client for local-model experiments. Agents use
         # model_client (with failover), not this handle.
@@ -126,6 +137,7 @@ class Supervisor:
             max_tokens=self.config.max_tokens,
             provider=self.ollama_provider,
             config=self.config,
+            hook_manager=self.hook_manager,
         )
         self.tool_registry = ToolRegistry()
         self.indexer = Indexer(vector_store_path=self.config.vector_store_path)
@@ -165,6 +177,19 @@ class Supervisor:
             )
         except Exception as exc:
             logger.warning("Supervisor tracing failed for %r: %s", name, exc)
+
+    def _hook(self, event: HookEvent, **context: object) -> None:
+        """Fire a lifecycle hook; never raises into orchestration."""
+        try:
+            payload = dict(context)
+            payload.setdefault("component", "Supervisor")
+            self.hook_manager.trigger(event, payload)
+        except Exception as exc:
+            logger.warning(
+                "Supervisor hook %s failed: %s",
+                getattr(event, "value", event),
+                exc,
+            )
 
     def provider_status_message(self) -> str:
         """
@@ -341,6 +366,7 @@ class Supervisor:
             retriever=self.retriever,
             memory_store=self.memory_store,
             tracer=self.tracer,
+            hook_manager=self.hook_manager,
         )
         logger.info(
             "DocumentationAgent received an OpenRouter-backed LLMClient "
@@ -354,6 +380,7 @@ class Supervisor:
                 tool_registry=self.tool_registry,
                 memory_store=self.memory_store,
                 tracer=self.tracer,
+                hook_manager=self.hook_manager,
             ),
             AgentType.DOCUMENTATION: documentation_agent,
             AgentType.TESTING: TestingAgent(
@@ -362,6 +389,7 @@ class Supervisor:
                 retriever=self.retriever,
                 memory_store=self.memory_store,
                 tracer=self.tracer,
+                hook_manager=self.hook_manager,
             ),
         }
 
@@ -473,13 +501,32 @@ class Supervisor:
             The agent's AgentResponse, or a failed AgentResponse
             describing the exception it raised.
         """
+        self._hook(
+            HookEvent.BEFORE_AGENT_RUN,
+            agent_type=request.agent_type.value,
+            task_id=request.task_id,
+        )
         try:
-            return self.dispatch(request)
+            response = self.dispatch(request)
         except Exception as exc:
             logger.warning(
                 "%s failed while handling a request: %s",
                 request.agent_type.value,
                 exc,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                error=str(exc),
+                success=False,
+            )
+            self._hook(
+                HookEvent.AFTER_AGENT_RUN,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                success=False,
+                error=str(exc),
             )
             return AgentResponse(
                 task_id=request.task_id,
@@ -488,6 +535,23 @@ class Supervisor:
                 output=None,
                 errors=[str(exc)],
             )
+
+        self._hook(
+            HookEvent.AFTER_AGENT_RUN,
+            agent_type=request.agent_type.value,
+            task_id=request.task_id,
+            success=response.success,
+            errors=list(response.errors or []),
+        )
+        if not response.success:
+            self._hook(
+                HookEvent.ON_ERROR,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                success=False,
+                errors=list(response.errors or []),
+            )
+        return response
 
     def _select_agent_types(self, goal: str) -> List[AgentType]:
         """

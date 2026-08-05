@@ -2785,6 +2785,10 @@ class DocumentationAgent(BaseAgent):
             logger.info("No retriever configured; skipping documentation indexing.")
             return
 
+        from ..hooks.events import HookEvent
+
+        self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
+        started = time.perf_counter()
         try:
             vector_db = None
             try:
@@ -2800,10 +2804,31 @@ class DocumentationAgent(BaseAgent):
             )
             update = indexer.update_index(".")
             logger.info("Documentation index: %s", update.summary())
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=workspace,
+                success=True,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                summary=update.summary(),
+            )
         except Exception as exc:
             logger.warning(
                 "Documentation indexing failed; retrieval may be empty: %s",
                 exc,
+            )
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=workspace,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                workspace=workspace,
+                error=str(exc),
+                success=False,
+                stage="indexing",
             )
 
     def _resolve_documentation_target(

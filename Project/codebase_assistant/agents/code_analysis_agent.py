@@ -47,6 +47,8 @@ from ..analysis.static_analyzer import AnalysisReport as StaticAnalysisReport
 from ..analysis.static_analyzer import StaticAnalyzer
 from ..config import Config
 from ..exceptions.base import CodebaseAssistantError
+from ..hooks.events import HookEvent
+from ..hooks.manager import HookManager
 from ..memory.memory_store import MemoryStore
 from ..models.model_client import LLMClient
 from ..rag.indexer import IndexUpdate, Indexer
@@ -299,6 +301,7 @@ class CodeAnalysisAgent(BaseAgent):
         grounding_checker: Optional[GroundingChecker] = None,
         filesystem: Optional[FilesystemTools] = None,
         tracer: Optional[Tracer] = None,
+        hook_manager: Optional[HookManager] = None,
     ) -> None:
         """
         Initialize the agent and record its collaborators.
@@ -328,6 +331,7 @@ class CodeAnalysisAgent(BaseAgent):
             filesystem: Sandboxed file access. Built per repository when
                 omitted.
             tracer: Optional shared Tracer for lifecycle events.
+            hook_manager: Optional HookManager for lifecycle hooks.
         """
         super().__init__(
             model_client=model_client,
@@ -335,6 +339,7 @@ class CodeAnalysisAgent(BaseAgent):
             retriever=retriever,
             memory_store=memory_store,
             tracer=tracer,
+            hook_manager=hook_manager,
         )
         self.config = config or Config.load()
         self._indexer = indexer
@@ -864,6 +869,11 @@ class CodeAnalysisAgent(BaseAgent):
             repository_path=pipeline.root,
             scope=scope,
         )
+        self._hook(
+            HookEvent.BEFORE_INGEST,
+            workspace=pipeline.root,
+            scope=scope,
+        )
         index_started = time.perf_counter()
         try:
             update = pipeline.indexer.update_index(scope)
@@ -874,21 +884,46 @@ class CodeAnalysisAgent(BaseAgent):
             note = f"Indexing failed, continuing without retrieval: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            duration_ms = (time.perf_counter() - index_started) * 1000.0
             self._trace(
                 "indexing_finished",
                 event_type=TraceEventType.INGESTION,
                 success=False,
                 error=str(exc),
-                duration_ms=(time.perf_counter() - index_started) * 1000.0,
+                duration_ms=duration_ms,
+            )
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=pipeline.root,
+                scope=scope,
+                success=False,
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                workspace=pipeline.root,
+                error=str(exc),
+                success=False,
+                stage="indexing",
             )
             return None
 
         logger.info("Index: %s", update.summary())
+        duration_ms = (time.perf_counter() - index_started) * 1000.0
         self._trace(
             "indexing_finished",
             event_type=TraceEventType.INGESTION,
             success=True,
-            duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            duration_ms=duration_ms,
+            summary=update.summary(),
+        )
+        self._hook(
+            HookEvent.AFTER_INGEST,
+            workspace=pipeline.root,
+            scope=scope,
+            success=True,
+            duration_ms=duration_ms,
             summary=update.summary(),
         )
         return update
