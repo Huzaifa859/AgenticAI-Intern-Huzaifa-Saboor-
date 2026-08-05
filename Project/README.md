@@ -221,11 +221,15 @@ Writes deterministic JSON with `run_id`, ordered `events`, and an aggregate `sum
 
 Primary remote provider. Used for analysis and as the general LLM backend when `OPENROUTER_API_KEY` is configured.
 
-Default primary model: `google/gemma-3-27b-it`.
+Default primary model: `nvidia/nemotron-3-ultra-550b-a55b:free`.
+
+### Nemotron 3 Ultra (free)
+
+Reached through OpenRouter (`nvidia/nemotron-3-ultra-550b-a55b:free`). Default primary model for code analysis and grounded bug finding. Free-tier rate limits apply (see OpenRouter docs).
 
 ### Gemma
 
-Reached through OpenRouter (`google/gemma-3-27b-it`). Default primary model for code analysis and grounded bug finding.
+OpenRouter fallback candidate: `google/gemma-3-27b-it`.
 
 ### Llama
 
@@ -233,7 +237,7 @@ OpenRouter fallback candidate: `meta-llama/llama-3.1-8b-instruct`.
 
 Also available locally via Ollama as `llama3` (default Ollama model).
 
-### Nemotron
+### Nemotron Nano
 
 OpenRouter fallback candidate: `nvidia/nemotron-nano-9b-v2`.
 
@@ -247,9 +251,10 @@ Local provider for models served at `OLLAMA_BASE_URL` (default `http://localhost
 
 Fallback order:
 
-1. Primary model (default Gemma 3 27B IT)
-2. Llama 3.1 8B Instruct
-3. Nemotron Nano 9B
+1. Primary model (default Nemotron 3 Ultra free)
+2. Gemma 3 27B IT
+3. Llama 3.1 8B Instruct
+4. Nemotron Nano 9B
 
 ---
 
@@ -345,8 +350,10 @@ Variables below are loaded by `Config.load()` (from `Project/.env` and the proce
 | `RERANK_MODEL_NAME` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
 | `RERANK_CANDIDATES` | No | `24` | Candidate pool size before rerank |
 | `LOG_LEVEL` | No | `INFO` | Logging threshold |
+| `DOCUMENTATION_LENIENT` | No | `true` | Keep imperfect documentation LLM text (with warnings) instead of emptying on JSON/grounding failures. Set `false` for strict abstention. |
+| `TESTING_LENIENT` | No | `true` | Salvage pytest source from non-JSON testing model output instead of abstaining with an empty suite. Set `false` for strict abstention. |
 
-Model identifiers (`openrouter_model`, `claude_model`, `ollama_model`) are Config defaults (`google/gemma-3-27b-it` and `llama3`) unless changed in code/configuration objects.
+Model identifiers (`openrouter_model`, `claude_model`, `ollama_model`) are Config defaults (`nvidia/nemotron-3-ultra-550b-a55b:free` and `llama3`) unless changed in code/configuration objects.
 
 ---
 

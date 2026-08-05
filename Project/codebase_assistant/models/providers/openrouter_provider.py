@@ -51,6 +51,7 @@ _INITIAL_BACKOFF_SECONDS = 1.0
 
 #: Models tried in order when the configured model is not usable.
 _FALLBACK_MODELS = (
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-3-27b-it",
     "meta-llama/llama-3.1-8b-instruct",
     "nvidia/nemotron-nano-9b-v2",
@@ -88,7 +89,7 @@ class OpenRouterProvider(BaseProvider):
 
     def __init__(
         self,
-        model: str = "google/gemma-3-27b-it",
+        model: str = "nvidia/nemotron-3-ultra-550b-a55b:free",
         api_key: Optional[str] = None,
         max_tokens: int = 4096,
         base_url: str = "https://openrouter.ai/api/v1",

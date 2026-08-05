@@ -196,7 +196,7 @@ class Supervisor:
         One-line CLI summary of the active LLM provider.
 
         Returns:
-            Status such as ``Using OpenRouter (Gemma 3 27B)`` or an
+            Status such as ``Using OpenRouter (Nemotron 3 Ultra)`` or an
             Ollama fallback / static-only message.
         """
         try:

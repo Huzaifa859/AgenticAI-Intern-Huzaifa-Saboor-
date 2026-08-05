@@ -447,6 +447,22 @@ class DocumentationAgent(BaseAgent):
 
     agent_type: AgentType = AgentType.DOCUMENTATION
 
+    def _lenient(self) -> bool:
+        """
+        Whether to keep imperfect LLM documentation for demos.
+
+        Uses ``Config.documentation_lenient`` when the model client carries
+        a real Config. Mock clients / missing Config stay strict so unit
+        tests that assert abstention remain stable.
+        """
+        from ..config import Config
+
+        client = self.model_client
+        cfg = getattr(client, "config", None) if client is not None else None
+        if not isinstance(cfg, Config):
+            return False
+        return bool(cfg.documentation_lenient)
+
     def run(self, repo_path: str) -> Dict[str, str]:
         """
         Simple entry point used by the Supervisor for direct routing.
@@ -916,12 +932,15 @@ class DocumentationAgent(BaseAgent):
                 continue
 
             duration_ms = (time.perf_counter() - symbol_started) * 1000.0
-            if (
+            has_body = bool(
+                symbol_result.summary and symbol_result.summary.strip()
+            )
+            clean = (
                 grounded_ok
-                and symbol_result.summary
-                and symbol_result.summary.strip()
+                and has_body
                 and symbol_result.abstention is None
-            ):
+            )
+            if clean:
                 partial_results.append(symbol_result)
                 verified_total += v_count
                 removed_total += r_count
@@ -931,6 +950,37 @@ class DocumentationAgent(BaseAgent):
                     module=symbol.module_path,
                     duration_ms=duration_ms,
                     success=True,
+                )
+            elif has_body and self._lenient():
+                # Demo path: keep imperfect model text instead of dropping it.
+                kept = DocumentationResult(
+                    file_path=symbol_result.file_path,
+                    function_name=symbol_result.function_name,
+                    summary=symbol_result.summary,
+                    parameters=list(symbol_result.parameters or []),
+                    returns=symbol_result.returns or "",
+                    example_usage=symbol_result.example_usage or "",
+                    abstention=None,
+                )
+                partial_results.append(kept)
+                verified_total += v_count
+                removed_total += r_count
+                reason = (
+                    symbol_result.abstention.reason
+                    if symbol_result.abstention is not None
+                    else "imperfect grounding or JSON shape"
+                )
+                warnings.append(
+                    f"{symbol.qualname}: kept model output despite {reason}"
+                )
+                self._trace(
+                    "documentation_symbol_finished",
+                    symbol=symbol.qualname,
+                    module=symbol.module_path,
+                    duration_ms=duration_ms,
+                    success=True,
+                    lenient=True,
+                    reason=reason,
                 )
             else:
                 reason = (
@@ -1147,6 +1197,7 @@ class DocumentationAgent(BaseAgent):
             )
             return result
 
+        pre_ground = result
         result, grounding_stats, grounding_abstained = self._ground_documentation(
             result,
             filesystem=filesystem,
@@ -1155,28 +1206,45 @@ class DocumentationAgent(BaseAgent):
             target_path=target_path,
         )
         if grounding_abstained or not (result.summary and result.summary.strip()):
-            result = self._abstain_result(
-                empty,
-                reason="Documentation claims could not be grounded in the repository.",
-                evidence_available=[f"{len(inventory)} inventoried path(s)"],
-                recommended_next_steps=[
-                    "Retry with a narrower documentation target.",
-                    "Ensure generated documentation only cites inventory paths and symbols.",
-                ],
-            )
-            self._trace(
-                "documentation_grounding_abstained",
-                removed=len(grounding_stats.removed),
-                unsupported=len(grounding_stats.unsupported),
-                verified=len(grounding_stats.verified),
-            )
-            self._trace(
-                "documentation_finished",
-                success=False,
-                abstained=True,
-                reason=result.abstention.reason if result.abstention else "",
-            )
-            return result
+            if self._lenient() and (pre_ground.summary or "").strip():
+                result = DocumentationResult(
+                    file_path=pre_ground.file_path,
+                    function_name=pre_ground.function_name,
+                    summary=pre_ground.summary,
+                    parameters=list(pre_ground.parameters or []),
+                    returns=pre_ground.returns or "",
+                    example_usage=pre_ground.example_usage or "",
+                    abstention=None,
+                )
+                self._trace(
+                    "documentation_grounding_lenient_keep",
+                    removed=len(grounding_stats.removed),
+                    unsupported=len(grounding_stats.unsupported),
+                    verified=len(grounding_stats.verified),
+                )
+            else:
+                result = self._abstain_result(
+                    empty,
+                    reason="Documentation claims could not be grounded in the repository.",
+                    evidence_available=[f"{len(inventory)} inventoried path(s)"],
+                    recommended_next_steps=[
+                        "Retry with a narrower documentation target.",
+                        "Ensure generated documentation only cites inventory paths and symbols.",
+                    ],
+                )
+                self._trace(
+                    "documentation_grounding_abstained",
+                    removed=len(grounding_stats.removed),
+                    unsupported=len(grounding_stats.unsupported),
+                    verified=len(grounding_stats.verified),
+                )
+                self._trace(
+                    "documentation_finished",
+                    success=False,
+                    abstained=True,
+                    reason=result.abstention.reason if result.abstention else "",
+                )
+                return result
 
         self._trace(
             "documentation_target_grounded",
@@ -1292,6 +1360,24 @@ class DocumentationAgent(BaseAgent):
             target_path=symbol.module_path or target_path,
         )
         if abstained or not (grounded.summary and grounded.summary.strip()):
+            if self._lenient() and (result.summary or "").strip():
+                self._trace(
+                    "documentation_grounding_lenient_keep",
+                    removed=len(stats.removed),
+                    unsupported=len(stats.unsupported),
+                    verified=len(stats.verified),
+                    symbol=symbol.qualname,
+                )
+                kept = DocumentationResult(
+                    file_path=result.file_path or symbol.module_path,
+                    function_name=result.function_name or symbol.result_name,
+                    summary=result.summary,
+                    parameters=list(result.parameters or []),
+                    returns=result.returns or "",
+                    example_usage=result.example_usage or "",
+                    abstention=None,
+                )
+                return kept, False, len(stats.verified), len(stats.removed)
             self._trace(
                 "documentation_grounding_abstained",
                 removed=len(stats.removed),
@@ -1378,6 +1464,23 @@ class DocumentationAgent(BaseAgent):
                 default_file_path=default_file_path,
                 default_function_name=default_function_name,
             )
+        if (
+            self._lenient()
+            and not (result.summary and result.summary.strip())
+            and (response.content or "").strip()
+        ):
+            salvaged = self._salvage_raw_documentation(
+                response.content or "",
+                default_file_path=default_file_path,
+                default_function_name=default_function_name,
+            )
+            if salvaged.summary.strip():
+                self._trace(
+                    "documentation_json_salvaged",
+                    success=True,
+                    summary_chars=len(salvaged.summary),
+                )
+                return salvaged
         return result
 
     def _discover_documentable_symbols(
@@ -2162,6 +2265,14 @@ class DocumentationAgent(BaseAgent):
                 error=str(exc),
                 duration_ms=(time.perf_counter() - model_started) * 1000.0,
             )
+            if self._lenient():
+                salvaged = self._salvage_raw_documentation(
+                    raw_output,
+                    default_file_path=default_file_path,
+                    default_function_name=default_function_name,
+                )
+                if salvaged.summary.strip():
+                    return salvaged
             return self._empty_result(default_file_path, default_function_name)
 
         repaired, retry_error = self._parse_response_with_status(
@@ -2178,6 +2289,20 @@ class DocumentationAgent(BaseAgent):
                 error=retry_error or "repaired JSON produced an empty summary",
                 duration_ms=(time.perf_counter() - model_started) * 1000.0,
             )
+            if self._lenient():
+                for candidate in (response.content or "", raw_output):
+                    salvaged = self._salvage_raw_documentation(
+                        candidate,
+                        default_file_path=default_file_path,
+                        default_function_name=default_function_name,
+                    )
+                    if salvaged.summary.strip():
+                        self._trace(
+                            "documentation_json_salvaged",
+                            success=True,
+                            summary_chars=len(salvaged.summary),
+                        )
+                        return salvaged
             return self._empty_result(default_file_path, default_function_name)
 
         self._trace(
@@ -3515,6 +3640,61 @@ class DocumentationAgent(BaseAgent):
             file_path=file_path or "",
             function_name=function_name or "",
             summary="",
+            parameters=[],
+            returns="",
+            example_usage="",
+            abstention=None,
+        )
+
+    @staticmethod
+    def _salvage_raw_documentation(
+        raw_output: str,
+        *,
+        default_file_path: str,
+        default_function_name: str,
+    ) -> DocumentationResult:
+        """
+        Keep usable model prose when JSON parsing fails (lenient mode).
+
+        Strips markdown fences and ignores trivial refusal/error stubs.
+        """
+        text = (raw_output or "").strip()
+        if not text:
+            return DocumentationAgent._empty_result(
+                default_file_path, default_function_name
+            )
+        fence = _FENCE.search(text)
+        if fence:
+            text = fence.group(1).strip() or text
+        # Prefer a nested summary string if the model almost returned JSON.
+        summary_match = re.search(
+            r'"summary"\s*:\s*"(.*)"\s*(?:,|\})',
+            text,
+            flags=re.DOTALL,
+        )
+        if summary_match:
+            candidate = summary_match.group(1)
+            candidate = (
+                candidate.replace("\\n", "\n")
+                .replace('\\"', '"')
+                .replace("\\\\", "\\")
+                .strip()
+            )
+            if len(candidate) >= 40:
+                text = candidate
+        lowered = text.lower()
+        if len(text) < 40 or lowered in {"not-json", "not-json-at-all"}:
+            return DocumentationAgent._empty_result(
+                default_file_path, default_function_name
+            )
+        if "sorry" in lowered and "json" in lowered and len(text) < 120:
+            return DocumentationAgent._empty_result(
+                default_file_path, default_function_name
+            )
+        return DocumentationResult(
+            file_path=default_file_path or "",
+            function_name=default_function_name or "",
+            summary=text,
             parameters=[],
             returns="",
             example_usage="",

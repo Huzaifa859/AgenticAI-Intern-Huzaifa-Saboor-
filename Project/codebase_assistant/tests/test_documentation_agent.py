@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from codebase_assistant.agents.documentation_agent import DocumentationAgent
+from codebase_assistant.config import Config
 from codebase_assistant.schemas.schemas import (
     AgentRequest,
     AgentType,
@@ -523,6 +524,35 @@ def test_abstention_still_occurs_after_unsuccessful_retry(
     assert "could not be verified" in response.errors[0].lower()
     assert response.output.abstention is not None
     assert response.output.abstention.reason == "LLM response could not be verified."
+    assert client.generate.call_count == 2
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_lenient_mode_keeps_raw_model_text_when_json_fails(
+    _mock_index: Any, sample_repo: Path
+) -> None:
+    """With documentation_lenient=True, salvage prose instead of emptying."""
+    prose = (
+        "## collect\n\n"
+        "Appends `name` to a shared default list and returns the bucket. "
+        "This is intentional demo documentation text for mentor review."
+    )
+    client = _mock_client()
+    client.config = Config(
+        openrouter_api_key=None,
+        documentation_lenient=True,
+    )
+    client.generate.side_effect = [
+        ModelResponse(content=prose, usage={}, raw={}),
+        ModelResponse(content="still broken {{{", usage={}, raw={}),
+    ]
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(_docstring_request(sample_repo))
+
+    assert response.success is True
+    assert response.output.abstention is None
+    assert "intentional demo documentation" in response.output.summary
     assert client.generate.call_count == 2
 
 

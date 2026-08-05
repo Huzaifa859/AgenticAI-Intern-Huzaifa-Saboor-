@@ -131,6 +131,9 @@ _ALWAYS_ALLOWED_IMPORT_ROOTS = frozenset(
 )
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_PYTHON_FENCE = re.compile(
+    r"```(?:python)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE
+)
 _TEST_DEF = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.MULTILINE)
 
 _SYSTEM_PROMPT = """\
@@ -437,6 +440,21 @@ class TestingAgent(BaseAgent):
     __test__ = False
 
     agent_type: AgentType = AgentType.TESTING
+
+    def _lenient(self) -> bool:
+        """
+        Whether to salvage imperfect LLM test output for demos.
+
+        Uses ``Config.testing_lenient`` when the model client carries a
+        real Config. Mock clients stay strict so unit tests remain stable.
+        """
+        from ..config import Config
+
+        client = self.model_client
+        cfg = getattr(client, "config", None) if client is not None else None
+        if not isinstance(cfg, Config):
+            return False
+        return bool(cfg.testing_lenient)
 
     def run(self, repo_path: str) -> Dict[str, str]:
         """
@@ -836,6 +854,19 @@ class TestingAgent(BaseAgent):
                 symbol=symbol.qualname,
             )
             parsed = self._parse_response(response.content)
+            if self._lenient() and not parsed.generated_tests:
+                salvaged = self._salvage_raw_testing(
+                    response.content or "",
+                    symbol=symbol,
+                )
+                if salvaged.generated_tests:
+                    self._trace(
+                        "testing_json_salvaged",
+                        success=True,
+                        symbol=symbol.qualname,
+                        files=len(salvaged.generated_tests),
+                    )
+                    parsed = salvaged
             normalized = self._normalize_symbol_result(parsed, symbol)
             self._trace(
                 "testing_symbol_generation_finished",
@@ -3173,6 +3204,87 @@ class TestingAgent(BaseAgent):
             summary=str(payload.get("summary") or ""),
             generated_tests=generated_tests,
             coverage_estimate=coverage,
+        )
+
+    def _salvage_raw_testing(
+        self,
+        content: str,
+        *,
+        symbol: Optional[_TestableSymbol] = None,
+    ) -> TestingResult:
+        """
+        Keep usable pytest source when TestingResult JSON parsing fails.
+
+        Prefers fenced ``python`` blocks that contain ``def test_``, then
+        falls back to a contiguous ``def test_`` region in the raw text.
+        """
+        text = (content or "").strip()
+        if not text:
+            return self._empty_result()
+
+        codes: List[str] = []
+        for match in _PYTHON_FENCE.finditer(text):
+            block = (match.group(1) or "").strip()
+            if "def test_" in block:
+                codes.append(block)
+
+        if not codes and "def test_" in text:
+            # Drop leading prose; keep from the earliest import/def near tests.
+            test_at = text.find("def test_")
+            window = text[:test_at]
+            start = 0
+            for marker in ("\nimport ", "\nfrom ", "\ndef ", "\nclass "):
+                idx = window.rfind(marker)
+                if idx >= 0:
+                    start = max(start, idx + 1)
+            snippet = text[start:].strip()
+            if "def test_" in snippet and len(snippet) >= 40:
+                codes.append(snippet)
+
+        if not codes:
+            # Last resort: pull string values that look like test modules
+            # out of nearly-JSON payloads.
+            for match in re.finditer(
+                r'"(test_[^"\\]+\.py)"\s*:\s*("((?:\\.|[^"\\])*)"|"""([\s\S]*?)""")',
+                text,
+            ):
+                name = match.group(1)
+                code = match.group(3) if match.group(3) is not None else match.group(4)
+                if code is None:
+                    continue
+                code = (
+                    code.replace("\\n", "\n")
+                    .replace('\\"', '"')
+                    .replace("\\\\", "\\")
+                    .strip()
+                )
+                if "def test_" in code:
+                    filename = name
+                    if symbol is not None:
+                        filename = self._test_filename_for_module(symbol.module_path)
+                    return TestingResult(
+                        summary=(
+                            "Salvaged test source from non-JSON model output."
+                        ),
+                        generated_tests={filename: code},
+                        coverage_estimate=0.0,
+                        abstention=None,
+                    )
+
+        if not codes:
+            return self._empty_result()
+
+        filename = "test_salvaged.py"
+        if symbol is not None:
+            filename = self._test_filename_for_module(symbol.module_path)
+        merged = self._merge_module_sources(codes)
+        if not merged.strip():
+            return self._empty_result()
+        return TestingResult(
+            summary="Salvaged test source from non-JSON model output.",
+            generated_tests={filename: merged},
+            coverage_estimate=0.0,
+            abstention=None,
         )
 
     @staticmethod

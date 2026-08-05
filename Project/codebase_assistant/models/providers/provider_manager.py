@@ -36,6 +36,8 @@ def _friendly_model_label(model: str) -> str:
     """Turn a provider model slug into a short CLI label."""
     slug = (model or "").strip()
     known = {
+        "nvidia/nemotron-3-ultra-550b-a55b:free": "Nemotron 3 Ultra",
+        "nvidia/nemotron-3-ultra-550b-a55b": "Nemotron 3 Ultra",
         "google/gemma-3-27b-it": "Gemma 3 27B",
         "meta-llama/llama-3.1-8b-instruct": "Llama 3.1 8B",
         "nvidia/nemotron-nano-9b-v2": "Nemotron Nano 9B",

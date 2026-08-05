@@ -239,10 +239,14 @@ def provider_status_message(config: Optional[Config] = None) -> str:
     )
     if key:
         label = str(model)
-        if "gemma-3-27b" in label:
+        if "nemotron-3-ultra" in label:
+            label = "Nemotron 3 Ultra"
+        elif "gemma-3-27b" in label:
             label = "Gemma 3 27B"
         elif "/" in label:
             label = label.split("/", 1)[-1]
+            if label.endswith(":free"):
+                label = label[: -len(":free")]
         return f"Using OpenRouter ({label})"
     return "Using Ollama (no OPENROUTER_API_KEY)"
 

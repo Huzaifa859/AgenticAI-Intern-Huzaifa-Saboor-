@@ -26,6 +26,7 @@ from codebase_assistant.agents.testing_agent import (
     _MAX_PROMPT_CHARS,
     _TEST_MAX_TOKENS,
 )
+from codebase_assistant.config import Config
 from codebase_assistant.schemas.schemas import (
     AgentRequest,
     AgentType,
@@ -123,6 +124,33 @@ def test_successful_test_generation(_mock_index: Any, sample_repo: Path) -> None
     assert "Coverage:" in response.output.summary
     assert 0.0 < response.output.coverage_estimate <= 1.0
     client.generate.assert_called_once()
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_lenient_mode_salvages_python_fence_when_json_fails(
+    _mock_index: Any, sample_repo: Path
+) -> None:
+    """With testing_lenient=True, keep fenced pytest source instead of abstaining."""
+    prose = (
+        "Here are tests for add:\n\n"
+        "```python\n"
+        "import pytest\n"
+        "from math_utils import add\n\n"
+        "def test_add_happy_path():\n"
+        "    assert add(1, 2) == 3\n"
+        "```\n"
+    )
+    client = _mock_client(content=prose)
+    client.config = Config(openrouter_api_key=None, testing_lenient=True)
+    agent = _agent(client, _mock_retriever())
+
+    response = agent.handle(_request(sample_repo))
+
+    assert response.success is True
+    assert response.output.abstention is None
+    assert "test_math_utils.py" in response.output.generated_tests
+    assert "def test_add_happy_path" in response.output.generated_tests["test_math_utils.py"]
+    assert "Execution:" in response.output.summary
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)

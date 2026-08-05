@@ -189,15 +189,22 @@ class Config:
     # --- Models (proposal: Tech Stack) --------------------------------
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: Optional[str] = None
-    openrouter_model: str = "google/gemma-3-27b-it"
-    claude_model: str = "google/gemma-3-27b-it"
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    claude_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     max_tokens: int = 2048
-    model_name: str = "google/gemma-3-27b-it"
+    model_name: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     preferred_provider: str = "openrouter"
     fallback_provider: str = "ollama"
     provider_cache_seconds: int = 60
+    # When True, DocumentationAgent keeps imperfect LLM text (invalid JSON
+    # salvage / soft grounding) with warnings instead of emptying results.
+    # Best for demos; set DOCUMENTATION_LENIENT=false for strict abstention.
+    documentation_lenient: bool = True
+    # When True, TestingAgent salvages pytest source from non-JSON model
+    # output instead of abstaining with an empty suite.
+    testing_lenient: bool = True
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -290,5 +297,11 @@ class Config:
             ),
             provider_cache_seconds=_env_int(
                 "PROVIDER_CACHE_SECONDS", defaults.provider_cache_seconds
+            ),
+            documentation_lenient=_env_bool(
+                "DOCUMENTATION_LENIENT", defaults.documentation_lenient
+            ),
+            testing_lenient=_env_bool(
+                "TESTING_LENIENT", defaults.testing_lenient
             ),
         )
