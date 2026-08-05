@@ -22,26 +22,35 @@ what a hallucination looks like -- so it comes back as a
 `GroundingVerificationError` is reserved for the case where the check
 itself could not be carried out.
 
-TODO: Feed rejection counts into the tracing layer so the false-positive
-rate can be measured against the evaluation benchmark.
+When quoted evidence exists in the cited file but the line numbers are
+wrong, the checker may deterministically relocate the finding to the
+matching span. Relocation never invents evidence and never uses fuzzy
+or semantic matching -- only exact and mechanical normalizations.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import textwrap
+import tokenize
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..config import Config
 from ..exceptions.base import CodebaseAssistantError
 from ..exceptions.tool_exceptions import PathOutsideWorkspaceError
 from ..schemas.schemas import BugReport
 from ..tools.filesystem_tools import FilesystemTools
+from ..tracing.events import TraceEventType
+from ..tracing.tracer import Tracer
 
 logger = logging.getLogger(__name__)
+
+#: Occurrence: (line_start, line_end, match_type) — 1-based inclusive.
+_Occurrence = Tuple[int, int, "MatchType"]
 
 
 class GroundingStatus(str, Enum):
@@ -73,7 +82,16 @@ class MatchType(str, Enum):
     EXACT = "exact"
     NORMALIZED = "normalized"
     DEDENTED = "dedented"
+    COMMENT_STRIPPED = "comment_stripped"
     NONE = "none"
+
+
+_MATCH_PRIORITY = {
+    MatchType.EXACT: 0,
+    MatchType.NORMALIZED: 1,
+    MatchType.DEDENTED: 2,
+    MatchType.COMMENT_STRIPPED: 3,
+}
 
 
 @dataclass
@@ -100,6 +118,7 @@ class GroundingResult:
             snapshot taken at analysis time. On its own this does not
             reject a report -- see `verify_report`.
         report: The report that was verified, when there was one.
+        metadata: Mechanical annotations (e.g. relocation details).
     """
 
     grounded: bool
@@ -114,6 +133,7 @@ class GroundingResult:
     found_at_line: Optional[int] = None
     source_changed: bool = False
     report: Optional[BugReport] = None
+    metadata: Dict[str, object] = field(default_factory=dict)
 
     def summary(self) -> str:
         """
@@ -207,6 +227,7 @@ class GroundingChecker:
         filesystem: Optional[FilesystemTools] = None,
         strict: bool = False,
         snapshot: Optional[Dict[str, str]] = None,
+        tracer: Optional[Tracer] = None,
     ) -> None:
         """
         Initialize the GroundingChecker.
@@ -228,6 +249,7 @@ class GroundingChecker:
             snapshot: Optional mapping of file path to content hash,
                 captured when the reports were produced. Enables
                 staleness detection; see `capture_snapshot`.
+            tracer: Optional Tracer for relocation / grounding events.
 
         Raises:
             ToolExecutionError: If the workspace root does not exist.
@@ -239,6 +261,7 @@ class GroundingChecker:
         )
         self.strict = strict
         self.snapshot: Dict[str, str] = dict(snapshot or {})
+        self.tracer = tracer
 
     # ------------------------------------------------------------------
     # Verification
@@ -300,48 +323,42 @@ class GroundingChecker:
             )
 
         lines = source.split("\n")
-        range_error = self._validate_range(report.line_start, report.line_end, len(lines))
+        changed = self._has_changed(report.file_path, source)
+        range_error = self._validate_range(
+            report.line_start, report.line_end, len(lines)
+        )
+
+        actual = ""
+        if range_error is None:
+            actual = "\n".join(lines[report.line_start - 1 : report.line_end])
+            match_type = self._compare(expected, actual)
+            if match_type is not MatchType.NONE:
+                # The claim holds at the cited range. A file that has
+                # changed elsewhere does not invalidate it -- the
+                # evidence is verifiable right now.
+                if changed:
+                    logger.info(
+                        "Grounded but %s changed since analysis: %s:%d-%d",
+                        report.file_path,
+                        report.file_path,
+                        report.line_start,
+                        report.line_end,
+                    )
+                return self._accept(report, actual, match_type, changed)
+
+        # Line numbers are wrong or out of range, but the quote may still
+        # exist elsewhere in this file. Relocate deterministically when
+        # the evidence is found; never invent evidence.
+        repaired = self._relocate_evidence(report, expected, source)
+        if repaired is not None:
+            return repaired
+
         if range_error is not None:
             return self._reject(
                 report,
                 GroundingStatus.INVALID_LINE_RANGE,
                 range_error,
                 expected,
-            )
-
-        actual = "\n".join(lines[report.line_start - 1 : report.line_end])
-        changed = self._has_changed(report.file_path, source)
-        match_type = self._compare(expected, actual)
-
-        if match_type is not MatchType.NONE:
-            # The claim holds against the current file. A file that has
-            # changed elsewhere does not invalidate it -- the evidence
-            # is verifiable right now, which is the whole question --
-            # so this is recorded rather than rejected.
-            if changed:
-                logger.info(
-                    "Grounded but %s changed since analysis: %s:%d-%d",
-                    report.file_path,
-                    report.file_path,
-                    report.line_start,
-                    report.line_end,
-                )
-            return self._accept(report, actual, match_type, changed)
-
-        # The evidence is not where it was claimed to be. If it appears
-        # anywhere else in the file, the code moved and the report is
-        # stale; if it appears nowhere, the claim was never true.
-        relocated = self._locate(expected, source)
-        if relocated is not None:
-            return self._reject(
-                report,
-                GroundingStatus.SOURCE_CHANGED,
-                f"The cited code has moved to line {relocated}; the report's "
-                f"line numbers are stale and no longer describe the file.",
-                expected,
-                actual=actual,
-                found_at_line=relocated,
-                source_changed=True,
             )
 
         if changed:
@@ -391,7 +408,9 @@ class GroundingChecker:
             summary.results.append(result)
 
             if result.grounded:
-                summary.grounded.append(report)
+                # Prefer the (possibly line-repaired) report from the
+                # verdict so callers see updated line numbers.
+                summary.grounded.append(result.report or report)
                 logger.debug("Grounded: %s", result.summary())
             else:
                 summary.rejected.append(report)
@@ -399,6 +418,19 @@ class GroundingChecker:
 
         if summary.rejected:
             logger.info("Grounding check: %s", summary.summary())
+
+        self._trace(
+            "grounding_completed",
+            success=True,
+            total=summary.total,
+            grounded=len(summary.grounded),
+            rejected=len(summary.rejected),
+            relocated=sum(
+                1
+                for result in summary.results
+                if result.grounded and result.metadata.get("evidence_relocated")
+            ),
+        )
         return summary
 
     def verify_evidence(
@@ -556,15 +588,10 @@ class GroundingChecker:
         """
         Compare quoted evidence against real source.
 
-        Exact first. In non-strict mode two further tiers are tried, and
-        the line drawn between them matters: line endings and trailing
-        whitespace cannot change what Python does, so tolerating them
-        costs nothing, whereas *leading* indentation is semantic and is
-        never normalized away. The dedent tier removes only the common
-        indent shared by every line, which is what a model does when it
-        quotes a method body without its enclosing indentation -- the
-        code is still verifiably at that location, only the quote was
-        re-margined.
+        Exact first. In non-strict mode further mechanical tiers are
+        tried: line endings / trailing whitespace, shared leading
+        indent, then comment+whitespace token signatures. No fuzzy or
+        semantic matching.
 
         Args:
             expected: Evidence quoted by the report.
@@ -582,7 +609,244 @@ class GroundingChecker:
             return MatchType.NORMALIZED
         if self._dedent(expected) == self._dedent(actual):
             return MatchType.DEDENTED
+
+        expected_sig = self._token_signature(expected)
+        actual_sig = self._token_signature(actual)
+        if (
+            expected_sig is not None
+            and actual_sig is not None
+            and expected_sig == actual_sig
+        ):
+            return MatchType.COMMENT_STRIPPED
         return MatchType.NONE
+
+    def _relocate_evidence(
+        self,
+        report: BugReport,
+        expected: str,
+        source: str,
+    ) -> Optional[GroundingResult]:
+        """
+        Repair line numbers when evidence exists elsewhere in the file.
+
+        Args:
+            report: Finding with inaccurate lines (mutated on success).
+            expected: Quoted evidence.
+            source: Full file contents.
+
+        Returns:
+            A grounded result after repair, or None if evidence is absent.
+        """
+        original_start = int(report.line_start or 0)
+        original_end = int(report.line_end or original_start)
+
+        self._trace(
+            "evidence_search_started",
+            success=True,
+            file=report.file_path,
+            original_lines=[original_start, original_end],
+        )
+
+        occurrences = self._find_evidence_occurrences(expected, source)
+        if not occurrences:
+            self._trace(
+                "evidence_relocation_failed",
+                success=False,
+                file=report.file_path,
+                original_lines=[original_start, original_end],
+                reason="evidence_not_found",
+            )
+            return None
+
+        chosen = self._select_occurrence(occurrences, original_start)
+        new_start, new_end, match_type = chosen
+        lines = source.split("\n")
+        actual = "\n".join(lines[new_start - 1 : new_end])
+
+        # Prefer keeping the caller's evidence string; acceptance still
+        # requires a mechanical match at the repaired range.
+        accepted_match = self._compare(expected, actual)
+        if accepted_match is MatchType.NONE:
+            self._trace(
+                "evidence_relocation_failed",
+                success=False,
+                file=report.file_path,
+                original_lines=[original_start, original_end],
+                relocated_lines=[new_start, new_end],
+                reason="post_repair_mismatch",
+            )
+            return None
+
+        relocation_meta = {
+            "evidence_relocated": True,
+            "original_lines": [original_start, original_end],
+            "relocated_lines": [new_start, new_end],
+            "relocation_match_type": match_type.value,
+        }
+        report.line_start = new_start
+        report.line_end = new_end
+        report.metadata.update(relocation_meta)
+
+        self._trace(
+            "evidence_relocated",
+            success=True,
+            file=report.file_path,
+            original_lines=[original_start, original_end],
+            relocated_lines=[new_start, new_end],
+            match_type=match_type.value,
+        )
+        logger.info(
+            "Relocated evidence for %s from %d-%d to %d-%d (%s).",
+            report.file_path,
+            original_start,
+            original_end,
+            new_start,
+            new_end,
+            match_type.value,
+        )
+
+        changed = self._has_changed(report.file_path, source)
+        result = self._accept(
+            report,
+            actual,
+            accepted_match,
+            changed,
+            metadata=relocation_meta,
+        )
+        result.found_at_line = new_start
+        return result
+
+    def _find_evidence_occurrences(
+        self, expected: str, source: str
+    ) -> List[_Occurrence]:
+        """
+        Find every mechanical match of evidence inside source.
+
+        Exact / whitespace / dedent matches use a fixed line span.
+        Comment-stripped matches allow a bounded larger span so
+        comment-only lines between tokens can still align.
+        """
+        lines = source.split("\n")
+        if not lines:
+            return []
+
+        evidence_lines = expected.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        span = max(1, len(evidence_lines))
+        found: List[_Occurrence] = []
+        seen = set()
+
+        for start in range(len(lines)):
+            end_index = start + span
+            if end_index > len(lines):
+                break
+            candidate = "\n".join(lines[start:end_index])
+            match_type = self._compare_without_comment_tier(expected, candidate)
+            if match_type is MatchType.NONE:
+                continue
+            key = (start + 1, end_index, match_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((start + 1, end_index, match_type))
+
+        if self.strict:
+            return found
+
+        target_sig = self._token_signature(expected)
+        if target_sig is None or not target_sig:
+            return found
+
+        max_span = max(span + 20, span * 3)
+        for start in range(len(lines)):
+            for length in range(span, max_span + 1):
+                end_index = start + length
+                if end_index > len(lines):
+                    break
+                candidate = "\n".join(lines[start:end_index])
+                candidate_sig = self._token_signature(candidate)
+                if candidate_sig is None or candidate_sig != target_sig:
+                    continue
+                key = (start + 1, end_index, MatchType.COMMENT_STRIPPED)
+                if key in seen:
+                    continue
+                # Skip if an exact/ws match already covers this start.
+                if any(item[0] == start + 1 and item[2] != MatchType.COMMENT_STRIPPED for item in found):
+                    continue
+                seen.add(key)
+                found.append((start + 1, end_index, MatchType.COMMENT_STRIPPED))
+
+        return found
+
+    def _compare_without_comment_tier(
+        self, expected: str, actual: str
+    ) -> MatchType:
+        """Like `_compare` but stops before comment-stripped matching."""
+        if expected == actual:
+            return MatchType.EXACT
+        if self.strict:
+            return MatchType.NONE
+        if self._normalize(expected) == self._normalize(actual):
+            return MatchType.NORMALIZED
+        if self._dedent(expected) == self._dedent(actual):
+            return MatchType.DEDENTED
+        return MatchType.NONE
+
+    @staticmethod
+    def _select_occurrence(
+        occurrences: Sequence[_Occurrence], original_start: int
+    ) -> _Occurrence:
+        """
+        Choose one occurrence deterministically.
+
+        Prefer tighter match tiers, then proximity to the original
+        line_start, then earlier line numbers.
+        """
+        anchor = original_start if original_start > 0 else 1
+
+        def sort_key(item: _Occurrence) -> Tuple[int, int, int, int, int]:
+            start, end, match_type = item
+            return (
+                _MATCH_PRIORITY.get(match_type, 99),
+                abs(start - anchor),
+                end - start,
+                start,
+                end,
+            )
+
+        return sorted(occurrences, key=sort_key)[0]
+
+    @staticmethod
+    def _token_signature(text: str) -> Optional[Tuple[Tuple[int, str], ...]]:
+        """
+        Build a comment- and whitespace-insensitive token signature.
+
+        Returns:
+            A tuple of (token_type, token_string) pairs, or None when
+            the snippet cannot be tokenized.
+        """
+        unified = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not unified.strip():
+            return None
+        try:
+            tokens: List[Tuple[int, str]] = []
+            for tok in tokenize.generate_tokens(io.StringIO(unified).readline):
+                if tok.type in (
+                    tokenize.COMMENT,
+                    tokenize.NL,
+                    tokenize.NEWLINE,
+                    tokenize.INDENT,
+                    tokenize.DEDENT,
+                    tokenize.ENCODING,
+                    tokenize.ENDMARKER,
+                ):
+                    continue
+                if tok.type == tokenize.STRING:
+                    tokens.append((tok.type, tok.string))
+                else:
+                    tokens.append((tok.type, tok.string))
+            return tuple(tokens) if tokens else None
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return None
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -616,26 +880,19 @@ class GroundingChecker:
         """
         Find where the evidence actually appears in a file.
 
-        Used only after a mismatch, to tell a stale report from an
-        invented one. The same tiers as `_compare` are tried, so code
-        that moved is still recognized when the quote was re-margined.
+        Compatibility helper over `_find_evidence_occurrences`.
 
         Args:
             expected: Evidence quoted by the report.
             source: The file's full contents.
 
         Returns:
-            The 1-based line where the evidence starts, or None if it
-            does not appear in the file at all.
+            The 1-based line where the best occurrence starts, or None.
         """
-        lines = source.split("\n")
-        span = max(1, len(self._normalize(expected).split("\n")))
-
-        for start in range(len(lines)):
-            candidate = "\n".join(lines[start : start + span])
-            if self._compare(expected, candidate) is not MatchType.NONE:
-                return start + 1
-        return None
+        occurrences = self._find_evidence_occurrences(expected, source)
+        if not occurrences:
+            return None
+        return self._select_occurrence(occurrences, 1)[0]
 
     @staticmethod
     def _validate_range(
@@ -775,6 +1032,7 @@ class GroundingChecker:
         actual: str,
         match_type: MatchType,
         source_changed: bool,
+        metadata: Optional[Dict[str, object]] = None,
     ) -> GroundingResult:
         """
         Build the verdict for a report that passed.
@@ -785,6 +1043,7 @@ class GroundingChecker:
             match_type: How closely the evidence matched.
             source_changed: Whether the file has changed since the
                 snapshot.
+            metadata: Optional mechanical annotations.
 
         Returns:
             A grounded GroundingResult.
@@ -798,6 +1057,10 @@ class GroundingChecker:
             MatchType.DEDENTED: (
                 "matches the source apart from the quote's leading indentation"
             ),
+            MatchType.COMMENT_STRIPPED: (
+                "matches the source apart from comments or insignificant "
+                "whitespace"
+            ),
         }[match_type]
 
         reason = (
@@ -806,6 +1069,9 @@ class GroundingChecker:
         )
         if source_changed:
             reason += " Note: the file has changed since analysis."
+        if metadata and metadata.get("evidence_relocated"):
+            original = metadata.get("original_lines")
+            reason += f" Line numbers were repaired from {original}."
 
         return GroundingResult(
             grounded=True,
@@ -819,7 +1085,22 @@ class GroundingChecker:
             line_end=report.line_end,
             source_changed=source_changed,
             report=report,
+            metadata=dict(metadata or {}),
         )
+
+    def _trace(self, name: str, **metadata: object) -> None:
+        """Record a grounding event; never raises."""
+        if self.tracer is None:
+            return
+        try:
+            self.tracer.record(
+                TraceEventType.AGENT_RUN,
+                name,
+                component="GroundingChecker",
+                **metadata,
+            )
+        except Exception as exc:
+            logger.warning("GroundingChecker tracing failed for %r: %s", name, exc)
 
     @staticmethod
     def _reject(

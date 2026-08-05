@@ -28,9 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: Display name -> OpenRouter slug.
 COMPARISON_MODELS: Dict[str, str] = {
-    "Claude Sonnet 4": "anthropic/claude-sonnet-4",
-    "Llama 3.1 8B Instruct": "meta-llama/llama-3.1-8b-instruct",
     "Gemma 3 27B IT": "google/gemma-3-27b-it",
+    "Llama 3.1 8B Instruct": "meta-llama/llama-3.1-8b-instruct",
     "Nemotron Nano 9B V2": "nvidia/nemotron-nano-9b-v2",
 }
 

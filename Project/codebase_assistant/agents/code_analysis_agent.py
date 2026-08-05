@@ -106,19 +106,25 @@ The `42 | ` gutter is NOT part of the code. Never include it in evidence.
 
 Rules you must follow exactly:
 
-1. Only report problems visible in the CODE CONTEXT you are given. If \
-you cannot see it, it does not exist.
-2. `evidence` must be copied character for character from the code \
-shown. Do not re-indent it, do not reformat it, do not fix it, do not \
-abbreviate it. It is a quotation, not a description.
-3. `line_start` and `line_end` must be the real line numbers from the \
-gutter, and `evidence` must be exactly the lines in that range.
-4. Do not repeat anything listed under KNOWN STATIC FINDINGS. Those are \
+1. Report only findings supported by the repository code shown in \
+CODE CONTEXT. If you cannot see it, it does not exist.
+2. `evidence` must be the exact code snippet that supports the finding, \
+copied character for character from the code shown. Do not re-indent \
+it, do not reformat it, do not fix it, do not abbreviate it. It is a \
+quotation, not a description.
+3. `file_path` must be the accurate path from the CODE CONTEXT header \
+(for example `path/as/shown/in/the/header.py`). Never invent files.
+4. `line_start` and `line_end` must be the most accurate real line \
+numbers from the gutter, and `evidence` must be exactly the lines in \
+that range.
+5. Never invent files, functions, variables, or evidence. Never guess \
+symbols that are not visible in CODE CONTEXT.
+6. Do not repeat anything listed under KNOWN STATIC FINDINGS. Those are \
 already confirmed.
-5. If the context is not enough to answer, say so in `answer` and return \
-an empty `findings` list. Abstaining is a correct answer. Guessing is \
-not.
-6. Reply with ONE JSON object and nothing else -- no prose before it, no \
+7. If you are uncertain, omit the finding. If the context is not enough \
+to answer, say so in `answer` and return an empty `findings` list. \
+Abstaining is a correct answer. Guessing is not.
+8. Reply with ONE JSON object and nothing else -- no prose before it, no \
 prose after it.
 
 Reply in exactly this shape:
@@ -1593,7 +1599,10 @@ class CodeAnalysisAgent(BaseAgent):
             ),
             checker=self._grounding_checker
             or GroundingChecker(
-                workspace_root=root, config=self.config, filesystem=filesystem
+                workspace_root=root,
+                config=self.config,
+                filesystem=filesystem,
+                tracer=self.tracer,
             ),
             indexer=self._indexer
             or Indexer(

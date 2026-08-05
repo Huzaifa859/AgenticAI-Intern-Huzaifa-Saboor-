@@ -140,15 +140,14 @@ class Config:
             environment; never commit a value here.
         openrouter_model: Default model slug requested through
             OpenRouter.
-        claude_model: Claude slug used for code analysis and
-            bug-finding. Reached via OpenRouter, hence the same slug
-            namespace.
+        claude_model: Legacy alias for the primary OpenRouter analysis
+            model. Kept because existing callers still read it.
         ollama_base_url: Base URL of the local Ollama service.
         ollama_model: Local model used for documentation generation.
         max_tokens: Default maximum tokens per model call.
         model_name: Legacy single-model identifier, superseded by
-            `claude_model` and `ollama_model`. Retained because existing
-            callers still read it.
+            `openrouter_model` and `ollama_model`. Retained because
+            existing callers still read it.
         preferred_provider: Primary LLM backend name (default openrouter).
         fallback_provider: Secondary LLM backend name (default ollama).
         provider_cache_seconds: TTL for preferred-provider availability
@@ -190,12 +189,12 @@ class Config:
     # --- Models (proposal: Tech Stack) --------------------------------
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: Optional[str] = None
-    openrouter_model: str = "anthropic/claude-sonnet-4"
-    claude_model: str = "anthropic/claude-sonnet-4"
+    openrouter_model: str = "google/gemma-3-27b-it"
+    claude_model: str = "google/gemma-3-27b-it"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     max_tokens: int = 2048
-    model_name: str = "anthropic/claude-sonnet-4"
+    model_name: str = "google/gemma-3-27b-it"
     preferred_provider: str = "openrouter"
     fallback_provider: str = "ollama"
     provider_cache_seconds: int = 60

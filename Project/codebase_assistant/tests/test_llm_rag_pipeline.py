@@ -161,7 +161,7 @@ def analysis_agent(pipeline_config: Config) -> CodeAnalysisAgent:
     """CodeAnalysisAgent wired to a real OpenRouterProvider + LLMClient."""
     provider = OpenRouterProvider(
         api_key="sk-test-integration",
-        model="anthropic/claude-sonnet-4",
+        model="google/gemma-3-27b-it",
         max_tokens=512,
         timeout=5.0,
         config=pipeline_config,

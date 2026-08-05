@@ -51,7 +51,6 @@ _INITIAL_BACKOFF_SECONDS = 1.0
 
 #: Models tried in order when the configured model is not usable.
 _FALLBACK_MODELS = (
-    "anthropic/claude-sonnet-4",
     "google/gemma-3-27b-it",
     "meta-llama/llama-3.1-8b-instruct",
     "nvidia/nemotron-nano-9b-v2",
@@ -89,7 +88,7 @@ class OpenRouterProvider(BaseProvider):
 
     def __init__(
         self,
-        model: str = "anthropic/claude-sonnet-4",
+        model: str = "google/gemma-3-27b-it",
         api_key: Optional[str] = None,
         max_tokens: int = 4096,
         base_url: str = "https://openrouter.ai/api/v1",

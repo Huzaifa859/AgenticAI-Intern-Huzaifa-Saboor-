@@ -32,7 +32,8 @@ MESSAGES = [ModelMessage(role="user", content="hello")]
 
 FALLBACK_CHAIN = _FALLBACK_MODELS
 
-CLAUDE, GEMMA, LLAMA, NEMOTRON = FALLBACK_CHAIN
+GEMMA, LLAMA, NEMOTRON = FALLBACK_CHAIN
+PRIMARY = GEMMA
 
 
 def _models_called(mock_post: MagicMock) -> List[str]:
@@ -49,7 +50,7 @@ def _provider(**kwargs: Any) -> OpenRouterProvider:
     """Build a provider with an explicit test key unless overridden."""
     defaults = dict(
         api_key="sk-test-key",
-        model="anthropic/claude-sonnet-4",
+        model="google/gemma-3-27b-it",
         max_tokens=256,
         timeout=5.0,
         config=_config(),
@@ -272,43 +273,43 @@ def test_whitespace_only_model_output_raises(
 @pytest.mark.parametrize("status_code", [402, 404])
 @patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
 @patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
-def test_falls_back_to_gemma_on_402_and_404(
+def test_falls_back_to_llama_on_402_and_404(
     mock_post: MagicMock, mock_sleep: MagicMock, status_code: int
 ) -> None:
-    """Insufficient credits or a missing model should switch to Gemma."""
+    """Insufficient credits or a missing model should switch to Llama."""
     mock_post.side_effect = [
         _http_response(status_code, {"error": {"message": f"http {status_code}"}}),
-        _http_response(200, _success_payload(content="Answer from Gemma.")),
+        _http_response(200, _success_payload(content="Answer from Llama.")),
     ]
-    provider = _provider()
-
-    result = provider.generate(MESSAGES)
-
-    assert result.content == "Answer from Gemma."
-    assert result.raw["model_used"] == GEMMA
-    assert _models_called(mock_post) == [CLAUDE, GEMMA]
-    # Credits and unknown models never recover, so no backoff is spent.
-    mock_sleep.assert_not_called()
-
-
-@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
-@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
-def test_falls_back_to_llama_when_claude_rate_limited_and_gemma_unusable(
-    mock_post: MagicMock, mock_sleep: MagicMock
-) -> None:
-    """A rate-limited Claude and an unusable Gemma should reach Llama."""
-    mock_post.side_effect = (
-        [_http_response(429, {"error": {"message": "rate limited"}})] * 4
-        + [_http_response(402, {"error": {"message": "no credits"}})]
-        + [_http_response(200, _success_payload(content="Answer from Llama."))]
-    )
     provider = _provider()
 
     result = provider.generate(MESSAGES)
 
     assert result.content == "Answer from Llama."
     assert result.raw["model_used"] == LLAMA
-    assert _models_called(mock_post) == [CLAUDE] * 4 + [GEMMA, LLAMA]
+    assert _models_called(mock_post) == [GEMMA, LLAMA]
+    # Credits and unknown models never recover, so no backoff is spent.
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_falls_back_to_nemotron_when_gemma_rate_limited_and_llama_unusable(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A rate-limited Gemma and an unusable Llama should reach Nemotron."""
+    mock_post.side_effect = (
+        [_http_response(429, {"error": {"message": "rate limited"}})] * 4
+        + [_http_response(402, {"error": {"message": "no credits"}})]
+        + [_http_response(200, _success_payload(content="Answer from Nemotron."))]
+    )
+    provider = _provider()
+
+    result = provider.generate(MESSAGES)
+
+    assert result.content == "Answer from Nemotron."
+    assert result.raw["model_used"] == NEMOTRON
+    assert _models_called(mock_post) == [GEMMA] * 4 + [LLAMA, NEMOTRON]
     assert mock_sleep.call_count == 3
 
 
@@ -321,7 +322,6 @@ def test_falls_back_through_whole_chain_to_nemotron(
     mock_post.side_effect = [
         _http_response(402, {"error": {"message": "no credits"}}),
         _http_response(404, {"error": {"message": "unknown model"}}),
-        _http_response(402, {"error": {"message": "no credits"}}),
         _http_response(200, _success_payload(content="Answer from Nemotron.")),
     ]
     provider = _provider()
@@ -404,7 +404,7 @@ def test_model_used_reported_without_any_fallback(
 
     result = provider.generate(MESSAGES)
 
-    assert result.raw["model_used"] == CLAUDE
+    assert result.raw["model_used"] == PRIMARY
     mock_post.assert_called_once()
 
 
@@ -422,8 +422,8 @@ def test_custom_primary_model_is_tried_before_the_chain(
 
     result = provider.generate(MESSAGES)
 
-    assert result.raw["model_used"] == CLAUDE
-    assert _models_called(mock_post) == ["openai/gpt-4o-mini", CLAUDE]
+    assert result.raw["model_used"] == PRIMARY
+    assert _models_called(mock_post) == ["openai/gpt-4o-mini", PRIMARY]
 
 
 def test_generate_without_api_key_raises() -> None:

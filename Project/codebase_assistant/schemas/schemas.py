@@ -137,6 +137,8 @@ class BugReport(BaseModel):
         detection_method: How the bug was found — "static" (pyflakes/
             ast), "llm" (model reasoning only), "hybrid" (heuristic +
             LLM), or "dynamic" (via actually running generated tests).
+        metadata: Optional mechanical annotations (e.g. evidence
+            relocation). Not model-facing.
     """
 
     bug_type: str
@@ -150,6 +152,7 @@ class BugReport(BaseModel):
     evidence: str
     suggested_fix: Optional[str] = None
     detection_method: Literal["static", "llm", "hybrid", "dynamic"]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AbstentionResult(BaseModel):
