@@ -23,6 +23,13 @@ __pycache__/
 .codebase_assistant/
 **/.codebase_assistant/
 **/chroma_store/
+**/.chroma/
+**/chroma/
+**/chroma.sqlite3
+
+# Benchmark run outputs (keep directory via .gitkeep)
+Project/benchmarks/results/*
+!Project/benchmarks/results/.gitkeep
 
 # Environment variables
 .env
@@ -46,3 +53,4 @@ Thumbs.db
 *.log
 .coverage
 htmlcov/
+coverage.xml

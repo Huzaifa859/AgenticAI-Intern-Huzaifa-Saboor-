@@ -43,6 +43,10 @@ requests>=2.31
 # The user-facing surface: ingest -> ask questions -> view bug report.
 jupyter>=1.0
 
+# --- Web UI ------------------------------------------------------------
+# Lightweight Streamlit frontend for report browsing on top of Supervisor.
+streamlit>=1.32
+
 # --- Testing -----------------------------------------------------------
 # Test suite plus coverage measurement, against the Week 6 target of
 # >= 70% on ingestion and the Code Analysis Agent.

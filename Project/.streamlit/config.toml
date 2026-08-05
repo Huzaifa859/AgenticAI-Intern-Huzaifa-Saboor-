@@ -1,0 +1,17 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+# Analysis writes ChromaDB / memory files under the project. Streamlit's
+# default file watcher treats those as source changes, restarts the server
+# mid-run, and the browser then fails to load widgets (Metric fetch errors).
+fileWatcherType = "none"
+runOnSave = false
+folderWatchBlacklist = [
+    "./.codebase_assistant",
+    "./.chroma",
+    "./__pycache__",
+    "./benchmarks/results",
+    "./examples",
+]

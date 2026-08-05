@@ -27,6 +27,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 - [Installation](#installation)
 - [Environment Variables](#environment-variables)
 - [CLI Usage](#cli-usage)
+- [Web UI](#web-ui)
 - [Screenshots](#screenshots)
 - [Example Outputs](#example-outputs)
 - [Testing](#testing)
@@ -54,7 +55,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 | Observability | End-to-end tracing with ordered events and JSON export |
 | Tools | Shared `ToolRegistry` for filesystem and GitHub tools |
 | MCP | Local MCP server exposing Supervisor agent pipelines (`analysis.run`, `documentation.run`, `testing.run`, `goal.run`) |
-| Interfaces | Interactive CLI menu, non-interactive `--agent` mode, and Jupyter demo notebook |
+| Interfaces | Interactive CLI menu, non-interactive `--agent` mode, Streamlit web UI, and Jupyter demo notebook |
 
 ---
 
@@ -62,7 +63,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 
 ```mermaid
 flowchart TD
-    CLI[CLI / Notebook / MCP Client]
+    CLI[CLI / Streamlit / Notebook / MCP Client]
     CLI --> Supervisor[Supervisor]
     Supervisor --> Routing[Agent Routing]
     Routing --> CAA[Code Analysis Agent]
@@ -319,6 +320,9 @@ python app/main.py .
 
 # Non-interactive analysis
 python app/main.py . --agent analysis --question "Find security bugs"
+
+# Streamlit web UI (same .env / provider setup as the CLI)
+streamlit run app/streamlit_app.py
 ```
 
 ---
@@ -401,6 +405,32 @@ python app/main.py codebase_assistant --agent analysis --no-color
 ```bash
 jupyter notebook Project.ipynb
 ```
+
+---
+
+## Web UI
+
+A Streamlit frontend wraps the same Supervisor pipeline as the CLI. Provider configuration (`.env`, OpenRouter → Ollama failover) is unchanged.
+
+```bash
+cd Project
+# Preferred launcher (forces file-watcher off):
+run_ui.bat
+
+# Or:
+streamlit run app/streamlit_app.py --server.fileWatcherType=none
+```
+
+Agent jobs run in a separate `app/worker.py` process so embedding/LLM memory use cannot kill the Streamlit server. `Project/.streamlit/config.toml` also disables Streamlit's file watcher (Chroma writes used to restart the app mid-run).
+
+In the sidebar:
+
+1. Enter a local path (for example `examples/demo_repo`) or a GitHub HTTPS URL and click **Load repository**
+2. Choose **Analysis**, **Documentation**, or **Testing**
+3. For docs/tests, set mode and optional file/function/class targeting
+4. Click **Run** and browse the report tabs in the main pane
+
+Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`. Agent logic stays inside `codebase_assistant/`.
 
 ---
 
@@ -522,7 +552,10 @@ Providers are mocked in automated tests; Supervisor and agent pipelines run for 
 Project/
 ├── app/
 │   ├── main.py                 # CLI entry point
-│   └── report_formatter.py     # Terminal report formatting
+│   ├── report_formatter.py     # Terminal report formatting
+│   ├── service.py              # Shared non-interactive orchestration
+│   ├── ui_reports.py           # Streamlit report renderers
+│   └── streamlit_app.py        # Streamlit web UI entry point
 ├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
 │   ├── architecture.excalidraw
@@ -565,7 +598,7 @@ Project/
 - Broader language support beyond Python bug detection
 - Richer coverage measurement for generated tests
 - Production-ready Docker / Compose deployment with Jupyter + Ollama
-- Lightweight web UI for report browsing
+- Richer Streamlit UX (background jobs, run history, live progress streaming)
 - CI integration for repository checks on pull requests
 - Deeper semantic code search and explanation skills
 - Networked MCP transport (stdio / HTTP) for external host applications
