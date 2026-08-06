@@ -12,13 +12,69 @@ from __future__ import annotations
 import os
 import re
 import sys
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import streamlit as st
+
+_REPORT_CSS = """
+<style>
+.ca-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.35rem 0 0.75rem;
+}
+.ca-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.22rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  font-variant-numeric: tabular-nums;
+}
+.ca-chip-pass {
+  color: #166534;
+  background: #dcfce7;
+  border-color: rgba(22, 101, 52, 0.18);
+}
+.ca-chip-fail {
+  color: #991b1b;
+  background: #fee2e2;
+  border-color: rgba(153, 27, 27, 0.18);
+}
+.ca-chip-skip {
+  color: #92400e;
+  background: #fef3c7;
+  border-color: rgba(146, 64, 14, 0.18);
+}
+.ca-chip-error {
+  color: #9f1239;
+  background: #ffe4e6;
+  border-color: rgba(159, 18, 57, 0.18);
+}
+.ca-chip-neutral {
+  color: #334155;
+  background: #e2e8f0;
+  border-color: rgba(51, 65, 85, 0.14);
+}
+.ca-chip-cov {
+  color: #1e3a8a;
+  background: #dbeafe;
+  border-color: rgba(30, 58, 138, 0.16);
+}
+</style>
+"""
+
+def _ensure_report_styles() -> None:
+    """Inject chip styles for the current page render."""
+    st.markdown(_REPORT_CSS, unsafe_allow_html=True)
 
 
 def _parse_execution_counts(summary: str) -> Dict[str, int]:
@@ -35,6 +91,17 @@ def _parse_execution_counts(summary: str) -> Dict[str, int]:
         counts["failed"] = int(match.group(2))
         counts["skipped"] = int(match.group(3))
         counts["errors"] = int(match.group(4))
+        return counts
+
+    for key, pattern in (
+        ("passed", r"(\d+)\s+passed"),
+        ("failed", r"(\d+)\s+failed"),
+        ("skipped", r"(\d+)\s+skipped"),
+        ("errors", r"(\d+)\s+errors?"),
+    ):
+        found = re.search(pattern, text, flags=re.IGNORECASE)
+        if found:
+            counts[key] = int(found.group(1))
     return counts
 
 
@@ -49,6 +116,20 @@ def _detect_writeback_note(summary: str) -> str:
         match = re.search(r"Write-back[^\n]*", text)
         if match:
             return match.group(0).strip()
+    return ""
+
+
+def _extract_write_path(write_note: str) -> str:
+    """Best-effort path extraction from a write-back note."""
+    text = write_note or ""
+    # Common shapes: Write-back: path/to/file.py  OR wrote to `path`
+    for pattern in (
+        r"[`'\"]([^`'\"]+)[`'\"]",
+        r"(?:to|into|at|:)\s+([^\s].+)$",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().rstrip(".")
     return ""
 
 
@@ -76,11 +157,83 @@ def _severity_counts(findings: List[Mapping[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def _finding_search_blob(finding: Mapping[str, Any]) -> str:
+    """Lowercased haystack for free-text finding search."""
+    parts = [
+        finding.get("severity"),
+        finding.get("bug_type"),
+        finding.get("description"),
+        finding.get("file_path"),
+        finding.get("function_name"),
+        finding.get("evidence"),
+        finding.get("suggested_fix"),
+        finding.get("detection_method"),
+    ]
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _filter_findings(
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    severities: Sequence[str],
+    query: str,
+) -> List[Dict[str, Any]]:
+    """Filter findings by severity set and free-text query."""
+    allowed = {str(item).lower() for item in severities}
+    needle = (query or "").strip().lower()
+    filtered: List[Dict[str, Any]] = []
+    for finding in findings:
+        item = dict(finding)
+        severity = str(item.get("severity") or "").lower()
+        if allowed and severity not in allowed:
+            continue
+        if needle and needle not in _finding_search_blob(item):
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def _render_stats(items: List[tuple[str, str]]) -> None:
     """Render compact stats without Streamlit Metric widgets."""
     cols = st.columns(len(items))
     for column, (label, value) in zip(cols, items):
         column.markdown(f"**{label}**<br>{value}", unsafe_allow_html=True)
+
+
+def _render_status_chips(
+    *,
+    passed: int,
+    failed: int,
+    skipped: int = 0,
+    errors: int = 0,
+    coverage_pct: Optional[float] = None,
+    files: Optional[int] = None,
+) -> None:
+    """Colored pass/fail (and related) status chips."""
+    _ensure_report_styles()
+    chips: List[str] = []
+    if files is not None:
+        chips.append(
+            f'<span class="ca-chip ca-chip-neutral">Files {int(files)}</span>'
+        )
+    chips.append(f'<span class="ca-chip ca-chip-pass">Passed {int(passed)}</span>')
+    chips.append(f'<span class="ca-chip ca-chip-fail">Failed {int(failed)}</span>')
+    if skipped:
+        chips.append(
+            f'<span class="ca-chip ca-chip-skip">Skipped {int(skipped)}</span>'
+        )
+    if errors:
+        chips.append(
+            f'<span class="ca-chip ca-chip-error">Errors {int(errors)}</span>'
+        )
+    if coverage_pct is not None:
+        chips.append(
+            f'<span class="ca-chip ca-chip-cov">Coverage {coverage_pct:.0f}%</span>'
+        )
+    st.markdown(
+        f'<div class="ca-chip-row">{"".join(chips)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_abstention(abstention: Optional[Mapping[str, Any]]) -> None:
@@ -93,6 +246,12 @@ def _render_abstention(abstention: Optional[Mapping[str, Any]]) -> None:
         st.markdown("**Recommended next steps**")
         for step in steps:
             st.markdown(f"- {step}")
+
+
+def _is_long_log(text: str) -> bool:
+    """True when a pytest/summary log should start collapsed."""
+    content = text or ""
+    return len(content) > 500 or content.count("\n") >= 12
 
 
 def render_analysis_report(report: Any) -> None:
@@ -137,8 +296,41 @@ def render_analysis_report(report: Any) -> None:
         st.info("No verified findings.")
         return
 
+    st.markdown("### Filter findings")
+    filter_cols = st.columns([2, 3])
+    with filter_cols[0]:
+        selected_severities = st.multiselect(
+            "Severity",
+            options=["High", "Medium", "Low"],
+            default=["High", "Medium", "Low"],
+            key="analysis_severity_filter",
+            help="Show only findings at the selected severity levels.",
+        )
+    with filter_cols[1]:
+        search_query = st.text_input(
+            "Search",
+            value="",
+            key="analysis_findings_search",
+            placeholder="file, function, bug type, description…",
+            help="Case-insensitive match across finding fields.",
+        )
+
+    filtered = _filter_findings(
+        findings,
+        severities=selected_severities or [],
+        query=search_query,
+    )
+    if not selected_severities:
+        st.info("Select at least one severity to show findings.")
+        return
+
+    st.caption(f"Showing {len(filtered)} of {len(findings)} finding(s).")
+    if not filtered:
+        st.warning("No findings match the current severity/search filters.")
+        return
+
     table_rows: List[Dict[str, object]] = []
-    for finding in findings:
+    for finding in filtered:
         table_rows.append(
             {
                 "severity": finding.get("severity"),
@@ -153,7 +345,7 @@ def render_analysis_report(report: Any) -> None:
     st.dataframe(table_rows, width="stretch", hide_index=True)
 
     st.markdown("### Finding details")
-    for index, finding in enumerate(findings, start=1):
+    for index, finding in enumerate(filtered, start=1):
         title = (
             f"{index}. [{finding.get('severity')}] {finding.get('bug_type')} — "
             f"{finding.get('file_path')}:{finding.get('line_start')}-"
@@ -196,12 +388,20 @@ def render_documentation_result(
         or "(repository)"
     )
     write_note = _detect_writeback_note(str(data.get("summary") or ""))
+    write_path = _extract_write_path(write_note)
     grounded = "No" if data.get("abstention") else "Yes"
 
-    st.markdown(
-        f"**Target:** `{target}` · **Grounded:** {grounded} · "
-        f"**Written:** {write_note or '(not written)'}"
-    )
+    st.markdown(f"**Target:** `{target}` · **Grounded:** {grounded}")
+
+    if write_note:
+        if write_path:
+            st.success(
+                f"Written to disk successfully: `{write_path}`\n\n{write_note}"
+            )
+        else:
+            st.success(f"Written to disk successfully.\n\n{write_note}")
+    else:
+        st.info("Not written to disk — preview only (enable write-back in the sidebar).")
 
     _render_abstention(data.get("abstention"))
 
@@ -210,7 +410,10 @@ def render_documentation_result(
         body = body.replace(write_note, "").rstrip()
 
     if body:
+        st.markdown("### Documentation")
         st.markdown(body)
+        st.caption("Use the copy icon on the block below to copy the full text.")
+        st.code(body, language="markdown")
     else:
         st.info("Empty documentation summary.")
 
@@ -239,23 +442,22 @@ def render_testing_result(result: Any) -> None:
     names = sorted(generated.keys())
     coverage_pct = float(data.get("coverage_estimate") or 0.0) * 100.0
 
-    _render_stats(
-        [
-            ("Test files", str(len(names))),
-            ("Passed", str(counts["passed"])),
-            ("Failed", str(counts["failed"])),
-            ("Coverage", f"{coverage_pct:.0f}%"),
-        ]
+    _render_status_chips(
+        passed=counts["passed"],
+        failed=counts["failed"],
+        skipped=counts["skipped"],
+        errors=counts["errors"],
+        coverage_pct=coverage_pct,
+        files=len(names),
     )
 
-    if counts["skipped"] or counts["errors"]:
-        st.caption(
-            f"Skipped: {counts['skipped']} · Errors: {counts['errors']}"
-        )
-
     if summary:
-        with st.expander("Summary", expanded=True):
-            st.markdown(summary)
+        expanded = not _is_long_log(summary)
+        label = "Pytest log / summary"
+        if _is_long_log(summary):
+            label += " (collapsed — long output)"
+        with st.expander(label, expanded=expanded):
+            st.code(summary, language="text")
 
     _render_abstention(data.get("abstention"))
 

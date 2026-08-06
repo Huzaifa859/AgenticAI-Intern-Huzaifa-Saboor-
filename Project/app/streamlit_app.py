@@ -23,11 +23,12 @@ from __future__ import annotations
 import html
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -49,10 +50,16 @@ from service import (  # noqa: E402
     prepare_repository,
     provider_status_message,
 )
+from ui_export import (  # noqa: E402
+    export_filename,
+    markdown_for_agent,
+    result_to_json,
+)
 from ui_history import (  # noqa: E402
     append_history,
     clear_history,
     format_history_label,
+    format_history_summary,
     load_history,
     make_run_entry,
     summarize_result,
@@ -66,6 +73,7 @@ from ui_reports import (  # noqa: E402
 DOC_MODES = ("readme", "file", "function", "class")
 TEST_MODES = ("repository", "file", "function")
 AGENTS = ("Analysis", "Documentation", "Testing")
+RESULT_TABS = ("Analysis", "Documentation", "Testing")
 
 #: Approximate pipeline weights (0–1) for the live progress bar.
 _STAGE_WEIGHTS: Dict[str, Dict[str, float]] = {
@@ -130,22 +138,18 @@ _STAGE_WEIGHTS: Dict[str, Dict[str, float]] = {
 _PROGRESS_CSS = """
 <style>
 @keyframes ca-pulse {
-  0%, 100% { opacity: 0.55; transform: scale(1); }
-  50% { opacity: 1; transform: scale(1.15); }
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
 }
 @keyframes ca-shimmer {
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
+/* Hide Streamlit toolbar "Running" indicator next to Deploy.
+   Our job monitor uses a fragment auto-refresh; that widget otherwise
+   blinks/resizes beside Deploy and looks like a bug. */
 div[data-testid="stStatusWidget"] {
-  border: 1px solid rgba(49, 51, 63, 0.16);
-  border-radius: 12px;
-  padding: 0.15rem 0.35rem 0.35rem;
-  background: linear-gradient(
-    135deg,
-    rgba(250, 250, 252, 0.95) 0%,
-    rgba(241, 245, 249, 0.9) 100%
-  );
+  display: none !important;
 }
 .ca-progress-wrap {
   margin: 0.35rem 0 0.85rem;
@@ -218,16 +222,35 @@ div[data-testid="stStatusWidget"] {
   color: #0f172a;
   font-weight: 600;
 }
+.ca-history-card {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 10px;
+  padding: 0.55rem 0.65rem 0.45rem;
+  margin-bottom: 0.45rem;
+  background: rgba(255, 255, 255, 0.72);
+}
+.ca-history-title {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: #0f172a;
+  margin-bottom: 0.15rem;
+}
+.ca-history-summary {
+  font-size: 0.78rem;
+  color: #64748b;
+  margin-bottom: 0.35rem;
+  line-height: 1.35;
+}
 </style>
 """
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def _local_now_iso() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
 def _inject_progress_styles() -> None:
-    """Inject CSS once per page render for the live progress panel."""
+    """Inject CSS for the live progress panel and history cards."""
     st.markdown(_PROGRESS_CSS, unsafe_allow_html=True)
 
 
@@ -244,7 +267,6 @@ def _stage_progress(job: str, stage: str, current: float) -> float:
     weights = _STAGE_WEIGHTS.get(job) or {}
     target = float(weights.get(stage, 0.0) or 0.0)
     if target <= 0:
-        # Unknown stage: nudge forward slightly so the bar still feels alive.
         return min(0.95, max(current, current + 0.015 if current < 0.9 else current))
     return max(current, min(1.0, target))
 
@@ -258,7 +280,7 @@ def _render_progress_panel(
     elapsed: float,
     state: str = "running",
 ) -> None:
-    """Draw the animated progress header + Streamlit progress bar."""
+    """Draw the progress header + Streamlit progress bar."""
     pct = int(round(max(0.0, min(1.0, fraction)) * 100))
     title = {
         "running": f"Running {job.capitalize()}",
@@ -308,6 +330,9 @@ def _init_state() -> None:
         "history_loaded": False,
         "viewing_history_id": None,
         "viewing_history_label": "",
+        "active_result_tab": "Analysis",
+        "active_job": None,
+        "job_log": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -317,6 +342,8 @@ def _init_state() -> None:
         st.session_state.history_loaded = True
     if st.session_state.run_history is None:
         st.session_state.run_history = []
+    if st.session_state.active_result_tab not in RESULT_TABS:
+        st.session_state.active_result_tab = "Analysis"
     if not st.session_state.provider_status:
         try:
             st.session_state.provider_status = provider_status_message()
@@ -334,6 +361,12 @@ def _clear_results() -> None:
     st.session_state.last_agent = ""
     st.session_state.viewing_history_id = None
     st.session_state.viewing_history_label = ""
+
+
+def _set_active_tab(agent: str) -> None:
+    """Select the result pane matching an agent name."""
+    if agent in RESULT_TABS:
+        st.session_state.active_result_tab = agent
 
 
 def _load_repository(reference: str) -> None:
@@ -392,18 +425,115 @@ def _tail_progress(
     return events, new_offset
 
 
-def _run_worker(job: str, repo_path: str, **fields: Any) -> Dict[str, Any]:
-    """
-    Run one agent job in a subprocess with live progress updates.
+def _pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` still looks alive."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            return str(pid) in (completed.stdout or "")
+        except OSError:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
-    Raises:
-        RuntimeError: When the worker exits without a usable result file.
-    """
+
+def _kill_pid(pid: int) -> None:
+    """Force-stop a worker process tree."""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _cleanup_paths(*paths: str) -> None:
+    for path in paths:
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _record_history(
+    *,
+    agent: str,
+    target: str,
+    ok: bool,
+    result: Optional[Dict[str, Any]] = None,
+    error: str = "",
+    started_at: str,
+) -> None:
+    """Append one run to session + disk history."""
+    entry = make_run_entry(
+        agent=agent,
+        repo_reference=str(st.session_state.repo_reference or ""),
+        target=target,
+        ok=ok,
+        error=error,
+        summary=summarize_result(agent, result, error=error),
+        result=result or {},
+        started_at=started_at,
+        finished_at=_local_now_iso(),
+    )
+    st.session_state.run_history = append_history(
+        list(st.session_state.run_history or []),
+        entry,
+    )
+    st.session_state.viewing_history_id = None
+    st.session_state.viewing_history_label = ""
+
+
+def _apply_success_result(agent: str, result: Dict[str, Any], target: str) -> None:
+    """Store a successful agent result and focus its tab."""
+    if agent == "Analysis":
+        st.session_state.last_analysis = result
+    elif agent == "Documentation":
+        st.session_state.last_documentation = result
+        st.session_state.last_doc_target = target
+    elif agent == "Testing":
+        st.session_state.last_testing = result
+    st.session_state.last_agent = agent
+    st.session_state.last_error = ""
+    _set_active_tab(agent)
+
+
+def _start_worker(
+    agent: str,
+    job: str,
+    repo_path: str,
+    *,
+    target: str,
+    **fields: Any,
+) -> None:
+    """Launch the worker subprocess and park state for the live monitor."""
     fd, out_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".json")
     os.close(fd)
     progress_fd, progress_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".ndjson")
     os.close(progress_fd)
-    # Start empty so the UI can open the file immediately.
+    err_fd, stderr_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".err")
+    os.close(err_fd)
     try:
         with open(progress_path, "w", encoding="utf-8"):
             pass
@@ -442,169 +572,220 @@ def _run_worker(job: str, repo_path: str, **fields: Any) -> Dict[str, Any]:
     env.setdefault("CHROMA_PERSIST_DIR", os.path.join(runtime_root, "chroma"))
     env.setdefault("MEMORY_STORE_PATH", os.path.join(runtime_root, "memory_store"))
 
-    process = subprocess.Popen(
-        cmd,
-        cwd=_PROJECT_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    offset = 0
-    last_message = ""
-    fraction = 0.02
-    stage_message = "Starting worker…"
-    started = time.monotonic()
-    last_creep = started
-    payload: Optional[Dict[str, Any]] = None
-    panel = st.empty()
+    err_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
     try:
-        _render_progress_panel(
-            placeholder=panel,
-            job=job,
-            fraction=fraction,
-            stage_message=stage_message,
-            elapsed=0.0,
-            state="running",
+        process = subprocess.Popen(
+            cmd,
+            cwd=_PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=err_handle,
+            text=True,
         )
-        with st.status("Pipeline stages", expanded=True) as status:
-            status.write("Queued — launching isolated worker process…")
-            while True:
-                events, offset = _tail_progress(progress_path, offset)
-                for event in events:
-                    message = event.get("message") or ""
-                    stage = event.get("stage") or "progress"
-                    if message and message != last_message:
-                        status.write(f"→ {message}")
-                        last_message = message
-                        stage_message = message
-                    fraction = _stage_progress(job, stage, fraction)
-
-                # Soft creep while a long stage (e.g. model call) is in flight.
-                now = time.monotonic()
-                if now - last_creep >= 1.2 and fraction < 0.93:
-                    fraction = min(0.93, fraction + 0.008)
-                    last_creep = now
-
-                # Refresh every tick so elapsed time / bar stay live.
-                _render_progress_panel(
-                    placeholder=panel,
-                    job=job,
-                    fraction=fraction,
-                    stage_message=stage_message,
-                    elapsed=now - started,
-                    state="running",
-                )
-                status.update(
-                    label=f"{stage_message} · {_format_elapsed(now - started)}",
-                    state="running",
-                )
-
-                code = process.poll()
-                if code is not None:
-                    events, offset = _tail_progress(progress_path, offset)
-                    for event in events:
-                        message = event.get("message") or ""
-                        stage = event.get("stage") or "progress"
-                        if message and message != last_message:
-                            status.write(f"→ {message}")
-                            last_message = message
-                            stage_message = message
-                        fraction = _stage_progress(job, stage, fraction)
-                    break
-                time.sleep(0.28)
-
-            stdout, stderr = process.communicate(timeout=5)
-            elapsed = time.monotonic() - started
-            if not os.path.isfile(out_path):
-                detail = (stderr or stdout or "").strip()
-                _render_progress_panel(
-                    placeholder=panel,
-                    job=job,
-                    fraction=fraction,
-                    stage_message=stage_message or "Worker exited unexpectedly",
-                    elapsed=elapsed,
-                    state="error",
-                )
-                status.update(label=f"{job.capitalize()} failed", state="error")
-                raise RuntimeError(
-                    detail
-                    or f"Worker exited with code {process.returncode} and wrote no result."
-                )
-            with open(out_path, encoding="utf-8") as handle:
-                payload = json.load(handle)
-            if payload.get("ok"):
-                fraction = 1.0
-                stage_message = f"{job.capitalize()} finished"
-                _render_progress_panel(
-                    placeholder=panel,
-                    job=job,
-                    fraction=fraction,
-                    stage_message=stage_message,
-                    elapsed=elapsed,
-                    state="complete",
-                )
-                status.update(
-                    label=f"{job.capitalize()} complete · {_format_elapsed(elapsed)}",
-                    state="complete",
-                )
-            else:
-                _render_progress_panel(
-                    placeholder=panel,
-                    job=job,
-                    fraction=max(fraction, 0.2),
-                    stage_message=str(payload.get("error") or "Job failed"),
-                    elapsed=elapsed,
-                    state="error",
-                )
-                status.update(label=f"{job.capitalize()} failed", state="error")
+    except Exception:
+        err_handle.close()
+        _cleanup_paths(out_path, progress_path, stderr_path)
+        raise
     finally:
-        for path in (out_path, progress_path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        # Child keeps the inherited handle; parent can close its copy.
+        try:
+            err_handle.close()
+        except OSError:
+            pass
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("Worker returned an invalid payload.")
-    if not payload.get("ok"):
-        raise RuntimeError(str(payload.get("error") or "Worker job failed."))
-    result = payload.get("result")
-    if not isinstance(result, dict):
-        raise RuntimeError("Worker returned no result object.")
-    return result
-
-
-def _record_history(
-    *,
-    agent: str,
-    target: str,
-    ok: bool,
-    result: Optional[Dict[str, Any]] = None,
-    error: str = "",
-    started_at: str,
-) -> None:
-    """Append one run to session + disk history."""
-    entry = make_run_entry(
-        agent=agent,
-        repo_reference=str(st.session_state.repo_reference or ""),
-        target=target,
-        ok=ok,
-        error=error,
-        summary=summarize_result(agent, result, error=error),
-        result=result or {},
-        started_at=started_at,
-        finished_at=_utc_now_iso(),
-    )
-    st.session_state.run_history = append_history(
-        list(st.session_state.run_history or []),
-        entry,
-    )
+    started = time.monotonic()
+    st.session_state.job_log = ["Queued — launching isolated worker process…"]
+    st.session_state.active_job = {
+        "pid": int(process.pid or 0),
+        "job": job,
+        "agent": agent,
+        "target": target,
+        "out_path": out_path,
+        "progress_path": progress_path,
+        "stderr_path": stderr_path,
+        "offset": 0,
+        "fraction": 0.02,
+        "stage_message": "Starting worker…",
+        "started_mono": started,
+        "started_at": _local_now_iso(),
+        "last_creep": started,
+        "last_message": "",
+        "cancelled": False,
+    }
+    st.session_state.last_agent = agent
+    st.session_state.last_error = ""
     st.session_state.viewing_history_id = None
     st.session_state.viewing_history_label = ""
+    _set_active_tab(agent)
+
+
+def _finalize_active_job(*, cancelled: bool = False) -> None:
+    """Consume worker output (or cancellation) and clear active job state."""
+    job_state = st.session_state.get("active_job")
+    if not isinstance(job_state, dict):
+        return
+
+    agent = str(job_state.get("agent") or "Analysis")
+    target = str(job_state.get("target") or "")
+    started_at = str(job_state.get("started_at") or _local_now_iso())
+    out_path = str(job_state.get("out_path") or "")
+    progress_path = str(job_state.get("progress_path") or "")
+    stderr_path = str(job_state.get("stderr_path") or "")
+    pid = int(job_state.get("pid") or 0)
+
+    try:
+        if cancelled:
+            _kill_pid(pid)
+            message = f"{agent} cancelled by user"
+            st.session_state.last_error = message
+            _record_history(
+                agent=agent,
+                target=target,
+                ok=False,
+                error=message,
+                started_at=started_at,
+            )
+            _set_active_tab(agent)
+            return
+
+        payload: Optional[Dict[str, Any]] = None
+        if os.path.isfile(out_path):
+            try:
+                with open(out_path, encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (OSError, json.JSONDecodeError):
+                payload = None
+
+        if payload and payload.get("ok"):
+            result = payload.get("result")
+            if isinstance(result, dict):
+                _apply_success_result(agent, result, target)
+                _record_history(
+                    agent=agent,
+                    target=target,
+                    ok=True,
+                    result=result,
+                    started_at=started_at,
+                )
+                return
+            message = f"{agent} failed: Worker returned no result object."
+        else:
+            detail = ""
+            if payload and payload.get("error"):
+                detail = str(payload.get("error"))
+            elif os.path.isfile(stderr_path):
+                try:
+                    with open(stderr_path, encoding="utf-8", errors="replace") as handle:
+                        detail = handle.read().strip()
+                except OSError:
+                    detail = ""
+            message = f"{agent} failed: {detail or 'Worker job failed.'}"
+
+        st.session_state.last_error = message
+        _record_history(
+            agent=agent,
+            target=target,
+            ok=False,
+            error=message,
+            started_at=started_at,
+        )
+        _set_active_tab(agent)
+    finally:
+        _cleanup_paths(out_path, progress_path, stderr_path)
+        st.session_state.active_job = None
+
+
+def _poll_active_job() -> None:
+    """Advance progress state for the in-flight worker; finalize if done."""
+    job_state = st.session_state.get("active_job")
+    if not isinstance(job_state, dict):
+        return
+
+    if job_state.get("cancelled"):
+        _finalize_active_job(cancelled=True)
+        return
+
+    pid = int(job_state.get("pid") or 0)
+    progress_path = str(job_state.get("progress_path") or "")
+    events, offset = _tail_progress(progress_path, int(job_state.get("offset") or 0))
+    job_state["offset"] = offset
+    log = list(st.session_state.job_log or [])
+    for event in events:
+        message = event.get("message") or ""
+        stage = event.get("stage") or "progress"
+        if message and message != job_state.get("last_message"):
+            log.append(f"→ {message}")
+            job_state["last_message"] = message
+            job_state["stage_message"] = message
+        job_state["fraction"] = _stage_progress(
+            str(job_state.get("job") or ""),
+            stage,
+            float(job_state.get("fraction") or 0.02),
+        )
+    st.session_state.job_log = log[-40:]
+
+    now = time.monotonic()
+    last_creep = float(job_state.get("last_creep") or now)
+    fraction = float(job_state.get("fraction") or 0.02)
+    if now - last_creep >= 1.2 and fraction < 0.93:
+        job_state["fraction"] = min(0.93, fraction + 0.008)
+        job_state["last_creep"] = now
+
+    st.session_state.active_job = job_state
+    if not _pid_alive(pid):
+        # Small grace so the worker can flush result JSON.
+        time.sleep(0.15)
+        _finalize_active_job(cancelled=False)
+
+
+@st.fragment(run_every=timedelta(seconds=1))
+def _render_job_monitor_live() -> None:
+    """Live progress panel + Stop control while a worker is running."""
+    _poll_active_job()
+    job_state = st.session_state.get("active_job")
+    if not isinstance(job_state, dict):
+        st.rerun()
+        return
+
+    job = str(job_state.get("job") or "job")
+    elapsed = time.monotonic() - float(job_state.get("started_mono") or time.monotonic())
+    top = st.columns([4, 1])
+    with top[1]:
+        if st.button("Stop run", type="secondary", width="stretch", key="stop_run"):
+            job_state["cancelled"] = True
+            st.session_state.active_job = job_state
+            _finalize_active_job(cancelled=True)
+            st.rerun()
+            return
+
+    panel = st.empty()
+    _render_progress_panel(
+        placeholder=panel,
+        job=job,
+        fraction=float(job_state.get("fraction") or 0.02),
+        stage_message=str(job_state.get("stage_message") or "Working…"),
+        elapsed=elapsed,
+        state="running",
+    )
+    # Prefer a plain expander over st.status here — status widgets can
+    # interact badly with fragment auto-refresh and toolbar chrome.
+    log_lines = list(st.session_state.job_log or [])
+    with st.expander(
+        f"Pipeline stages · {_format_elapsed(elapsed)}",
+        expanded=True,
+    ):
+        if log_lines:
+            st.markdown("\n".join(f"- {line}" for line in log_lines))
+        else:
+            st.caption("Waiting for worker stages…")
+
+
+def _render_job_monitor() -> None:
+    """Mount the live monitor only while a job is active."""
+    if isinstance(st.session_state.get("active_job"), dict):
+        _render_job_monitor_live()
 
 
 def _run_selected_agent(
@@ -619,40 +800,33 @@ def _run_selected_agent(
     write_to_disk: bool,
     replace_existing: bool,
 ) -> None:
-    """Dispatch the selected agent via worker subprocess and store JSON."""
+    """Start the selected agent in a cancellable worker subprocess."""
+    if st.session_state.get("active_job"):
+        st.session_state.last_error = "A job is already running. Stop it first."
+        return
+
     repo_path = st.session_state.repo_path
     if not repo_path:
         st.session_state.last_error = "Load a repository first."
         return
 
-    st.session_state.last_error = ""
-    st.session_state.last_agent = agent
-    st.session_state.viewing_history_id = None
-    st.session_state.viewing_history_label = ""
-    started_at = _utc_now_iso()
-
-    target = "repository"
     try:
         if agent == "Analysis":
             target = question[:80] or "analysis"
-            result = _run_worker(
+            _start_worker(
+                agent,
                 "analysis",
                 repo_path,
-                question=question,
-            )
-            st.session_state.last_analysis = result
-            _record_history(
-                agent=agent,
                 target=target,
-                ok=True,
-                result=result,
-                started_at=started_at,
+                question=question,
             )
         elif agent == "Documentation":
             target = file_path or class_name or function_name or doc_mode or "repository"
-            result = _run_worker(
+            _start_worker(
+                agent,
                 "documentation",
                 repo_path,
+                target=str(target),
                 mode=doc_mode,
                 file_path=file_path,
                 function_name=function_name,
@@ -660,42 +834,28 @@ def _run_selected_agent(
                 write_to_disk=write_to_disk,
                 replace_existing=replace_existing,
             )
-            st.session_state.last_documentation = result
-            st.session_state.last_doc_target = target
-            _record_history(
-                agent=agent,
-                target=str(target),
-                ok=True,
-                result=result,
-                started_at=started_at,
-            )
         else:
             target = file_path or function_name or test_mode or "repository"
-            result = _run_worker(
+            _start_worker(
+                agent,
                 "testing",
                 repo_path,
+                target=str(target),
                 mode=test_mode,
                 file_path=file_path,
                 function_name=function_name,
             )
-            st.session_state.last_testing = result
-            _record_history(
-                agent=agent,
-                target=str(target),
-                ok=True,
-                result=result,
-                started_at=started_at,
-            )
-    except Exception as exc:  # noqa: BLE001 — show agent failures in the UI
+    except Exception as exc:  # noqa: BLE001 — show launch failures in the UI
         message = f"{agent} failed: {exc}"
         st.session_state.last_error = message
         _record_history(
             agent=agent,
-            target=str(target),
+            target="launch",
             ok=False,
             error=message,
-            started_at=started_at,
+            started_at=_local_now_iso(),
         )
+        _set_active_tab(agent)
 
 
 def _restore_history_entry(entry: Dict[str, Any]) -> None:
@@ -703,7 +863,9 @@ def _restore_history_entry(entry: Dict[str, Any]) -> None:
     agent = str(entry.get("agent") or "")
     result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
     st.session_state.viewing_history_id = entry.get("id")
-    st.session_state.viewing_history_label = format_history_label(entry)
+    st.session_state.viewing_history_label = (
+        f"{format_history_label(entry)} — {format_history_summary(entry)}"
+    )
     st.session_state.last_error = ""
     if agent == "Analysis":
         st.session_state.last_analysis = result
@@ -715,10 +877,36 @@ def _restore_history_entry(entry: Dict[str, Any]) -> None:
     elif agent == "Testing":
         st.session_state.last_testing = result
         st.session_state.last_agent = "Testing"
+    _set_active_tab(agent)
+
+
+def _render_export_buttons(agent: str, result: Any, *, doc_target: str = "") -> None:
+    """Markdown + JSON download buttons for the active result."""
+    md = markdown_for_agent(agent, result, doc_target=doc_target)
+    raw = result_to_json(result)
+    col_a, col_b, _ = st.columns([1, 1, 2])
+    with col_a:
+        st.download_button(
+            "Download Markdown",
+            data=md,
+            file_name=export_filename(agent, "md"),
+            mime="text/markdown",
+            width="stretch",
+            key=f"dl_md_{agent}",
+        )
+    with col_b:
+        st.download_button(
+            "Download JSON",
+            data=raw,
+            file_name=export_filename(agent, "json"),
+            mime="application/json",
+            width="stretch",
+            key=f"dl_json_{agent}",
+        )
 
 
 def _render_history_sidebar() -> None:
-    """Draw the run-history expander."""
+    """Draw the run-history expander with local times + summaries."""
     with st.sidebar.expander("Run history", expanded=False):
         history: List[Dict[str, Any]] = list(st.session_state.run_history or [])
         if not history:
@@ -727,9 +915,19 @@ def _render_history_sidebar() -> None:
 
         newest_first = list(reversed(history))
         for entry in newest_first[:20]:
-            label = format_history_label(entry)
             entry_id = str(entry.get("id") or "")
-            if st.button(label, key=f"hist_{entry_id}", width="stretch"):
+            title = html.escape(format_history_label(entry))
+            summary = html.escape(format_history_summary(entry))
+            st.markdown(
+                f"""
+<div class="ca-history-card">
+  <div class="ca-history-title">{title}</div>
+  <div class="ca-history-summary">{summary}</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if st.button("Open", key=f"hist_{entry_id}", width="stretch"):
                 _restore_history_entry(entry)
                 st.rerun()
 
@@ -752,7 +950,8 @@ def _render_sidebar() -> None:
         help="Local path relative to Project/, absolute path, or HTTPS GitHub URL.",
     )
 
-    if st.sidebar.button("Load repository", width="stretch"):
+    busy = bool(st.session_state.get("active_job"))
+    if st.sidebar.button("Load repository", width="stretch", disabled=busy):
         with st.spinner("Preparing repository..."):
             _load_repository(reference)
 
@@ -764,7 +963,7 @@ def _render_sidebar() -> None:
     _render_history_sidebar()
 
     st.sidebar.divider()
-    agent = st.sidebar.radio("Agent", AGENTS, index=0)
+    agent = st.sidebar.radio("Agent", AGENTS, index=0, disabled=busy)
 
     question = "Find bugs and potential issues"
     doc_mode = "readme"
@@ -780,29 +979,40 @@ def _render_sidebar() -> None:
             "Question",
             value="Find bugs and potential issues",
             height=80,
+            disabled=busy,
         )
     elif agent == "Documentation":
-        doc_mode = st.sidebar.selectbox("Documentation mode", DOC_MODES, index=2)
+        doc_mode = st.sidebar.selectbox(
+            "Documentation mode", DOC_MODES, index=2, disabled=busy
+        )
         if doc_mode in {"file", "function", "class"}:
-            file_path = st.sidebar.text_input("File path", value="")
+            file_path = st.sidebar.text_input("File path", value="", disabled=busy)
         if doc_mode == "function":
-            function_name = st.sidebar.text_input("Function name", value="")
+            function_name = st.sidebar.text_input(
+                "Function name", value="", disabled=busy
+            )
         if doc_mode == "class":
-            class_name = st.sidebar.text_input("Class name", value="")
-        write_to_disk = st.sidebar.checkbox("Write documentation to disk", value=False)
+            class_name = st.sidebar.text_input("Class name", value="", disabled=busy)
+        write_to_disk = st.sidebar.checkbox(
+            "Write documentation to disk", value=False, disabled=busy
+        )
         replace_existing = False
         if write_to_disk:
             replace_existing = st.sidebar.checkbox(
-                "Replace existing documentation", value=False
+                "Replace existing documentation", value=False, disabled=busy
             )
     else:
-        test_mode = st.sidebar.selectbox("Testing mode", TEST_MODES, index=2)
+        test_mode = st.sidebar.selectbox(
+            "Testing mode", TEST_MODES, index=2, disabled=busy
+        )
         if test_mode in {"file", "function"}:
-            file_path = st.sidebar.text_input("File path", value="")
+            file_path = st.sidebar.text_input("File path", value="", disabled=busy)
         if test_mode == "function":
-            function_name = st.sidebar.text_input("Function name", value="")
+            function_name = st.sidebar.text_input(
+                "Function name", value="", disabled=busy
+            )
 
-    run_disabled = not bool(st.session_state.repo_path)
+    run_disabled = (not bool(st.session_state.repo_path)) or busy
     if st.sidebar.button(
         "Run",
         type="primary",
@@ -822,12 +1032,52 @@ def _render_sidebar() -> None:
         )
 
 
+def _render_result_pane() -> None:
+    """Render the selected result tab content with export actions."""
+    selected = st.session_state.get("active_result_tab") or "Analysis"
+    st.segmented_control(
+        "Results",
+        options=list(RESULT_TABS),
+        key="active_result_tab",
+        label_visibility="collapsed",
+    )
+    selected = st.session_state.get("active_result_tab") or selected
+
+    if selected == "Analysis":
+        if st.session_state.last_analysis is not None:
+            _render_export_buttons("Analysis", st.session_state.last_analysis)
+            render_analysis_report(st.session_state.last_analysis)
+        else:
+            st.caption("No analysis result in this session.")
+    elif selected == "Documentation":
+        if st.session_state.last_documentation is not None:
+            _render_export_buttons(
+                "Documentation",
+                st.session_state.last_documentation,
+                doc_target=st.session_state.last_doc_target,
+            )
+            render_documentation_result(
+                st.session_state.last_documentation,
+                requested_target=st.session_state.last_doc_target,
+            )
+        else:
+            st.caption("No documentation result in this session.")
+    else:
+        if st.session_state.last_testing is not None:
+            _render_export_buttons("Testing", st.session_state.last_testing)
+            render_testing_result(st.session_state.last_testing)
+        else:
+            st.caption("No testing result in this session.")
+
+
 def _render_main() -> None:
     """Draw status and the latest report."""
     st.title("Codebase Assistant")
     st.markdown(
         "Load a repository in the sidebar, choose an agent, then browse the report here."
     )
+
+    _render_job_monitor()
 
     if st.session_state.viewing_history_id:
         st.info(
@@ -855,32 +1105,15 @@ def _render_main() -> None:
             st.session_state.last_testing,
         ]
     )
+    if st.session_state.get("active_job") and not has_any:
+        st.caption("Job in progress — results will appear here when finished.")
+        return
+
     if not has_any:
         st.info("No results yet. Choose an agent and click **Run**.")
         return
 
-    tabs = st.tabs(["Analysis", "Documentation", "Testing"])
-
-    with tabs[0]:
-        if st.session_state.last_analysis is not None:
-            render_analysis_report(st.session_state.last_analysis)
-        else:
-            st.caption("No analysis result in this session.")
-
-    with tabs[1]:
-        if st.session_state.last_documentation is not None:
-            render_documentation_result(
-                st.session_state.last_documentation,
-                requested_target=st.session_state.last_doc_target,
-            )
-        else:
-            st.caption("No documentation result in this session.")
-
-    with tabs[2]:
-        if st.session_state.last_testing is not None:
-            render_testing_result(st.session_state.last_testing)
-        else:
-            st.caption("No testing result in this session.")
+    _render_result_pane()
 
 
 def main() -> None:

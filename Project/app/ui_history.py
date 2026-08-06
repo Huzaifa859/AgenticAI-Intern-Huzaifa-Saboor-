@@ -21,13 +21,42 @@ RUNTIME_ROOT = os.path.join(
 HISTORY_PATH = os.path.join(RUNTIME_ROOT, "ui_run_history.jsonl")
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def _local_now_iso() -> str:
+    """Current local device time with timezone offset (no microseconds)."""
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
 def history_path() -> str:
     """Return the on-disk history file path."""
     return HISTORY_PATH
+
+
+def parse_history_time(value: Any) -> Optional[datetime]:
+    """Parse a stored ISO timestamp into an aware datetime when possible."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Legacy naive UTC stamps from earlier builds.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def format_local_time(value: Any) -> str:
+    """
+    Format a stored timestamp in the user's local device timezone.
+
+    Example: ``Aug 06, 2026 05:43:12 AM``
+    """
+    dt = parse_history_time(value)
+    if dt is None:
+        return "unknown time"
+    local = dt.astimezone()
+    return local.strftime("%b %d, %Y %I:%M:%S %p")
 
 
 def load_history(path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -93,11 +122,11 @@ def make_run_entry(
     started_at: Optional[str] = None,
     finished_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build one history entry dict."""
+    """Build one history entry dict (timestamps in local device time)."""
     return {
         "id": uuid.uuid4().hex,
-        "started_at": started_at or _utc_now_iso(),
-        "finished_at": finished_at or _utc_now_iso(),
+        "started_at": started_at or _local_now_iso(),
+        "finished_at": finished_at or _local_now_iso(),
         "agent": agent,
         "repo_reference": repo_reference or "",
         "target": target or "",
@@ -153,11 +182,19 @@ def summarize_result(agent: str, result: Optional[Dict[str, Any]], error: str = 
 
 
 def format_history_label(entry: Dict[str, Any]) -> str:
-    """Sidebar label for one history row."""
+    """Compact one-line label (agent · local time · status)."""
     agent = entry.get("agent") or "?"
-    repo = entry.get("repo_reference") or "?"
-    if len(repo) > 28:
-        repo = "…" + repo[-27:]
-    stamp = (entry.get("finished_at") or entry.get("started_at") or "")[-8:]
+    stamp = format_local_time(entry.get("finished_at") or entry.get("started_at"))
     status = "ok" if entry.get("ok") else "fail"
-    return f"{agent} · {repo} · {stamp} · {status}"
+    return f"{agent} · {stamp} · {status}"
+
+
+def format_history_summary(entry: Dict[str, Any]) -> str:
+    """Secondary history line with result summary."""
+    summary = str(entry.get("summary") or "").strip()
+    if summary:
+        return summary[:140]
+    repo = str(entry.get("repo_reference") or "").strip()
+    target = str(entry.get("target") or "").strip()
+    bits = [bit for bit in (repo, target) if bit]
+    return " · ".join(bits) if bits else "No summary"
