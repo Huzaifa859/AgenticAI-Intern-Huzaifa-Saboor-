@@ -1,8 +1,11 @@
 [browser]
 gatherUsageStats = false
+serverAddress = "localhost"
 
 [server]
-headless = true
+# false = Streamlit auto-opens your default browser on `streamlit run`
+# (was true before, which only printed the URL).
+headless = false
 # Analysis writes ChromaDB / memory files under the project. Streamlit's
 # default file watcher treats those as source changes, restarts the server
 # mid-run, and the browser then fails to load widgets (Metric fetch errors).

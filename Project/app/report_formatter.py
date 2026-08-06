@@ -522,6 +522,40 @@ def format_summary_table(
     return f"\n{banner('Summary Statistics')}\n\n{body}"
 
 
+def format_ungrounded_section(report: CodeAnalysisReport) -> str:
+    """
+    Format rejected grounding candidates for terminal display.
+
+    These are never mixed into verified findings.
+    """
+    if not report.rejected:
+        return ""
+    lines = [
+        banner("Unverified (failed grounding)"),
+        "",
+        "These candidates were discarded by grounding and are NOT verified bugs.",
+        "",
+    ]
+    for index, result in enumerate(report.rejected, start=1):
+        nested = result.report
+        bug_type = getattr(nested, "bug_type", None) or "candidate"
+        severity = getattr(nested, "severity", None) or "?"
+        method = getattr(nested, "detection_method", None) or "?"
+        description = getattr(nested, "description", None) or "(no description)"
+        status = getattr(result.status, "value", result.status)
+        lines.extend(
+            [
+                f"{index}. [{severity}] {bug_type} — "
+                f"{result.file_path}:{result.line_start}-{result.line_end}",
+                f"   Method: {method} · Status: {status}",
+                f"   Why: {result.reason}",
+                f"   {description}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip()
+
+
 def format_report(
     report: CodeAnalysisReport,
     *,
@@ -549,6 +583,17 @@ def format_report(
         format_findings_section(report, width=term_width, use_color=use_color),
         format_summary_table(report, rejected_llm),
     ]
+    show_ungrounded = False
+    try:
+        from codebase_assistant.config import Config
+
+        show_ungrounded = bool(Config.load().analysis_show_ungrounded)
+    except Exception:
+        show_ungrounded = False
+    if show_ungrounded:
+        ungrounded = format_ungrounded_section(report)
+        if ungrounded:
+            sections.append(ungrounded)
     return "\n".join(part for part in sections if part)
 
 

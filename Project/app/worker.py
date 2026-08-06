@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -158,29 +158,80 @@ def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> None:
     tracer.record = record  # type: ignore[method-assign]
 
 
+def _finding_to_dict(finding: Any) -> Dict[str, Any]:
+    """Normalize a BugReport / finding-like object to a plain dict."""
+    if hasattr(finding, "model_dump"):
+        return dict(finding.model_dump())
+    return {
+        "bug_type": getattr(finding, "bug_type", ""),
+        "description": getattr(finding, "description", ""),
+        "severity": getattr(finding, "severity", ""),
+        "confidence": float(getattr(finding, "confidence", 0.0) or 0.0),
+        "file_path": getattr(finding, "file_path", ""),
+        "function_name": getattr(finding, "function_name", ""),
+        "line_start": int(getattr(finding, "line_start", 0) or 0),
+        "line_end": int(getattr(finding, "line_end", 0) or 0),
+        "evidence": getattr(finding, "evidence", ""),
+        "suggested_fix": getattr(finding, "suggested_fix", None),
+        "detection_method": getattr(finding, "detection_method", ""),
+        "metadata": dict(getattr(finding, "metadata", None) or {}),
+    }
+
+
+def _ungrounded_candidates_from_report(report: Any) -> List[Dict[str, Any]]:
+    """
+    Slim view of grounding rejections for the UI.
+
+    These are never mixed into verified ``findings``; the Streamlit checkbox
+    only controls whether they are displayed.
+    """
+    candidates: List[Dict[str, Any]] = []
+    for result in list(getattr(report, "rejected", None) or []):
+        nested = getattr(result, "report", None)
+        base = _finding_to_dict(nested) if nested is not None else {}
+        status = getattr(result, "status", "")
+        status_value = getattr(status, "value", status)
+        match_type = getattr(result, "match_type", "")
+        match_value = getattr(match_type, "value", match_type)
+        candidates.append(
+            {
+                "bug_type": base.get("bug_type") or "",
+                "description": base.get("description") or "",
+                "severity": base.get("severity") or "",
+                "confidence": float(base.get("confidence") or 0.0),
+                "file_path": getattr(result, "file_path", None)
+                or base.get("file_path")
+                or "",
+                "function_name": base.get("function_name") or "",
+                "line_start": int(
+                    getattr(result, "line_start", None)
+                    or base.get("line_start")
+                    or 0
+                ),
+                "line_end": int(
+                    getattr(result, "line_end", None) or base.get("line_end") or 0
+                ),
+                "evidence": getattr(result, "expected_evidence", None)
+                or base.get("evidence")
+                or "",
+                "actual_source": getattr(result, "actual_source", "") or "",
+                "suggested_fix": base.get("suggested_fix"),
+                "detection_method": base.get("detection_method") or "",
+                "grounding_status": str(status_value or ""),
+                "grounding_reason": getattr(result, "reason", "") or "",
+                "match_type": str(match_value or ""),
+                "found_at_line": getattr(result, "found_at_line", None),
+            }
+        )
+    return candidates
+
+
 def _analysis_to_dict(report: Any) -> Dict[str, Any]:
     """Slim JSON-ready view of a CodeAnalysisReport (no retrieval context)."""
-    findings = []
-    for finding in list(getattr(report, "findings", None) or []):
-        if hasattr(finding, "model_dump"):
-            findings.append(finding.model_dump())
-        else:
-            findings.append(
-                {
-                    "bug_type": getattr(finding, "bug_type", ""),
-                    "description": getattr(finding, "description", ""),
-                    "severity": getattr(finding, "severity", ""),
-                    "confidence": float(getattr(finding, "confidence", 0.0)),
-                    "file_path": getattr(finding, "file_path", ""),
-                    "function_name": getattr(finding, "function_name", ""),
-                    "line_start": int(getattr(finding, "line_start", 0) or 0),
-                    "line_end": int(getattr(finding, "line_end", 0) or 0),
-                    "evidence": getattr(finding, "evidence", ""),
-                    "suggested_fix": getattr(finding, "suggested_fix", None),
-                    "detection_method": getattr(finding, "detection_method", ""),
-                    "metadata": dict(getattr(finding, "metadata", None) or {}),
-                }
-            )
+    findings = [
+        _finding_to_dict(finding)
+        for finding in list(getattr(report, "findings", None) or [])
+    ]
 
     abstention = getattr(report, "abstention", None)
     abstention_data = None
@@ -200,15 +251,18 @@ def _analysis_to_dict(report: Any) -> Dict[str, Any]:
             }
         )
 
+    ungrounded = _ungrounded_candidates_from_report(report)
     return {
         "repository_path": getattr(report, "repository_path", ""),
         "question": getattr(report, "question", ""),
         "findings": findings,
+        "ungrounded_candidates": ungrounded,
         "answer": getattr(report, "answer", "") or "",
         "notes": list(getattr(report, "notes", None) or []),
         "duration_seconds": float(getattr(report, "duration_seconds", 0.0) or 0.0),
         "model_used": bool(getattr(report, "model_used", False)),
         "duplicates_removed": int(getattr(report, "duplicates_removed", 0) or 0),
+        "llm_grounded_count": int(getattr(report, "llm_grounded_count", 0) or 0),
         "abstention": abstention_data,
     }
 

@@ -30,11 +30,13 @@ def analysis_to_markdown(report: Any) -> str:
     """Render an analysis report as Markdown."""
     data = _as_dict(report)
     findings = list(data.get("findings") or [])
+    candidates = list(data.get("ungrounded_candidates") or [])
     lines: List[str] = [
         "# Analysis report",
         "",
         f"- Question: {data.get('question') or '(none)'}",
-        f"- Findings: {len(findings)}",
+        f"- Verified findings: {len(findings)}",
+        f"- Ungrounded candidates: {len(candidates)}",
         f"- Duration: {float(data.get('duration_seconds') or 0.0):.1f}s",
         f"- Model used: {'yes' if data.get('model_used') else 'no'}",
         "",
@@ -84,6 +86,41 @@ def analysis_to_markdown(report: Any) -> str:
             if finding.get("suggested_fix"):
                 lines.extend(
                     ["**Suggested fix**", "", str(finding.get("suggested_fix")), ""]
+                )
+    if candidates:
+        lines.extend(
+            [
+                "## Unverified (failed grounding)",
+                "",
+                "These were discarded by grounding and are NOT verified bugs.",
+                "",
+            ]
+        )
+        for index, item in enumerate(candidates, start=1):
+            lines.extend(
+                [
+                    f"### {index}. [{item.get('severity') or '?'}] "
+                    f"{item.get('bug_type') or 'candidate'} — "
+                    f"{item.get('file_path')}:{item.get('line_start')}-"
+                    f"{item.get('line_end')}",
+                    "",
+                    str(item.get("description") or "(no description)"),
+                    "",
+                    f"- Status: {item.get('grounding_status') or '(n/a)'}",
+                    f"- Reason: {item.get('grounding_reason') or '(n/a)'}",
+                    "",
+                ]
+            )
+            if item.get("evidence"):
+                lines.extend(
+                    [
+                        "**Claimed evidence**",
+                        "",
+                        "```python",
+                        str(item.get("evidence")),
+                        "```",
+                        "",
+                    ]
                 )
     return "\n".join(lines).rstrip() + "\n"
 

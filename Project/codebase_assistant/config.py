@@ -205,6 +205,9 @@ class Config:
     # When True, TestingAgent salvages pytest source from non-JSON model
     # output instead of abstaining with an empty suite.
     testing_lenient: bool = True
+    # When True, analysis UIs/CLI also surface findings that failed
+    # grounding as "unverified candidates" (never mixed into verified).
+    analysis_show_ungrounded: bool = False
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -303,5 +306,9 @@ class Config:
             ),
             testing_lenient=_env_bool(
                 "TESTING_LENIENT", defaults.testing_lenient
+            ),
+            analysis_show_ungrounded=_env_bool(
+                "ANALYSIS_SHOW_UNGROUNDED",
+                defaults.analysis_show_ungrounded,
             ),
         )

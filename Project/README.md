@@ -352,6 +352,7 @@ Variables below are loaded by `Config.load()` (from `Project/.env` and the proce
 | `LOG_LEVEL` | No | `INFO` | Logging threshold |
 | `DOCUMENTATION_LENIENT` | No | `true` | Keep imperfect documentation LLM text (with warnings) instead of emptying on JSON/grounding failures. Set `false` for strict abstention. |
 | `TESTING_LENIENT` | No | `true` | Salvage pytest source from non-JSON testing model output instead of abstaining with an empty suite. Set `false` for strict abstention. |
+| `ANALYSIS_SHOW_UNGROUNDED` | No | `false` | When `true`, the CLI analysis report also prints findings that failed grounding as unverified candidates. The Streamlit UI has a separate checkbox for the same view. |
 
 Model identifiers (`openrouter_model`, `claude_model`, `ollama_model`) are Config defaults (`nvidia/nemotron-3-ultra-550b-a55b:free` and `llama3`) unless changed in code/configuration objects.
 
@@ -421,18 +422,22 @@ A Streamlit frontend wraps the same Supervisor pipeline as the CLI. Provider con
 
 ```bash
 cd Project
-# Preferred launcher (forces file-watcher off):
+# Preferred launcher (file-watcher off + prefers Chrome):
 run_ui.bat
 
 # Or:
 streamlit run app/streamlit_app.py --server.fileWatcherType=none
 ```
 
-Agent jobs run in a separate `app/worker.py` process so embedding/LLM memory use cannot kill the Streamlit server. `Project/.streamlit/config.toml` also disables Streamlit's file watcher (Chroma writes used to restart the app mid-run).
+`Project/.streamlit/config.toml` sets `server.headless = false` so Streamlit auto-opens a browser tab on startup (uses your OS default browser; `run_ui.bat` prefers Chrome when installed). It also disables the file watcher (Chroma writes used to restart the app mid-run).
+
+Agent jobs run in a separate `app/worker.py` process so embedding/LLM memory use cannot kill the Streamlit server.
 
 While a job runs, the UI polls an NDJSON progress file from the worker and shows **live stage updates** with a progress bar (indexing, model call, grounding, pytest, and similar). Use **Stop run** to cancel a long job. This is stage progress only — not LLM token streaming into the chat pane.
 
 Completed, failed, and cancelled runs are appended to a capped **Run history** (sidebar expander, newest first, max 20). Each row shows your **local device time** plus a short result summary. History is kept in `st.session_state` and persisted to `%TEMP%/codebase_assistant_streamlit/ui_run_history.jsonl` so it survives Streamlit script reloads. Selecting an entry restores its result and auto-opens the matching result pane. Each result pane can **Download Markdown** or **Download JSON**.
+
+On Analysis reports, enable **Show ungrounded candidates** to inspect findings that failed grounding. They appear in a separate **Unverified** section and are never mixed into verified bugs.
 
 In the sidebar:
 

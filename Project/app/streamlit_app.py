@@ -138,89 +138,222 @@ _STAGE_WEIGHTS: Dict[str, Dict[str, float]] = {
 _PROGRESS_CSS = """
 <style>
 @keyframes ca-pulse {
-  0%, 100% { opacity: 0.55; }
+  0%, 100% { opacity: 0.45; }
   50% { opacity: 1; }
 }
-@keyframes ca-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+@keyframes ca-ring {
+  0% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35); }
+  70% { box-shadow: 0 0 0 8px rgba(37, 99, 235, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
 }
-/* Hide Streamlit toolbar "Running" indicator next to Deploy.
-   Our job monitor uses a fragment auto-refresh; that widget otherwise
-   blinks/resizes beside Deploy and looks like a bug. */
+@keyframes ca-bar-sheen {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+@keyframes ca-fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes ca-spin {
+  to { transform: rotate(360deg); }
+}
+/* Hide Streamlit toolbar "Running" indicator next to Deploy. */
 div[data-testid="stStatusWidget"] {
   display: none !important;
 }
-.ca-progress-wrap {
-  margin: 0.35rem 0 0.85rem;
-  padding: 0.85rem 1rem 0.95rem;
-  border-radius: 12px;
-  border: 1px solid rgba(49, 51, 63, 0.14);
-  background: linear-gradient(
-    120deg,
-    #f8fafc 0%,
-    #eef2ff 45%,
-    #f8fafc 100%
-  );
-  background-size: 220% 100%;
-  animation: ca-shimmer 4.5s ease-in-out infinite;
+.ca-run-card {
+  margin: 0.15rem 0 0.85rem;
+  padding: 1rem 1.1rem 1.05rem;
+  border-radius: 14px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background:
+    radial-gradient(120% 80% at 0% 0%, rgba(37, 99, 235, 0.07), transparent 55%),
+    linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  animation: ca-fade-up 0.35s ease-out;
 }
-.ca-progress-wrap.ca-done {
-  animation: none;
-  background: #f0fdf4;
-  border-color: rgba(22, 163, 74, 0.28);
+.ca-run-card.ca-done {
+  background:
+    radial-gradient(120% 80% at 0% 0%, rgba(22, 163, 74, 0.08), transparent 55%),
+    #f0fdf4;
+  border-color: rgba(22, 163, 74, 0.25);
 }
-.ca-progress-wrap.ca-error {
-  animation: none;
-  background: #fef2f2;
-  border-color: rgba(220, 38, 38, 0.28);
+.ca-run-card.ca-error {
+  background:
+    radial-gradient(120% 80% at 0% 0%, rgba(220, 38, 38, 0.08), transparent 55%),
+    #fef2f2;
+  border-color: rgba(220, 38, 38, 0.25);
 }
-.ca-progress-head {
+.ca-run-top {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.55rem;
-  font-size: 0.92rem;
+  gap: 0.85rem;
+  margin-bottom: 0.7rem;
 }
-.ca-progress-title {
-  font-weight: 600;
-  color: #0f172a;
+.ca-run-title-row {
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.65rem;
+  min-width: 0;
 }
-.ca-dot {
-  width: 0.55rem;
-  height: 0.55rem;
+.ca-spinner {
+  width: 1.05rem;
+  height: 1.05rem;
   border-radius: 999px;
-  background: #2563eb;
-  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
-  animation: ca-pulse 1.2s ease-in-out infinite;
+  border: 2px solid rgba(37, 99, 235, 0.2);
+  border-top-color: #2563eb;
+  animation: ca-spin 0.85s linear infinite;
+  flex: 0 0 auto;
 }
-.ca-progress-wrap.ca-done .ca-dot {
+.ca-run-card.ca-done .ca-spinner,
+.ca-run-card.ca-error .ca-spinner {
+  animation: none;
+  border-color: transparent;
   background: #16a34a;
-  box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.15);
-  animation: none;
+  box-shadow: inset 0 0 0 2px #fff;
 }
-.ca-progress-wrap.ca-error .ca-dot {
+.ca-run-card.ca-error .ca-spinner {
   background: #dc2626;
-  box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.15);
-  animation: none;
 }
-.ca-progress-meta {
+.ca-run-title {
+  font-weight: 650;
+  font-size: 1.02rem;
+  color: #0f172a;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+.ca-run-sub {
+  margin-top: 0.2rem;
+  color: #475569;
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+.ca-run-sub strong {
+  color: #0f172a;
+  font-weight: 600;
+}
+.ca-run-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
   color: #64748b;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  font-size: 0.84rem;
 }
-.ca-stage-line {
-  margin-top: 0.45rem;
+.ca-run-pct {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #1e3a8a;
+  letter-spacing: -0.02em;
+}
+.ca-run-card.ca-done .ca-run-pct { color: #166534; }
+.ca-run-card.ca-error .ca-run-pct { color: #991b1b; }
+.ca-bar-track {
+  position: relative;
+  height: 0.55rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+.ca-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #1d4ed8 0%, #0f766e 55%, #2563eb 100%);
+  background-size: 200% 100%;
+  animation: ca-bar-sheen 2.4s linear infinite;
+  transition: width 0.45s ease;
+}
+.ca-run-card.ca-done .ca-bar-fill {
+  animation: none;
+  background: #16a34a;
+}
+.ca-run-card.ca-error .ca-bar-fill {
+  animation: none;
+  background: #dc2626;
+}
+.ca-bar-glow {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255,255,255,0.35) 50%,
+    transparent 100%
+  );
+  background-size: 40% 100%;
+  animation: ca-bar-sheen 1.8s ease-in-out infinite;
+  pointer-events: none;
+  opacity: 0.55;
+}
+.ca-stage-panel {
+  margin: 0.35rem 0 0.25rem;
+  padding: 0.75rem 0.85rem 0.65rem;
+  border-radius: 12px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: rgba(248, 250, 252, 0.9);
+}
+.ca-stage-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.55rem;
+  color: #64748b;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ca-stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 0.15rem;
+}
+.ca-stage-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.35rem 0.45rem;
+  border-radius: 8px;
   color: #334155;
   font-size: 0.88rem;
+  line-height: 1.35;
+  animation: ca-fade-up 0.3s ease-out;
 }
-.ca-stage-line strong {
+.ca-stage-item.ca-active {
+  background: rgba(37, 99, 235, 0.07);
   color: #0f172a;
-  font-weight: 600;
+  font-weight: 550;
+}
+.ca-stage-item.ca-done {
+  color: #475569;
+}
+.ca-stage-mark {
+  width: 0.55rem;
+  height: 0.55rem;
+  margin-top: 0.35rem;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: #94a3b8;
+}
+.ca-stage-item.ca-done .ca-stage-mark {
+  background: #22c55e;
+}
+.ca-stage-item.ca-active .ca-stage-mark {
+  background: #2563eb;
+  animation: ca-pulse 1.1s ease-in-out infinite, ca-ring 1.6s ease-out infinite;
+}
+div[data-testid="stProgress"] > div {
+  border-radius: 999px !important;
+  height: 0.55rem !important;
+}
+div[data-testid="stProgress"] > div > div {
+  border-radius: 999px !important;
+  background: linear-gradient(90deg, #1d4ed8, #0f766e) !important;
 }
 .ca-history-card {
   border: 1px solid rgba(15, 23, 42, 0.08);
@@ -279,22 +412,81 @@ def _render_progress_panel(
     elapsed: float,
     state: str = "running",
 ) -> None:
-    """
-    Draw the live progress header + Streamlit progress bar.
-
-    Uses lightweight Streamlit widgets (not remounted custom HTML) so
-    fragment auto-refresh does not blink the page.
-    """
+    """Draw the animated live-run progress card + native progress bar."""
     pct = int(round(max(0.0, min(1.0, fraction)) * 100))
+    width = max(0.0, min(100.0, float(pct)))
     title = {
         "running": f"Running {job.capitalize()}",
         "complete": f"{job.capitalize()} complete",
         "error": f"{job.capitalize()} failed",
     }.get(state, f"Running {job.capitalize()}")
-    st.markdown(f"**{title}** · {pct}% · {_format_elapsed(elapsed)}")
-    if stage_message:
-        st.caption(f"Current stage: {stage_message}")
-    st.progress(max(0.0, min(1.0, fraction)))
+    wrap = "ca-run-card"
+    if state == "complete":
+        wrap += " ca-done"
+    elif state == "error":
+        wrap += " ca-error"
+    safe_stage = html.escape(stage_message or "Working…")
+    st.markdown(
+        f"""
+<div class="{wrap}">
+  <div class="ca-run-top">
+    <div class="ca-run-title-row">
+      <div class="ca-spinner" aria-hidden="true"></div>
+      <div>
+        <div class="ca-run-title">{html.escape(title)}</div>
+        <div class="ca-run-sub">Current stage: <strong>{safe_stage}</strong></div>
+      </div>
+    </div>
+    <div class="ca-run-meta">
+      <div class="ca-run-pct">{pct}%</div>
+      <div>{_format_elapsed(elapsed)} elapsed</div>
+    </div>
+  </div>
+  <div class="ca-bar-track" role="progressbar" aria-valuenow="{pct}" aria-valuemin="0" aria-valuemax="100">
+    <div class="ca-bar-fill" style="width: {width:.1f}%;"></div>
+    <div class="ca-bar-glow"></div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_stage_timeline(log_lines: List[str], *, elapsed: float) -> None:
+    """Render recent pipeline stages as a compact animated timeline."""
+    lines = [str(line).lstrip("→ ").strip() for line in (log_lines or []) if str(line).strip()]
+    items_html: List[str] = []
+    if not lines:
+        items_html.append(
+            '<div class="ca-stage-item ca-active">'
+            '<span class="ca-stage-mark"></span>'
+            "<span>Waiting for worker stages…</span>"
+            "</div>"
+        )
+    else:
+        for index, line in enumerate(lines):
+            active = index == len(lines) - 1
+            cls = "ca-stage-item ca-active" if active else "ca-stage-item ca-done"
+            items_html.append(
+                f'<div class="{cls}">'
+                f'<span class="ca-stage-mark"></span>'
+                f"<span>{html.escape(line)}</span>"
+                f"</div>"
+            )
+    st.markdown(
+        f"""
+<div class="ca-stage-panel">
+  <div class="ca-stage-panel-head">
+    <span>Pipeline stages</span>
+    <span>{_format_elapsed(elapsed)}</span>
+  </div>
+  <div class="ca-stage-list">
+    {"".join(items_html)}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def _init_state() -> None:
@@ -762,12 +954,10 @@ def _render_job_monitor_live() -> None:
         help="Uncheck to hide the stage log while the job runs.",
     )
     if st.session_state.get("job_show_stages", True):
-        log_lines = list(st.session_state.job_log or [])
-        st.caption(f"Pipeline stages · {_format_elapsed(elapsed)}")
-        if log_lines:
-            st.markdown("\n".join(f"- {line}" for line in log_lines[-20:]))
-        else:
-            st.caption("Waiting for worker stages…")
+        _render_stage_timeline(
+            list(st.session_state.job_log or [])[-12:],
+            elapsed=elapsed,
+        )
 
 
 def _render_job_monitor() -> None:

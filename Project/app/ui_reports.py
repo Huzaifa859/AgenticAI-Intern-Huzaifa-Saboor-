@@ -254,26 +254,79 @@ def _is_long_log(text: str) -> bool:
     return len(content) > 500 or content.count("\n") >= 12
 
 
+def _render_ungrounded_candidates(candidates: List[Dict[str, Any]]) -> None:
+    """Render findings that failed grounding (never mixed into verified)."""
+    st.markdown("### Unverified (failed grounding)")
+    st.warning(
+        "These candidates were **discarded by grounding** — evidence did not "
+        "match the source at the cited lines. They are **not** verified bugs."
+    )
+    st.caption(f"{len(candidates)} ungrounded candidate(s).")
+    for index, item in enumerate(candidates, start=1):
+        title = (
+            f"{index}. [{item.get('severity') or '?'}] "
+            f"{item.get('bug_type') or 'candidate'} — "
+            f"{item.get('file_path')}:{item.get('line_start')}-"
+            f"{item.get('line_end')}"
+        )
+        with st.expander(title, expanded=index == 1):
+            st.markdown(item.get("description") or "(no description)")
+            st.caption(
+                f"Method: {item.get('detection_method') or '(n/a)'} · "
+                f"Status: {item.get('grounding_status') or '(n/a)'} · "
+                f"Match: {item.get('match_type') or '(n/a)'}"
+            )
+            if item.get("grounding_reason"):
+                st.markdown(f"**Why rejected:** {item.get('grounding_reason')}")
+            if item.get("found_at_line") is not None:
+                st.caption(f"Evidence found near line: {item.get('found_at_line')}")
+            if item.get("evidence"):
+                st.markdown("**Claimed evidence**")
+                st.code(str(item.get("evidence")), language="python")
+            if item.get("actual_source"):
+                st.markdown("**Actual source at cited range**")
+                st.code(str(item.get("actual_source")), language="python")
+            if item.get("suggested_fix"):
+                st.markdown("**Suggested fix (unverified)**")
+                st.markdown(str(item.get("suggested_fix")))
+
+
 def render_analysis_report(report: Any) -> None:
     """Render an analysis report dict in the Streamlit main pane."""
     data = _as_dict(report)
     findings = [dict(item) for item in list(data.get("findings") or [])]
+    candidates = [
+        dict(item) for item in list(data.get("ungrounded_candidates") or [])
+    ]
     severity = _severity_counts(findings)
 
     st.subheader("Analysis report")
     _render_stats(
         [
-            ("Findings", str(len(findings))),
+            ("Verified", str(len(findings))),
             ("High", str(severity["high"])),
             ("Medium", str(severity["medium"])),
             ("Low", str(severity["low"])),
+            ("Ungrounded", str(len(candidates))),
         ]
     )
 
     st.caption(
         f"Duration: {float(data.get('duration_seconds') or 0.0):.1f}s · "
         f"Model used: {'yes' if data.get('model_used') else 'no'} · "
-        f"Duplicates removed: {int(data.get('duplicates_removed') or 0)}"
+        f"Duplicates removed: {int(data.get('duplicates_removed') or 0)} · "
+        f"LLM grounded: {int(data.get('llm_grounded_count') or 0)}"
+    )
+
+    if "analysis_show_ungrounded" not in st.session_state:
+        st.session_state.analysis_show_ungrounded = False
+    show_ungrounded = st.checkbox(
+        "Show ungrounded candidates",
+        key="analysis_show_ungrounded",
+        help=(
+            "Also show LLM/static findings that failed grounding. "
+            "They stay separate from verified findings."
+        ),
     )
 
     if data.get("question"):
@@ -292,84 +345,105 @@ def render_analysis_report(report: Any) -> None:
         with st.expander("Model answer", expanded=False):
             st.markdown(answer)
 
+    st.markdown("### Verified findings")
     if not findings:
         st.info("No verified findings.")
-        return
-
-    st.markdown("### Filter findings")
-    filter_cols = st.columns([2, 3])
-    with filter_cols[0]:
-        selected_severities = st.multiselect(
-            "Severity",
-            options=["High", "Medium", "Low"],
-            default=["High", "Medium", "Low"],
-            key="analysis_severity_filter",
-            help="Show only findings at the selected severity levels.",
-        )
-    with filter_cols[1]:
-        search_query = st.text_input(
-            "Search",
-            value="",
-            key="analysis_findings_search",
-            placeholder="file, function, bug type, description…",
-            help="Case-insensitive match across finding fields.",
-        )
-
-    filtered = _filter_findings(
-        findings,
-        severities=selected_severities or [],
-        query=search_query,
-    )
-    if not selected_severities:
-        st.info("Select at least one severity to show findings.")
-        return
-
-    st.caption(f"Showing {len(filtered)} of {len(findings)} finding(s).")
-    if not filtered:
-        st.warning("No findings match the current severity/search filters.")
-        return
-
-    table_rows: List[Dict[str, object]] = []
-    for finding in filtered:
-        table_rows.append(
-            {
-                "severity": finding.get("severity"),
-                "confidence": round(float(finding.get("confidence") or 0.0), 2),
-                "file": finding.get("file_path"),
-                "lines": f"{finding.get('line_start')}-{finding.get('line_end')}",
-                "type": finding.get("bug_type"),
-                "method": finding.get("detection_method"),
-                "summary": str(finding.get("description") or "")[:120],
-            }
-        )
-    st.dataframe(table_rows, width="stretch", hide_index=True)
-
-    st.markdown("### Finding details")
-    for index, finding in enumerate(filtered, start=1):
-        title = (
-            f"{index}. [{finding.get('severity')}] {finding.get('bug_type')} — "
-            f"{finding.get('file_path')}:{finding.get('line_start')}-"
-            f"{finding.get('line_end')}"
-        )
-        with st.expander(title, expanded=index == 1):
-            st.markdown(finding.get("description") or "(no description)")
-            st.caption(
-                f"Confidence: {float(finding.get('confidence') or 0.0):.2f} · "
-                f"Method: {finding.get('detection_method')} · "
-                f"Function: {finding.get('function_name') or '(n/a)'}"
+    else:
+        filter_cols = st.columns([2, 3])
+        with filter_cols[0]:
+            selected_severities = st.multiselect(
+                "Severity",
+                options=["High", "Medium", "Low"],
+                default=["High", "Medium", "Low"],
+                key="analysis_severity_filter",
+                help="Show only findings at the selected severity levels.",
             )
-            if finding.get("evidence"):
-                st.markdown("**Evidence**")
-                st.code(str(finding.get("evidence")), language="python")
-            if finding.get("suggested_fix"):
-                st.markdown("**Suggested fix**")
-                st.markdown(str(finding.get("suggested_fix")))
-            meta = dict(finding.get("metadata") or {})
-            if meta.get("evidence_relocated"):
-                st.caption(
-                    "Evidence relocated from "
-                    f"{meta.get('original_lines')} → {meta.get('relocated_lines')}"
-                )
+        with filter_cols[1]:
+            search_query = st.text_input(
+                "Search",
+                value="",
+                key="analysis_findings_search",
+                placeholder="file, function, bug type, description…",
+                help="Case-insensitive match across finding fields.",
+            )
+
+        filtered = _filter_findings(
+            findings,
+            severities=selected_severities or [],
+            query=search_query,
+        )
+        if not selected_severities:
+            st.info("Select at least one severity to show findings.")
+        else:
+            st.caption(f"Showing {len(filtered)} of {len(findings)} verified finding(s).")
+            if not filtered:
+                st.warning("No findings match the current severity/search filters.")
+            else:
+                table_rows: List[Dict[str, object]] = []
+                for finding in filtered:
+                    table_rows.append(
+                        {
+                            "severity": finding.get("severity"),
+                            "confidence": round(
+                                float(finding.get("confidence") or 0.0), 2
+                            ),
+                            "file": finding.get("file_path"),
+                            "lines": (
+                                f"{finding.get('line_start')}-"
+                                f"{finding.get('line_end')}"
+                            ),
+                            "type": finding.get("bug_type"),
+                            "method": finding.get("detection_method"),
+                            "summary": str(finding.get("description") or "")[:120],
+                        }
+                    )
+                st.dataframe(table_rows, width="stretch", hide_index=True)
+
+                st.markdown("### Finding details")
+                for index, finding in enumerate(filtered, start=1):
+                    title = (
+                        f"{index}. [{finding.get('severity')}] "
+                        f"{finding.get('bug_type')} — "
+                        f"{finding.get('file_path')}:{finding.get('line_start')}-"
+                        f"{finding.get('line_end')}"
+                    )
+                    with st.expander(title, expanded=index == 1):
+                        st.markdown(
+                            finding.get("description") or "(no description)"
+                        )
+                        st.caption(
+                            f"Confidence: "
+                            f"{float(finding.get('confidence') or 0.0):.2f} · "
+                            f"Method: {finding.get('detection_method')} · "
+                            f"Function: {finding.get('function_name') or '(n/a)'}"
+                        )
+                        if finding.get("evidence"):
+                            st.markdown("**Evidence**")
+                            st.code(
+                                str(finding.get("evidence")), language="python"
+                            )
+                        if finding.get("suggested_fix"):
+                            st.markdown("**Suggested fix**")
+                            st.markdown(str(finding.get("suggested_fix")))
+                        meta = dict(finding.get("metadata") or {})
+                        if meta.get("evidence_relocated"):
+                            st.caption(
+                                "Evidence relocated from "
+                                f"{meta.get('original_lines')} → "
+                                f"{meta.get('relocated_lines')}"
+                            )
+
+    if show_ungrounded:
+        if candidates:
+            _render_ungrounded_candidates(candidates)
+        else:
+            st.markdown("### Unverified (failed grounding)")
+            st.caption("No ungrounded candidates in this run.")
+    elif candidates:
+        st.caption(
+            f"{len(candidates)} ungrounded candidate(s) hidden — "
+            "enable **Show ungrounded candidates** above to inspect them."
+        )
 
 
 def render_documentation_result(
