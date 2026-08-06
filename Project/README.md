@@ -430,14 +430,19 @@ streamlit run app/streamlit_app.py --server.fileWatcherType=none
 
 Agent jobs run in a separate `app/worker.py` process so embedding/LLM memory use cannot kill the Streamlit server. `Project/.streamlit/config.toml` also disables Streamlit's file watcher (Chroma writes used to restart the app mid-run).
 
+While a job runs, the UI polls an NDJSON progress file from the worker and shows **live stage updates** (indexing, model call, grounding, pytest, and similar) in an `st.status` panel. This is stage progress only — not LLM token streaming into the chat pane.
+
+Completed and failed runs are appended to a capped **Run history** (sidebar expander, newest first, max 20). History is kept in `st.session_state` and persisted to `%TEMP%/codebase_assistant_streamlit/ui_run_history.jsonl` so it survives Streamlit script reloads. Selecting an entry restores its result into the matching Analysis / Documentation / Testing tab; a caption notes when you are viewing a historical run.
+
 In the sidebar:
 
 1. Enter a local path (for example `examples/demo_repo`) or a GitHub HTTPS URL and click **Load repository**
 2. Choose **Analysis**, **Documentation**, or **Testing**
 3. For docs/tests, set mode and optional file/function/class targeting
-4. Click **Run** and browse the report tabs in the main pane
+4. Click **Run** — watch stage progress, then browse the report tabs
+5. Open **Run history** to revisit prior runs or clear the list
 
-Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`. Agent logic stays inside `codebase_assistant/`.
+Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`; history helpers live in `app/ui_history.py`. Agent logic stays inside `codebase_assistant/`.
 
 ---
 
@@ -562,6 +567,8 @@ Project/
 │   ├── report_formatter.py     # Terminal report formatting
 │   ├── service.py              # Shared non-interactive orchestration
 │   ├── ui_reports.py           # Streamlit report renderers
+│   ├── ui_history.py           # Capped run-history load/save helpers
+│   ├── worker.py               # Isolated agent job subprocess (+ progress NDJSON)
 │   └── streamlit_app.py        # Streamlit web UI entry point
 ├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
@@ -605,7 +612,7 @@ Project/
 - Broader language support beyond Python bug detection
 - Richer coverage measurement for generated tests
 - Production-ready Docker / Compose deployment with Jupyter + Ollama
-- Richer Streamlit UX (background jobs, run history, live progress streaming)
+- Richer Streamlit UX (background job cancel/kill, true LLM token streaming)
 - CI integration for repository checks on pull requests
 - Deeper semantic code search and explanation skills
 - Networked MCP transport (stdio / HTTP) for external host applications
