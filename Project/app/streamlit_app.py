@@ -273,45 +273,28 @@ def _stage_progress(job: str, stage: str, current: float) -> float:
 
 def _render_progress_panel(
     *,
-    placeholder: Any,
     job: str,
     fraction: float,
     stage_message: str,
     elapsed: float,
     state: str = "running",
 ) -> None:
-    """Draw the progress header + Streamlit progress bar."""
+    """
+    Draw the live progress header + Streamlit progress bar.
+
+    Uses lightweight Streamlit widgets (not remounted custom HTML) so
+    fragment auto-refresh does not blink the page.
+    """
     pct = int(round(max(0.0, min(1.0, fraction)) * 100))
     title = {
         "running": f"Running {job.capitalize()}",
         "complete": f"{job.capitalize()} complete",
         "error": f"{job.capitalize()} failed",
     }.get(state, f"Running {job.capitalize()}")
-    wrap_class = "ca-progress-wrap"
-    if state == "complete":
-        wrap_class += " ca-done"
-    elif state == "error":
-        wrap_class += " ca-error"
-    safe_stage = html.escape(stage_message or "")
-    stage_html = (
-        f'<div class="ca-stage-line">Current stage: <strong>{safe_stage}</strong></div>'
-        if safe_stage
-        else ""
-    )
-    with placeholder.container():
-        st.markdown(
-            f"""
-<div class="{wrap_class}">
-  <div class="ca-progress-head">
-    <div class="ca-progress-title"><span class="ca-dot"></span>{title}</div>
-    <div class="ca-progress-meta">{pct}% · {_format_elapsed(elapsed)}</div>
-  </div>
-  {stage_html}
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-        st.progress(max(0.0, min(1.0, fraction)))
+    st.markdown(f"**{title}** · {pct}% · {_format_elapsed(elapsed)}")
+    if stage_message:
+        st.caption(f"Current stage: {stage_message}")
+    st.progress(max(0.0, min(1.0, fraction)))
 
 
 def _init_state() -> None:
@@ -333,6 +316,7 @@ def _init_state() -> None:
         "active_result_tab": "Analysis",
         "active_job": None,
         "job_log": [],
+        "job_show_stages": True,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -595,6 +579,8 @@ def _start_worker(
 
     started = time.monotonic()
     st.session_state.job_log = ["Queued — launching isolated worker process…"]
+    # Reset stages visibility for each new run; user can hide during the run.
+    st.session_state.job_show_stages = True
     st.session_state.active_job = {
         "pid": int(process.pid or 0),
         "job": job,
@@ -740,7 +726,7 @@ def _poll_active_job() -> None:
         _finalize_active_job(cancelled=False)
 
 
-@st.fragment(run_every=timedelta(seconds=1))
+@st.fragment(run_every=timedelta(seconds=1.5))
 def _render_job_monitor_live() -> None:
     """Live progress panel + Stop control while a worker is running."""
     _poll_active_job()
@@ -760,24 +746,26 @@ def _render_job_monitor_live() -> None:
             st.rerun()
             return
 
-    panel = st.empty()
     _render_progress_panel(
-        placeholder=panel,
         job=job,
         fraction=float(job_state.get("fraction") or 0.02),
         stage_message=str(job_state.get("stage_message") or "Working…"),
         elapsed=elapsed,
         state="running",
     )
-    # Prefer a plain expander over st.status here — status widgets can
-    # interact badly with fragment auto-refresh and toolbar chrome.
-    log_lines = list(st.session_state.job_log or [])
-    with st.expander(
-        f"Pipeline stages · {_format_elapsed(elapsed)}",
-        expanded=True,
-    ):
+
+    # Checkbox state persists across fragment refreshes (unlike expander
+    # with expanded=True, which kept forcing itself open).
+    st.checkbox(
+        "Show pipeline stages",
+        key="job_show_stages",
+        help="Uncheck to hide the stage log while the job runs.",
+    )
+    if st.session_state.get("job_show_stages", True):
+        log_lines = list(st.session_state.job_log or [])
+        st.caption(f"Pipeline stages · {_format_elapsed(elapsed)}")
         if log_lines:
-            st.markdown("\n".join(f"- {line}" for line in log_lines))
+            st.markdown("\n".join(f"- {line}" for line in log_lines[-20:]))
         else:
             st.caption("Waiting for worker stages…")
 
