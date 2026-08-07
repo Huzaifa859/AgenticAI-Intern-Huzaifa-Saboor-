@@ -28,7 +28,6 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 - [Environment Variables](#environment-variables)
 - [CLI Usage](#cli-usage)
 - [Web UI](#web-ui)
-- [Screenshots](#screenshots)
 - [Example Outputs](#example-outputs)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
@@ -51,7 +50,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 | Quality | Grounding checker rejects hallucinated evidence before it reaches the user |
 | Models | OpenRouter with automatic model fallback; optional local Ollama |
 | Retrieval | Optional cross-encoder reranking (disabled by default) |
-| Memory | Short-term conversation memory with automatic summarization and disk persistence |
+| Memory | Short-term conversation memory (CLI + Streamlit session memory) with disk persistence |
 | Observability | End-to-end tracing with ordered events and JSON export |
 | Tools | Shared `ToolRegistry` for filesystem and GitHub tools |
 | MCP | In-process MCP foundation plus official **stdio** server for external hosts (`analysis_run`, `documentation_run`, `testing_run`, `goal_run`) |
@@ -80,7 +79,7 @@ flowchart TD
     Shared --> Providers[OpenRouter / Ollama Providers]
 ```
 
-The Supervisor owns shared services and dispatches each request to the correct agent. Agents do not invent a second routing layer — CLI and MCP both call the same Supervisor pipelines.
+The Supervisor owns shared services and dispatches each request to the correct agent. Agents do not invent a second routing layer — CLI, Streamlit (`worker.py`), and MCP all call the same Supervisor pipelines.
 
 Editable architecture references also live under [`docs/architecture.excalidraw`](docs/architecture.excalidraw) and [`docs/architecture.png`](docs/architecture.png).
 
@@ -194,7 +193,7 @@ pip install -r codebase_assistant/requirements.txt   # includes mcp>=1.28,<2
 python -m codebase_assistant.mcp --help
 python -m codebase_assistant.mcp --list-tools
 python -m codebase_assistant.mcp                 # blocks; hosts attach via stdio
-# Or: run_mcp.bat
+# Or: run_mcp.bat / run_mcp_claude.bat
 ```
 
 Logging goes to **stderr**. Do not print app progress on stdout — that channel is the MCP wire.
@@ -218,7 +217,9 @@ Point the host at the Project directory and your Python interpreter:
 }
 ```
 
-Use an absolute `cwd` so imports and `examples/demo_repo` resolve correctly. Long agent runs may hit host tool timeouts — prefer targeted `documentation_run` / `testing_run` calls in interactive hosts.
+On Windows, Claude Desktop (especially the Store build) is often more reliable when `command` points at `run_mcp_claude.bat` with the same `cwd` / `env`. Check connection status under **Settings → Developer → Local MCP servers**. In chat, tools appear under **`+` → Connectors** (there is no separate hammer icon in current Claude UI).
+
+Use an absolute `cwd`, and prefer absolute repository paths in tool args (for example the full path to `examples/demo_repo`). Host clients often impose short tool timeouts (~a few minutes): full `analysis_run` (embed + index + LLM) can exceed that on a cold start. Pre-warm once via CLI/Streamlit, or demo long Analysis in Streamlit and use MCP for shorter `documentation_run` / `testing_run` calls.
 
 The in-process server still owns a Supervisor instance, mirrors its `ToolRegistry`, and records MCP request/response/tool traces. HTTP / SSE MCP and a Docker MCP service are not included yet.
 
@@ -228,10 +229,15 @@ The in-process server still owns a Supervisor instance, mirrors its `ToolRegistr
 
 | Component | Role |
 |---|---|
-| `ConversationMemory` | Short-term turn history used during a CLI/session run |
+| `ConversationMemory` | Short-term turn history (repo/targets/short summaries) for a session |
 | `MemoryStore` | Persistent on-disk store for conversation snapshots |
 | Summarization | When history exceeds the configured message cap, older turns are condensed via the LLM into a system summary |
 | Persistence | After each update (and after successful summarization), state is saved through `MemoryStore` |
+| Shared helpers | `app/ui_memory.py` — used by the CLI and the Streamlit UI |
+
+**CLI:** Supervisor-backed memory records short turns across interactive / `--agent` runs.
+
+**Streamlit:** The UI process owns a separate snapshot (`conversation_id=streamlit_default` under `%TEMP%/codebase_assistant_streamlit/memory_store`), shown in the **Session memory** sidebar expander. It prefills repo/target fields and is distinct from **Run history**. Memory turns are not injected into agent LLM prompts.
 
 If the provider is unavailable during summarization, history is left unchanged so no turns are lost.
 
@@ -239,7 +245,7 @@ If the provider is unavailable during summarization, history is left unchanged s
 
 ## Tracing
 
-`Tracer` records ordered lifecycle events for a run.
+`Tracer` records ordered lifecycle events for a run. Lifecycle **hooks** (`HookManager` + `TracingHook` / `LoggingHook`) fire at ingest, agent, model, and tool boundaries and can bridge into the same Tracer.
 
 **What gets traced**
 
@@ -248,6 +254,8 @@ If the provider is unavailable during summarization, history is left unchanged s
 - Ingestion / retrieval / model / tool calls
 - Memory summarization
 - MCP request, tool invoked, and MCP response (with duration and success)
+
+**Streamlit:** the worker wraps `tracer.record` and forwards selected stage names to an NDJSON progress file so the UI can show live stage updates (not token streaming).
 
 **Event model**
 
@@ -504,38 +512,6 @@ Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_re
 
 ---
 
-## Screenshots
-
-Add real screenshots under [`docs/images/`](docs/images/) when available. Placeholder captions:
-
-### CLI menu
-
-![CLI menu](docs/images/cli-menu.png)
-
-_Interactive agent selection after repository preparation._
-
-### Analysis output
-
-![Analysis output](docs/images/analysis-output.png)
-
-_Severity-grouped findings with grounded evidence snippets._
-
-### Documentation output
-
-![Documentation output](docs/images/documentation-output.png)
-
-_Structured documentation result for a target module or README._
-
-### Testing output
-
-![Testing output](docs/images/testing-output.png)
-
-_Generated pytest sources and local execution summary._
-
-> Image files are not bundled yet. See [`docs/images/README.md`](docs/images/README.md) for suggested filenames.
-
----
-
 ## Example Outputs
 
 ### CodeAnalysisReport (shortened)
@@ -632,11 +608,11 @@ Project/
 │   └── streamlit_app.py        # Streamlit web UI entry point
 ├── run_ui.bat                  # Launch Streamlit UI
 ├── run_mcp.bat                 # Launch MCP stdio server
+├── run_mcp_claude.bat          # Claude Desktop-friendly MCP launcher
 ├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
 │   ├── architecture.excalidraw
-│   ├── architecture.png
-│   └── images/                 # Screenshot drop zone
+│   └── architecture.png
 └── codebase_assistant/
     ├── config.py
     ├── supervisor.py
@@ -647,7 +623,11 @@ Project/
     ├── models/                 # LLMClient + OpenRouter/Ollama providers
     ├── memory/                 # ConversationMemory + MemoryStore
     ├── tracing/                # Tracer + TraceEvent
+    ├── hooks/                  # Lifecycle HookManager + default hooks
     ├── mcp/                    # In-process MCP + stdio FastMCP bridge
+    │   ├── server.py / client.py
+    │   ├── stdio_server.py     # Official stdio protocol bridge
+    │   └── __main__.py         # python -m codebase_assistant.mcp
     ├── schemas/
     ├── tests/
     └── requirements.txt
@@ -662,7 +642,8 @@ Project/
 - Generated tests can fail or need manual refinement for complex modules.
 - Cross-encoder reranking is optional and **disabled by default**.
 - MCP **HTTP / SSE** remote transport is not implemented (stdio + in-process only).
-- Long MCP agent runs may hit host client timeouts.
+- Long MCP agent runs (especially cold `analysis_run`) may hit host client timeouts; prefer Streamlit/CLI for long demos.
+- Skills and plugins packages are scaffolding only (not production features).
 - GitHub **write** operations require authentication via `GITHUB_TOKEN`.
 - Docker files exist as deployment scaffolding and are not yet a polished one-command production stack.
 - Supervisor routing is keyword/goal based, not full LLM task planning.
