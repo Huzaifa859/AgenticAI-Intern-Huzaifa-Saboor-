@@ -687,3 +687,295 @@ Created a reusable demonstration repository and runner script showcasing the com
 
 **result:**
 Updated the .gitignore to ignore runtime data and build artifacts while preserving tracked example configuration files.
+
+## week 7 + 8 — multi-agent assistant, streamlit, mcp & docker
+
+---
+
+### openrouter provider
+
+**prompt:**
+"Week 7 Task 1 — Implement the real OpenRouterProvider. Make real HTTPS chat completions requests, read the API key from Config/environment, support retries with exponential backoff for transient errors, implement is_available(), and return the existing ModelResponse schema without changing public interfaces."
+
+**result:**
+Implemented OpenRouterProvider with requests-based chat completions, env-based API key, retries, availability checks, and ModelResponseError on empty/malformed assistant content.
+
+---
+
+### wire openrouter into supervisor
+
+**prompt:**
+"Implement Week 7 Phase 1 - Step 2: Wire the real OpenRouterProvider into the Supervisor and ModelClient. Do not modify analysis, grounding, or static analysis logic — only wire the existing provider into the dependency graph."
+
+**result:**
+Supervisor now injects an OpenRouter-backed LLMClient so CodeAnalysisAgent can run LLM-assisted analysis when a key is available.
+
+---
+
+### end-to-end llm analysis pipeline
+
+**prompt:**
+"Implement Week 7 Phase 1 - Step 3: Verify and complete the first end-to-end LLM analysis pipeline using the local .env OpenRouter key. Do not redesign architecture or commit .env."
+
+**result:**
+Confirmed Indexer → Retriever → prompt → OpenRouter → grounding works end-to-end; fixed duplicate indexing/RAG wiring so one Indexer/Retriever is reused per repository run.
+
+---
+
+### ollama provider
+
+**prompt:**
+"Implement Week 7 Phase 2 - Step 1: Real OllamaProvider. Only implement the existing OllamaProvider scaffold — real local HTTP calls, is_available(), and ModelResponse — without changing public interfaces."
+
+**result:**
+Implemented OllamaProvider against the local Ollama HTTP API with availability probing and the shared ModelResponse shape.
+
+---
+
+### documentation agent llm wiring
+
+**prompt:**
+"Implement Week 7 Phase 2 - Step 2a/2b: Wire OllamaProvider into Supervisor and give DocumentationAgent its own LLMClient via dependency injection without implementing the agent pipeline yet."
+
+**result:**
+Supervisor constructs a docs-oriented LLMClient and injects it into DocumentationAgent while leaving agent business logic unchanged.
+
+---
+
+### documentation agent pipeline
+
+**prompt:**
+"Implement Week 7 Phase 2 - Step 3a: Implement the DocumentationAgent pipeline using the injected LLMClient, existing RAG retrieval, and DocumentationResult schema. Do not modify Supervisor, providers, or CodeAnalysisAgent."
+
+**result:**
+DocumentationAgent indexes/retrieves context, calls the LLM, parses structured documentation output, and returns DocumentationResult; tests cover success, empty context, unavailable provider, and malformed responses.
+
+---
+
+### openrouter + llm/rag tests
+
+**prompt:**
+"Add unit tests for OpenRouterProvider and integration tests for the full LLM + RAG analysis pipeline. Do not modify production code unless a test exposes a real bug."
+
+**result:**
+Added mocked OpenRouter unit tests and pipeline integration coverage for indexing, retrieval, prompt building, and grounded LLM analysis paths.
+
+---
+
+### testing agent
+
+**prompt:**
+"Implement Week 7 Phase 2: Create a real TestingAgent following DocumentationAgent style. Generate grounded pytest tests from repository context without redesigning architecture or changing public interfaces."
+
+**result:**
+Implemented TestingAgent with prompt packing, context retrieval, structured test generation, and unit tests for prompt/context construction.
+
+---
+
+### github url cli support
+
+**prompt:**
+"Implement GitHub repository URL support in the CLI using existing GitHubTools so users can pass either a local path or a GitHub URL."
+
+**result:**
+CLI clones public GitHub URLs into a temp directory, runs the same agent pipelines, and cleans up afterward.
+
+---
+
+### multi-agent interactive cli
+
+**prompt:**
+"Implement a multi-agent interactive CLI that exposes Analysis, Documentation, and Testing through app/main.py without merging agent logic or changing public agent interfaces."
+
+**result:**
+Unified interactive menu and non-interactive flags so one CLI entry point can dispatch to all three agents through Supervisor.
+
+---
+
+### documentation on openrouter + model fallback
+
+**prompt:**
+"Upgrade DocumentationAgent to use OpenRouter for repository documentation generation, and implement automatic OpenRouter model fallback when the primary model is unavailable or out of credits."
+
+**result:**
+Docs generation moved onto OpenRouter with configurable fallback models so demos keep working when a free-tier model is rate-limited.
+
+---
+
+### supervisor goal and task routing
+
+**prompt:**
+"Implement Supervisor.handle_goal() with deterministic rule-based orchestration, upgrade handle_task() to dispatch to real agent pipelines, and aggregate multi-agent results without stopping when one agent fails."
+
+**result:**
+Supervisor routes goals/tasks to Analysis/Documentation/Testing, continues after partial failures, and returns ordered aggregated AgentResponse results.
+
+---
+
+### tool registry integration
+
+**prompt:**
+"Register filesystem and GitHub tools in ToolRegistry during Supervisor initialization, then update agents to resolve tools through the registry instead of constructing them directly."
+
+**result:**
+ToolRegistry became the shared access point for filesystem/GitHub tools used by Supervisor and agents.
+
+---
+
+### conversation memory and persistence
+
+**prompt:**
+"Implement ConversationMemory.summarize(), persistent MemoryStore under .codebase_assistant/memory_store/, and wire memory into normal CLI usage without changing public interfaces or agent business logic."
+
+**result:**
+Long conversations can be summarized with the LLM, snapshots persist across runs, and the CLI records load/run turns in ConversationMemory.
+
+---
+
+### retriever reranking
+
+**prompt:**
+"Implement Retriever.rerank() with optional cross-encoder reranking and a config toggle. If no reranker is available, return the original retrieval results."
+
+**result:**
+Optional reranking sits behind config; retrieval still works when the reranker dependency/model is unavailable.
+
+---
+
+### testing execution + tracing
+
+**prompt:**
+"Extend TestingAgent to execute generated pytest tests and record real pass/fail results. Also wire the existing Tracer across CLI → Supervisor → agents so every execution is observable."
+
+**result:**
+Generated tests are executed with pytest, results populate TestingResult execution fields, and end-to-end traces export ordered events.
+
+---
+
+### github api tools
+
+**prompt:**
+"Implement GitHub REST API read and write operations in github_tools.py only — get file content, list files/issues, create/update files and related write helpers — without modifying agents or Supervisor."
+
+**result:**
+GitHubTools gained real authenticated REST read/write methods while keeping ToolRegistry and agent interfaces unchanged.
+
+---
+
+### mcp foundation and agent tools
+
+**prompt:**
+"Implement the MCP server foundation and MCP agent endpoints so external clients can run the same Analysis/Documentation/Testing/goal pipelines through Supervisor without duplicating agent logic."
+
+**result:**
+In-process MCP scaffolding exposes analysis_run, documentation_run, testing_run, and goal_run over the Supervisor pipelines used by the CLI.
+
+---
+
+### abstention, benchmarks, and model comparison
+
+**prompt:**
+"Add explicit abstention when evidence is insufficient, a reproducible evaluation benchmark suite, and a notebook that compares multiple LLMs on the same repository/task without changing production agent behavior."
+
+**result:**
+Agents can abstain with structured reasons; benchmarks measure existing pipelines; a comparison notebook documents multi-model behavior on shared tasks.
+
+---
+
+### docs/testing quality loop
+
+**prompt:**
+"Upgrade TestingAgent with a one-shot repair loop on pytest failures, ground DocumentationAgent claims against the repository inventory, replace LLM coverage estimates with real pytest-cov, add JSON retries for docs, and support optional documentation write-back."
+
+**result:**
+Docs and tests gained repair/grounding/coverage/write-back behavior so demos keep imperfect but usable outputs instead of failing closed.
+
+---
+
+### richer cli targeting flags
+
+**prompt:**
+"Enhance the interactive CLI and non-interactive flags so users can target file/function/class documentation and testing modes that the agents already support, without changing agent implementations."
+
+**result:**
+CLI exposes docs/testing target modes and write-back options that map onto existing agent capabilities.
+
+---
+
+### openrouter → ollama failover
+
+**prompt:**
+"Implement transparent provider failover behind the existing LLM client with a ProviderManager that automatically chooses between OpenRouter and Ollama without changing any agent APIs."
+
+**result:**
+LLMClient/ProviderManager fails over from OpenRouter to Ollama when OpenRouter is unavailable, keeping agent call sites unchanged.
+
+---
+
+### lifecycle hooks
+
+**prompt:**
+"Utilize lifecycle hooks — wire the existing hooks scaffold into Supervisor, agents, and LLMClient so before/after stages are observable without redesigning agent business logic."
+
+**result:**
+Lifecycle hooks fire around supervisor/agent/LLM stages and show up in traces for debugging and demos.
+
+---
+
+### streamlit web ui
+
+**prompt:**
+"ok lets use streamlit tell me step by step how we will implement this frontend — then implement the Streamlit frontend with an isolated worker process so embedding/LLM memory pressure cannot kill the Streamlit server."
+
+**result:**
+Added Streamlit UI (`app/streamlit_app.py` + `worker.py`) that loads a repo and runs Analysis/Documentation/Testing through the same Supervisor pipelines as the CLI.
+
+---
+
+### streamlit run history and live progress
+
+**prompt:**
+"Streamlit is basic (no run history / live streaming) — generate and implement a plan for capped run history, live stage progress from worker NDJSON, cancel support, richer reports, exports, and polished progress UX."
+
+**result:**
+UI gained live stage timeline/progress bar, Stop run, run history JSONL, markdown/JSON downloads, auto-focus result tabs, and ungrounded-candidate display for Analysis.
+
+---
+
+### streamlit conversation memory
+
+**prompt:**
+"Streamlit Conversation Memory (CLI Parity) — keep ConversationMemory + MemoryStore in the Streamlit parent process (not the worker), prefill sidebar targets, record Load/Run summaries, and persist under the Streamlit data dir."
+
+**result:**
+Session memory expander mirrors CLI memory semantics with conversation id `streamlit_default`, separate from run history.
+
+---
+
+### mcp stdio server
+
+**prompt:**
+"lets add/complete mcp first — Complete MCP: Stdio Protocol + CLI Entrypoint using the official MCP SDK so Claude Desktop / Cursor can call analysis_run, documentation_run, testing_run, and goal_run over stdio."
+
+**result:**
+Added `python -m codebase_assistant.mcp` stdio server, launcher scripts, and README setup notes for external MCP hosts.
+
+---
+
+### streamlit docker deployment
+
+**prompt:**
+"Streamlit Docker Deployment (Necessary Scope) — rewrite Dockerfile/compose for Streamlit on :8501 with OpenRouter, /data volume for chroma/memory/history, healthcheck, non-root user, .dockerignore/.env.example, and README Docker docs. Do not include Ollama/Jupyter/MCP sidecars in Compose."
+
+**result:**
+`docker compose up --build` serves the UI at http://localhost:8501 with persistent `/data`, env-file secrets, and pip timeout/retries for slow PyPI downloads.
+
+---
+
+### docker job-complete hang fix
+
+**prompt:**
+"yes it gets stuck on job complete part at 100%. U test it"
+
+**result:**
+Confirmed Linux zombie worker PIDs left the Streamlit bar at 100% after success; fixed process reaping / finalize-on-result so Docker runs clear the progress panel when the job finishes.
