@@ -28,6 +28,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 - [Environment Variables](#environment-variables)
 - [CLI Usage](#cli-usage)
 - [Web UI](#web-ui)
+- [Docker](#docker)
 - [Example Outputs](#example-outputs)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
@@ -54,7 +55,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 | Observability | End-to-end tracing with ordered events and JSON export |
 | Tools | Shared `ToolRegistry` for filesystem and GitHub tools |
 | MCP | In-process MCP foundation plus official **stdio** server for external hosts (`analysis_run`, `documentation_run`, `testing_run`, `goal_run`) |
-| Interfaces | Interactive CLI menu, non-interactive `--agent` mode, Streamlit web UI, and Jupyter demo notebook |
+| Interfaces | Interactive CLI, Streamlit web UI (local or Docker), MCP stdio, and Jupyter demo notebook |
 
 ---
 
@@ -495,7 +496,7 @@ While a job runs, the UI polls an NDJSON progress file from the worker and shows
 
 Completed, failed, and cancelled runs are appended to a capped **Run history** (sidebar expander, newest first, max 20). Each row shows your **local device time** plus a short result summary. History is kept in `st.session_state` and persisted to `%TEMP%/codebase_assistant_streamlit/ui_run_history.jsonl` so it survives Streamlit script reloads. Selecting an entry restores its result and auto-opens the matching result pane. Each result pane can **Download Markdown** or **Download JSON**.
 
-Separately, the UI keeps **Session memory** (same `ConversationMemory` + `MemoryStore` pattern as the CLI): last repository reference/path, docs/testing target fields, and short Load/Run summaries. Memory lives in the Streamlit process (not the worker), prefills sidebar defaults, and persists under `%TEMP%/codebase_assistant_streamlit/memory_store` with conversation id `streamlit_default`. It is not a chat pane and is not injected into agent LLM prompts. **Run history** remains the result browser; **Session memory** is conversational/session context only. Use **Clear memory** in the sidebar expander to reset both in-memory state and the disk snapshot.
+Separately, the UI keeps **Session memory** (same `ConversationMemory` + `MemoryStore` pattern as the CLI): last repository reference/path, docs/testing target fields, and short Load/Run summaries. Memory lives in the Streamlit process (not the worker), prefills sidebar defaults, and persists under the Streamlit data dir (`%TEMP%/codebase_assistant_streamlit/` locally, or `/data/...` in Docker) with conversation id `streamlit_default`. It is not a chat pane and is not injected into agent LLM prompts. **Run history** remains the result browser; **Session memory** is conversational/session context only. Use **Clear memory** in the sidebar expander to reset both in-memory state and the disk snapshot.
 
 On Analysis reports, enable **Show ungrounded candidates** to inspect findings that failed grounding. They appear in a separate **Unverified** section and are never mixed into verified bugs.
 
@@ -508,7 +509,54 @@ In the sidebar:
 5. Open **Run history** to revisit prior runs or clear the list
 6. Open **Session memory** to review remembered repo/targets/short turns, or clear memory
 
-Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`; history helpers live in `app/ui_history.py`; conversation-memory helpers live in `app/ui_memory.py`; export helpers live in `app/ui_export.py`. Agent logic stays inside `codebase_assistant/`.
+Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`; history helpers live in `app/ui_history.py`; conversation-memory helpers live in `app/ui_memory.py`; path helpers live in `app/ui_paths.py`; export helpers live in `app/ui_export.py`. Agent logic stays inside `codebase_assistant/`.
+
+---
+
+## Docker
+
+Run the Streamlit UI in a container with OpenRouter (no Ollama/Jupyter/MCP in this Compose stack).
+
+```bash
+cd Project
+cp .env.example .env   # set OPENROUTER_API_KEY
+docker compose up --build
+# open http://localhost:8501
+```
+
+First build is large/slow (PyTorch / `sentence-transformers` stack). Later rebuilds reuse the pip layer when only app code changes. Secrets come from `.env` via Compose — `.env` is listed in `.dockerignore` and must not be baked into the image.
+
+### Docker Architecture
+
+```text
+Browser
+   │
+   ▼
+Streamlit (:8501)
+   │
+   ▼
+Supervisor  (+ worker subprocess in same container)
+   │
+   ▼
+Agents (Analysis / Documentation / Testing)
+   │
+   ▼
+OpenRouter
+```
+
+### Persistent volume (`ca_data` → `/data`)
+
+```text
+/data
+ ├── chroma/          # CHROMA_PERSIST_DIR
+ ├── memory/          # MEMORY_STORE_PATH (session ConversationMemory)
+ └── history/
+     └── ui_run_history.jsonl   # RUN_HISTORY_PATH
+```
+
+Compose sets `CODEBASE_ASSISTANT_DATA_DIR`, `CHROMA_PERSIST_DIR`, `MEMORY_STORE_PATH`, and `RUN_HISTORY_PATH`. Local `run_ui.bat` still defaults under the OS temp directory when those env vars are unset.
+
+The service uses `restart: unless-stopped` and a `curl` healthcheck against Streamlit’s `/_stcore/health`. Only port `8501` is published. MCP remains a host-local stdio process (`python -m codebase_assistant.mcp`), not a Compose service.
 
 ---
 
@@ -603,12 +651,17 @@ Project/
 │   ├── ui_reports.py           # Streamlit report renderers
 │   ├── ui_history.py           # Capped run-history load/save helpers
 │   ├── ui_memory.py            # Shared ConversationMemory helpers (CLI + Streamlit)
+│   ├── ui_paths.py             # DATA_DIR / Chroma / memory / history path helpers
 │   ├── ui_export.py            # Markdown/JSON download helpers
 │   ├── worker.py               # Isolated agent job subprocess (+ progress NDJSON)
 │   └── streamlit_app.py        # Streamlit web UI entry point
 ├── run_ui.bat                  # Launch Streamlit UI
 ├── run_mcp.bat                 # Launch MCP stdio server
 ├── run_mcp_claude.bat          # Claude Desktop-friendly MCP launcher
+├── Dockerfile                  # Streamlit image (OpenRouter)
+├── docker-compose.yml          # app service on :8501 + /data volume
+├── .dockerignore
+├── .env.example                # OPENROUTER_API_KEY template
 ├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
 │   ├── architecture.excalidraw
@@ -645,7 +698,7 @@ Project/
 - Long MCP agent runs (especially cold `analysis_run`) may hit host client timeouts; prefer Streamlit/CLI for long demos.
 - Skills and plugins packages are scaffolding only (not production features).
 - GitHub **write** operations require authentication via `GITHUB_TOKEN`.
-- Docker files exist as deployment scaffolding and are not yet a polished one-command production stack.
+- Docker Compose ships Streamlit + OpenRouter only (no Ollama/Jupyter/MCP sidecar in this stack).
 - Supervisor routing is keyword/goal based, not full LLM task planning.
 
 ---
@@ -655,7 +708,7 @@ Project/
 - LLM-driven planning and task decomposition in the Supervisor
 - Broader language support beyond Python bug detection
 - Richer coverage measurement for generated tests
-- Production-ready Docker / Compose deployment (Streamlit and/or Jupyter + Ollama)
+- Optional Ollama / Jupyter Compose sidecars alongside Streamlit
 - Streamlit LLM token streaming (job cancel/kill already shipped)
 - CI integration for repository checks on pull requests
 - Deeper semantic code search and explanation skills

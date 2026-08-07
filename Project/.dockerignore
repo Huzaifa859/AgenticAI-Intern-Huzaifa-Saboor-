@@ -1,0 +1,32 @@
+# Keep secrets and local junk out of the build context.
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.git/
+.gitignore
+.ipynb_checkpoints/
+
+# Local runtime / vector stores
+.codebase_assistant/
+**/chroma_store/
+**/.chroma/
+*.sqlite3
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docs noise / large local artifacts
+*.log
+benchmarks/results/*

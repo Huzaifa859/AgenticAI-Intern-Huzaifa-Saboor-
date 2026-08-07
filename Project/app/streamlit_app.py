@@ -77,6 +77,7 @@ from ui_memory import (  # noqa: E402
     summarize_documentation_for_memory,
     summarize_testing_for_memory,
 )
+from ui_paths import chroma_persist_dir, memory_store_path  # noqa: E402
 from ui_reports import (  # noqa: E402
     render_analysis_report,
     render_documentation_result,
@@ -736,7 +737,7 @@ def _tail_progress(
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if ``pid`` still looks alive."""
+    """Return True if ``pid`` still looks alive (not exited / not a zombie)."""
     if pid <= 0:
         return False
     if sys.platform == "win32":
@@ -752,11 +753,55 @@ def _pid_alive(pid: int) -> bool:
             return str(pid) in (completed.stdout or "")
         except OSError:
             return False
+    # Reap our own exited children so they don't linger as zombies. On Linux,
+    # os.kill(pid, 0) still succeeds for zombies, which previously left the UI
+    # stuck at 100% after "job complete".
+    try:
+        waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("State:"):
+                    # Z = zombie (exited, not yet reaped)
+                    return "Z" not in line.split()[1:2]
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def _worker_exited(job_state: Dict[str, Any]) -> bool:
+    """Return True when the worker subprocess has exited (or is a zombie)."""
+    process = job_state.get("process")
+    if isinstance(process, subprocess.Popen):
+        try:
+            if process.poll() is not None:
+                return True
+        except OSError:
+            return True
+    return not _pid_alive(int(job_state.get("pid") or 0))
+
+
+def _result_ready(job_state: Dict[str, Any]) -> bool:
+    """True when the worker wrote a finished result payload we can consume."""
+    out_path = str(job_state.get("out_path") or "")
+    if not out_path or not os.path.isfile(out_path):
+        return False
+    try:
+        with open(out_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and ("ok" in payload)
 
 
 def _kill_pid(pid: int) -> None:
@@ -773,6 +818,10 @@ def _kill_pid(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
         pass
 
 
@@ -878,9 +927,8 @@ def _start_worker(
         cmd.append("--replace-existing")
 
     env = os.environ.copy()
-    runtime_root = os.path.join(tempfile.gettempdir(), "codebase_assistant_streamlit")
-    env.setdefault("CHROMA_PERSIST_DIR", os.path.join(runtime_root, "chroma"))
-    env.setdefault("MEMORY_STORE_PATH", os.path.join(runtime_root, "memory_store"))
+    env.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
+    env.setdefault("MEMORY_STORE_PATH", memory_store_path())
 
     err_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
     try:
@@ -909,6 +957,8 @@ def _start_worker(
     st.session_state.job_show_stages = True
     st.session_state.active_job = {
         "pid": int(process.pid or 0),
+        # Keep the Popen handle so we can poll()/wait() and reap zombies on Linux.
+        "process": process,
         "job": job,
         "agent": agent,
         "target": target,
@@ -928,6 +978,7 @@ def _start_worker(
         "last_creep": started,
         "last_message": "",
         "cancelled": False,
+        "terminal_stage": False,
     }
     st.session_state.last_agent = agent
     st.session_state.last_error = ""
@@ -949,10 +1000,18 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
     progress_path = str(job_state.get("progress_path") or "")
     stderr_path = str(job_state.get("stderr_path") or "")
     pid = int(job_state.get("pid") or 0)
+    process = job_state.get("process")
 
     try:
         if cancelled:
-            _kill_pid(pid)
+            if isinstance(process, subprocess.Popen):
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    _kill_pid(pid)
+            else:
+                _kill_pid(pid)
             message = f"{agent} cancelled by user"
             st.session_state.last_error = message
             _record_history(
@@ -1013,6 +1072,31 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
         _record_job_memory(job_state, ok=False, error=message)
         _set_active_tab(agent)
     finally:
+        if isinstance(process, subprocess.Popen):
+            try:
+                if process.poll() is None:
+                    # Result is already on disk; don't hang the UI on slow
+                    # interpreter teardown (common with embedding libs).
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        try:
+                            process.wait(timeout=2)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        process.wait(timeout=0.1)
+                    except Exception:
+                        pass
+            except Exception:
+                _kill_pid(pid)
+        elif pid > 0 and sys.platform != "win32":
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
         _cleanup_paths(out_path, progress_path, stderr_path)
         st.session_state.active_job = None
 
@@ -1027,7 +1111,6 @@ def _poll_active_job() -> None:
         _finalize_active_job(cancelled=True)
         return
 
-    pid = int(job_state.get("pid") or 0)
     progress_path = str(job_state.get("progress_path") or "")
     events, offset = _tail_progress(progress_path, int(job_state.get("offset") or 0))
     job_state["offset"] = offset
@@ -1035,6 +1118,8 @@ def _poll_active_job() -> None:
     for event in events:
         message = event.get("message") or ""
         stage = event.get("stage") or "progress"
+        if stage in {"job_finished", "job_failed"}:
+            job_state["terminal_stage"] = True
         if message and message != job_state.get("last_message"):
             log.append(f"→ {message}")
             job_state["last_message"] = message
@@ -1054,7 +1139,11 @@ def _poll_active_job() -> None:
         job_state["last_creep"] = now
 
     st.session_state.active_job = job_state
-    if not _pid_alive(pid):
+    # Finalize when the process exits OR when the worker already wrote the
+    # terminal result (avoids Linux zombie PIDs leaving the bar at 100%).
+    if _worker_exited(job_state) or (
+        job_state.get("terminal_stage") and _result_ready(job_state)
+    ):
         # Small grace so the worker can flush result JSON.
         time.sleep(0.15)
         _finalize_active_job(cancelled=False)

@@ -11,7 +11,6 @@ generated test sources.
 from __future__ import annotations
 
 import os
-import tempfile
 from typing import Any, Dict, Mapping, Optional
 
 from codebase_assistant.memory.conversation_memory import ConversationMemory
@@ -21,15 +20,17 @@ from codebase_assistant.schemas.schemas import (
     ModelMessage,
     TestingResult,
 )
+from ui_paths import memory_store_path
 
 #: Soft cap so memory never persists full reports or generated source.
 MAX_MEMORY_CONTENT_CHARS = 400
 
 STREAMLIT_CONVERSATION_ID = "streamlit_default"
-STREAMLIT_RUNTIME_ROOT = os.path.join(
-    tempfile.gettempdir(), "codebase_assistant_streamlit"
-)
-STREAMLIT_MEMORY_STORE_PATH = os.path.join(STREAMLIT_RUNTIME_ROOT, "memory_store")
+
+
+def streamlit_memory_store_path() -> str:
+    """Resolved MemoryStore directory for the Streamlit UI process."""
+    return memory_store_path()
 
 
 def memory_target(memory: Optional[ConversationMemory]) -> Dict[str, str]:
@@ -177,8 +178,8 @@ def build_streamlit_conversation_memory() -> ConversationMemory:
     so snapshots survive script reloads. ``model_client`` is None so the UI
     process never loads an LLM just for summarization.
     """
-    os.makedirs(STREAMLIT_MEMORY_STORE_PATH, exist_ok=True)
-    store = MemoryStore(storage_path=STREAMLIT_MEMORY_STORE_PATH)
+    os.makedirs(streamlit_memory_store_path(), exist_ok=True)
+    store = MemoryStore(storage_path=streamlit_memory_store_path())
     return ConversationMemory(
         model_client=None,
         memory_store=store,

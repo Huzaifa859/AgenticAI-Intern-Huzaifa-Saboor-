@@ -9,16 +9,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from ui_paths import run_history_path
+
 HISTORY_LIMIT = 20
-RUNTIME_ROOT = os.path.join(
-    tempfile.gettempdir(), "codebase_assistant_streamlit"
-)
-HISTORY_PATH = os.path.join(RUNTIME_ROOT, "ui_run_history.jsonl")
 
 
 def _local_now_iso() -> str:
@@ -27,8 +24,8 @@ def _local_now_iso() -> str:
 
 
 def history_path() -> str:
-    """Return the on-disk history file path."""
-    return HISTORY_PATH
+    """Return the on-disk history file path (respects RUN_HISTORY_PATH)."""
+    return run_history_path()
 
 
 def parse_history_time(value: Any) -> Optional[datetime]:
@@ -61,7 +58,7 @@ def format_local_time(value: Any) -> str:
 
 def load_history(path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Load the newest ``HISTORY_LIMIT`` runs from JSONL (oldest→newest)."""
-    target = path or HISTORY_PATH
+    target = path or history_path()
     if not os.path.isfile(target):
         return []
     entries: List[Dict[str, Any]] = []
@@ -89,7 +86,7 @@ def save_history(
     path: Optional[str] = None,
 ) -> None:
     """Rewrite history JSONL with at most ``HISTORY_LIMIT`` newest runs."""
-    target = path or HISTORY_PATH
+    target = path or history_path()
     capped = list(entries or [])[-HISTORY_LIMIT:]
     try:
         os.makedirs(os.path.dirname(os.path.abspath(target)) or ".", exist_ok=True)
@@ -102,7 +99,7 @@ def save_history(
 
 def clear_history(path: Optional[str] = None) -> None:
     """Delete the on-disk history file."""
-    target = path or HISTORY_PATH
+    target = path or history_path()
     try:
         if os.path.isfile(target):
             os.remove(target)

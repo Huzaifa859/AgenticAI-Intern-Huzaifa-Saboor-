@@ -22,7 +22,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 import time
 import traceback
 from typing import Any, Dict, List, Optional
@@ -35,16 +34,14 @@ if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
 # Keep runtime data outside the project tree so nothing touches watched sources.
-_RUNTIME_ROOT = os.path.join(
-    tempfile.gettempdir(), "codebase_assistant_streamlit"
-)
+from ui_paths import chroma_persist_dir, memory_store_path, streamlit_data_dir  # noqa: E402
+
+_RUNTIME_ROOT = streamlit_data_dir()
 os.makedirs(_RUNTIME_ROOT, exist_ok=True)
-os.environ.setdefault(
-    "CHROMA_PERSIST_DIR", os.path.join(_RUNTIME_ROOT, "chroma")
-)
-os.environ.setdefault(
-    "MEMORY_STORE_PATH", os.path.join(_RUNTIME_ROOT, "memory_store")
-)
+os.environ.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
+os.environ.setdefault("MEMORY_STORE_PATH", memory_store_path())
+os.makedirs(os.environ["CHROMA_PERSIST_DIR"], exist_ok=True)
+os.makedirs(os.environ["MEMORY_STORE_PATH"], exist_ok=True)
 
 #: Tracer / lifecycle event names → short human progress messages.
 _STAGE_MESSAGES: Dict[str, str] = {

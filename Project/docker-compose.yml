@@ -1,48 +1,34 @@
 # docker-compose.yml
 # ==================
 #
-# Brings up the two services the proposal's Deployment section calls
-# for: the Jupyter environment running the notebook, and an Ollama
-# container serving local llama3 for documentation generation.
+# Streamlit-only deployment (OpenRouter). No Ollama / Jupyter / MCP ports.
 #
-# Claude is reached over the network via OpenRouter, so it needs no
-# service here -- only the API key passed through to the notebook.
-#
-#     docker compose up
-#
-# NOTE: Placeholder. The Jupyter image is not yet runnable end-to-end
-# (see the TODO in Dockerfile about requirements.txt).
+#     cp .env.example .env   # set OPENROUTER_API_KEY
+#     docker compose up --build
+#     # http://localhost:8501
 
 services:
-  jupyter:
+  app:
     build: .
-    container_name: codebase-assistant-jupyter
+    container_name: codebase-assistant-ui
     ports:
-      - "8888:8888"
-    volumes:
-      # Mount the project so notebook edits persist on the host.
-      - .:/app
+      - "8501:8501"
+    env_file:
+      - .env
     environment:
-      # TODO: supply via a .env file rather than the host environment,
-      # and keep it out of version control.
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - OLLAMA_BASE_URL=http://ollama:11434
-    depends_on:
-      - ollama
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: codebase-assistant-ollama
-    ports:
-      - "11434:11434"
+      CODEBASE_ASSISTANT_DATA_DIR: /data
+      CHROMA_PERSIST_DIR: /data/chroma
+      MEMORY_STORE_PATH: /data/memory
+      RUN_HISTORY_PATH: /data/history/ui_run_history.jsonl
     volumes:
-      # Persist pulled models so llama3 is not re-downloaded on every
-      # restart.
-      - ollama_models:/root/.ollama
-
-    # TODO: llama3 must be pulled before first use:
-    #     docker compose exec ollama ollama pull llama3
-    # Automate this with an entrypoint or init container.
+      - ca_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
 volumes:
-  ollama_models:
+  ca_data:
