@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![pytest](https://img.shields.io/badge/tests-pytest-green.svg)](https://docs.pytest.org/)
 [![RAG](https://img.shields.io/badge/RAG-ChromaDB-orange.svg)](https://www.trychroma.com/)
-[![MCP](https://img.shields.io/badge/MCP-local%20server-purple.svg)](#mcp-architecture)
+[![MCP](https://img.shields.io/badge/MCP-stdio%20%2B%20local-purple.svg)](#mcp-architecture)
 
 A multi-agent AI assistant that helps developers understand, debug, document, and test Python repositories.
 
@@ -54,7 +54,7 @@ It ingests a local path or public GitHub URL, indexes the codebase with RAG, and
 | Memory | Short-term conversation memory with automatic summarization and disk persistence |
 | Observability | End-to-end tracing with ordered events and JSON export |
 | Tools | Shared `ToolRegistry` for filesystem and GitHub tools |
-| MCP | Local MCP server exposing Supervisor agent pipelines (`analysis.run`, `documentation.run`, `testing.run`, `goal.run`) |
+| MCP | In-process MCP foundation plus official **stdio** server for external hosts (`analysis_run`, `documentation_run`, `testing_run`, `goal_run`) |
 | Interfaces | Interactive CLI menu, non-interactive `--agent` mode, Streamlit web UI, and Jupyter demo notebook |
 
 ---
@@ -152,25 +152,75 @@ flowchart TD
 
 The MCP layer is another frontend for the existing Supervisor — it does not reimplement agent logic or routing.
 
+There are **two transports**:
+
+| Transport | Who uses it | How |
+|---|---|---|
+| **Local / in-process** | Unit tests, notebook-style embedding | `MCPServer` + `MCPClient` keyed by `host:port` in the same Python process |
+| **Stdio (official MCP)** | Cursor, Claude Desktop, other MCP hosts | `python -m codebase_assistant.mcp` — FastMCP JSON-RPC on stdin/stdout |
+
 ```mermaid
 flowchart TD
-    Client[MCP Client]
-    Client --> Server[MCP Server]
-    Server --> Supervisor[Supervisor]
-    Supervisor --> Registry[Tool Registry]
+    Host[Cursor_or_ClaudeDesktop]
+    CLI["python -m codebase_assistant.mcp"]
+    Bridge[stdio FastMCP bridge]
+    Local[MCPServer in-process]
+    Supervisor[Supervisor]
+    Registry[Tool Registry]
+    Host -->|stdio JSON-RPC| CLI
+    CLI --> Bridge
+    Bridge -->|invoke_tool| Local
+    Local --> Supervisor
+    Supervisor --> Registry
     Registry --> Agents[Code Analysis / Documentation / Testing]
 ```
 
-**Exposed agent tools**
+**Exposed agent tools (stdio protocol names)**
 
-| Tool | Supervisor call | Result |
-|---|---|---|
-| `analysis.run` | `handle_task("analysis: …")` | `CodeAnalysisReport` |
-| `documentation.run` | `handle_task("documentation …")` | `DocumentationResult` |
-| `testing.run` | `handle_task("testing …")` | `TestingResult` |
-| `goal.run` | `handle_goal(...)` | Ordered `AgentResponse` list |
+| Stdio tool | Local registry name | Args | Result |
+|---|---|---|---|
+| `analysis_run` | `analysis.run` | `repository`, optional `question` | `CodeAnalysisReport` (JSON) |
+| `documentation_run` | `documentation.run` | `repository`, optional `target` | `DocumentationResult` (JSON) |
+| `testing_run` | `testing.run` | `repository`, optional `target` | `TestingResult` (JSON) |
+| `goal_run` | `goal.run` | `repository`, `goal` | Ordered `AgentResponse` list (JSON) |
 
-Transport is **local / in-process** for the current foundation. The server owns a Supervisor instance, mirrors its `ToolRegistry`, and records MCP request/response/tool traces.
+By default stdio exposes the four agent tools only. Set `MCP_MIRROR_REGISTRY_TOOLS=1` to also mirror filesystem/GitHub registry tools (underscored names + `arguments_json` kwargs).
+
+### Run the stdio server
+
+```bash
+cd Project
+pip install -r codebase_assistant/requirements.txt   # includes mcp>=1.28,<2
+python -m codebase_assistant.mcp --help
+python -m codebase_assistant.mcp --list-tools
+python -m codebase_assistant.mcp                 # blocks; hosts attach via stdio
+# Or: run_mcp.bat
+```
+
+Logging goes to **stderr**. Do not print app progress on stdout — that channel is the MCP wire.
+
+### Example host config (Cursor / Claude Desktop)
+
+Point the host at the Project directory and your Python interpreter:
+
+```json
+{
+  "mcpServers": {
+    "codebase-assistant": {
+      "command": "python",
+      "args": ["-m", "codebase_assistant.mcp"],
+      "cwd": "C:/path/to/Project",
+      "env": {
+        "OPENROUTER_API_KEY": "your_key_here"
+      }
+    }
+  }
+}
+```
+
+Use an absolute `cwd` so imports and `examples/demo_repo` resolve correctly. Long agent runs may hit host tool timeouts — prefer targeted `documentation_run` / `testing_run` calls in interactive hosts.
+
+The in-process server still owns a Supervisor instance, mirrors its `ToolRegistry`, and records MCP request/response/tool traces. HTTP / SSE MCP and a Docker MCP service are not included yet.
 
 ---
 
@@ -559,7 +609,7 @@ PYTHONPATH=. python -m pytest codebase_assistant/tests -q
 | Integration tests | Week 6 end-to-end static analysis pipeline on a seeded repo |
 | Mocked LLM tests | Documentation/testing/analysis with fake providers (no network) |
 | RAG / retrieval tests | Indexing and retrieval behavior where covered |
-| MCP tests | Server lifecycle, registry exposure, agent tools, tracing, errors |
+| MCP tests | In-process lifecycle/tools + stdio bridge name mapping / forwarding |
 | GitHub tests | REST read/write helpers with mocked HTTP |
 
 Providers are mocked in automated tests; Supervisor and agent pipelines run for real where the suite requires it.
@@ -580,6 +630,8 @@ Project/
 │   ├── ui_export.py            # Markdown/JSON download helpers
 │   ├── worker.py               # Isolated agent job subprocess (+ progress NDJSON)
 │   └── streamlit_app.py        # Streamlit web UI entry point
+├── run_ui.bat                  # Launch Streamlit UI
+├── run_mcp.bat                 # Launch MCP stdio server
 ├── Project.ipynb               # End-to-end notebook demo
 ├── docs/
 │   ├── architecture.excalidraw
@@ -595,7 +647,7 @@ Project/
     ├── models/                 # LLMClient + OpenRouter/Ollama providers
     ├── memory/                 # ConversationMemory + MemoryStore
     ├── tracing/                # Tracer + TraceEvent
-    ├── mcp/                    # Local MCP server/client
+    ├── mcp/                    # In-process MCP + stdio FastMCP bridge
     ├── schemas/
     ├── tests/
     └── requirements.txt
@@ -609,7 +661,8 @@ Project/
 - Repository ingestion respects configured ceilings (default: 100 files, 20k LOC, 500 KB per file).
 - Generated tests can fail or need manual refinement for complex modules.
 - Cross-encoder reranking is optional and **disabled by default**.
-- MCP currently runs as a **local in-process** server (not a remote stdio/HTTP deployment).
+- MCP **HTTP / SSE** remote transport is not implemented (stdio + in-process only).
+- Long MCP agent runs may hit host client timeouts.
 - GitHub **write** operations require authentication via `GITHUB_TOKEN`.
 - Docker files exist as deployment scaffolding and are not yet a polished one-command production stack.
 - Supervisor routing is keyword/goal based, not full LLM task planning.
@@ -621,11 +674,11 @@ Project/
 - LLM-driven planning and task decomposition in the Supervisor
 - Broader language support beyond Python bug detection
 - Richer coverage measurement for generated tests
-- Production-ready Docker / Compose deployment with Jupyter + Ollama
-- Richer Streamlit UX (background job cancel/kill, true LLM token streaming)
+- Production-ready Docker / Compose deployment (Streamlit and/or Jupyter + Ollama)
+- Streamlit LLM token streaming (job cancel/kill already shipped)
 - CI integration for repository checks on pull requests
 - Deeper semantic code search and explanation skills
-- Networked MCP transport (stdio / HTTP) for external host applications
+- Remote MCP transport (HTTP / SSE) and optional Docker MCP service
 
 ---
 
