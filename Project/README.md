@@ -437,17 +437,20 @@ While a job runs, the UI polls an NDJSON progress file from the worker and shows
 
 Completed, failed, and cancelled runs are appended to a capped **Run history** (sidebar expander, newest first, max 20). Each row shows your **local device time** plus a short result summary. History is kept in `st.session_state` and persisted to `%TEMP%/codebase_assistant_streamlit/ui_run_history.jsonl` so it survives Streamlit script reloads. Selecting an entry restores its result and auto-opens the matching result pane. Each result pane can **Download Markdown** or **Download JSON**.
 
+Separately, the UI keeps **Session memory** (same `ConversationMemory` + `MemoryStore` pattern as the CLI): last repository reference/path, docs/testing target fields, and short Load/Run summaries. Memory lives in the Streamlit process (not the worker), prefills sidebar defaults, and persists under `%TEMP%/codebase_assistant_streamlit/memory_store` with conversation id `streamlit_default`. It is not a chat pane and is not injected into agent LLM prompts. **Run history** remains the result browser; **Session memory** is conversational/session context only. Use **Clear memory** in the sidebar expander to reset both in-memory state and the disk snapshot.
+
 On Analysis reports, enable **Show ungrounded candidates** to inspect findings that failed grounding. They appear in a separate **Unverified** section and are never mixed into verified bugs.
 
 In the sidebar:
 
 1. Enter a local path (for example `examples/demo_repo`) or a GitHub HTTPS URL and click **Load repository**
 2. Choose **Analysis**, **Documentation**, or **Testing**
-3. For docs/tests, set mode and optional file/function/class targeting
+3. For docs/tests, set mode and optional file/function/class targeting (defaults may come from Session memory)
 4. Click **Run** — watch stage progress (or **Stop run**), then browse the focused result pane
 5. Open **Run history** to revisit prior runs or clear the list
+6. Open **Session memory** to review remembered repo/targets/short turns, or clear memory
 
-Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`; history helpers live in `app/ui_history.py`; export helpers live in `app/ui_export.py`. Agent logic stays inside `codebase_assistant/`.
+Orchestration lives in `app/service.py`; presentation helpers live in `app/ui_reports.py`; history helpers live in `app/ui_history.py`; conversation-memory helpers live in `app/ui_memory.py`; export helpers live in `app/ui_export.py`. Agent logic stays inside `codebase_assistant/`.
 
 ---
 
@@ -573,6 +576,7 @@ Project/
 │   ├── service.py              # Shared non-interactive orchestration
 │   ├── ui_reports.py           # Streamlit report renderers
 │   ├── ui_history.py           # Capped run-history load/save helpers
+│   ├── ui_memory.py            # Shared ConversationMemory helpers (CLI + Streamlit)
 │   ├── ui_export.py            # Markdown/JSON download helpers
 │   ├── worker.py               # Isolated agent job subprocess (+ progress NDJSON)
 │   └── streamlit_app.py        # Streamlit web UI entry point

@@ -68,7 +68,6 @@ from codebase_assistant.schemas.schemas import (  # noqa: E402
     AgentRequest,
     AgentType,
     DocumentationResult,
-    ModelMessage,
     TestingResult,
 )
 from codebase_assistant.supervisor import Supervisor  # noqa: E402
@@ -80,9 +79,15 @@ from report_formatter import (  # noqa: E402
     print_report,
     print_testing_result,
 )
-
-#: Soft cap so CLI memory never persists full reports or generated source.
-_MAX_MEMORY_CONTENT_CHARS = 400
+from ui_memory import (  # noqa: E402
+    memory_target,
+    record_memory_message,
+    record_repository_loaded,
+    store_memory_target,
+    summarize_analysis_for_memory,
+    summarize_documentation_for_memory,
+    summarize_testing_for_memory,
+)
 
 #: Clones made during this execution, keyed by canonical repository URL.
 _CLONE_CACHE: Dict[str, str] = {}
@@ -570,36 +575,6 @@ def resolve_repo_path(repository_path: str, raw_path: str) -> str:
     return os.path.abspath(os.path.join(repository_path, expanded))
 
 
-def memory_target(memory: Optional[ConversationMemory]) -> Dict[str, str]:
-    """Read last documentation/testing target fields from memory metadata."""
-    if memory is None:
-        return {"file_path": "", "function_name": "", "class_name": ""}
-    meta = getattr(memory, "metadata", {}) or {}
-    return {
-        "file_path": str(meta.get("last_file_path") or ""),
-        "function_name": str(meta.get("last_function_name") or ""),
-        "class_name": str(meta.get("last_class_name") or ""),
-    }
-
-
-def store_memory_target(
-    memory: Optional[ConversationMemory],
-    *,
-    file_path: str = "",
-    function_name: str = "",
-    class_name: str = "",
-) -> None:
-    """Persist the latest target selection for follow-up turns."""
-    if memory is None:
-        return
-    if file_path:
-        memory.metadata["last_file_path"] = file_path
-    if function_name:
-        memory.metadata["last_function_name"] = function_name
-    if class_name:
-        memory.metadata["last_class_name"] = class_name
-
-
 def print_progress(message: str) -> None:
     """Print one progress line."""
     text = (message or "").strip()
@@ -1006,105 +981,6 @@ def collect_testing_options(
         "file_path": out_file,
         "function_name": out_function,
     }
-
-
-def record_memory_message(
-    memory: Optional[ConversationMemory],
-    role: str,
-    content: str,
-) -> None:
-    """
-    Append one short turn to ConversationMemory when available.
-
-    Uses the existing ``add_message`` API so summarization and
-    MemoryStore persistence run automatically. Content is truncated so
-    full agent reports never enter memory.
-
-    Args:
-        memory: Session ConversationMemory, or None to skip.
-        role: Message role (``user`` or ``assistant``).
-        content: Short summary text to store.
-    """
-    if memory is None:
-        return
-    text = (content or "").strip()
-    if not text:
-        return
-    if len(text) > _MAX_MEMORY_CONTENT_CHARS:
-        text = text[: _MAX_MEMORY_CONTENT_CHARS - 3].rstrip() + "..."
-    memory.add_message(ModelMessage(role=role, content=text))
-
-
-def record_repository_loaded(
-    memory: Optional[ConversationMemory],
-    reference: str,
-    repository_path: str,
-) -> None:
-    """
-    Record the selected repository for this CLI session.
-
-    Args:
-        memory: Session ConversationMemory, or None to skip.
-        reference: Original path or URL the user supplied.
-        repository_path: Resolved local path used by agents.
-    """
-    if memory is None:
-        return
-    memory.metadata["repository_reference"] = reference
-    memory.metadata["repository_path"] = repository_path
-    record_memory_message(memory, "user", f"Repository: {reference}")
-    record_memory_message(memory, "assistant", "Repository loaded.")
-
-
-def summarize_analysis_for_memory(report: object) -> str:
-    """
-    Build a short analysis summary for ConversationMemory.
-
-    Args:
-        report: AnalysisReport-like object with finding lists.
-
-    Returns:
-        Compact counts only — never the full report body.
-    """
-    static_count = len(getattr(report, "static_findings", []) or [])
-    llm_count = len(getattr(report, "llm_findings", []) or [])
-    static_label = "finding" if static_count == 1 else "findings"
-    llm_label = "finding" if llm_count == 1 else "findings"
-    return (
-        f"{static_count} static {static_label}. "
-        f"{llm_count} grounded LLM {llm_label}."
-    )
-
-
-def summarize_documentation_for_memory(result: DocumentationResult) -> str:
-    """
-    Build a short documentation summary for ConversationMemory.
-
-    Args:
-        result: Documentation agent structured result.
-
-    Returns:
-        One-line outcome — never the README or docstring body.
-    """
-    name = (result.function_name or "").strip()
-    if not name or name.upper() == "README":
-        return "README generated."
-    return f"Documentation generated for {name}."
-
-
-def summarize_testing_for_memory(result: TestingResult) -> str:
-    """
-    Build a short testing summary for ConversationMemory.
-
-    Args:
-        result: Testing agent structured result.
-
-    Returns:
-        One-line outcome — never generated test source.
-    """
-    module_count = len(result.generated_tests or {})
-    module_label = "module" if module_count == 1 else "modules"
-    return f"Generated tests for {module_count} {module_label}."
 
 
 def run_code_analysis(

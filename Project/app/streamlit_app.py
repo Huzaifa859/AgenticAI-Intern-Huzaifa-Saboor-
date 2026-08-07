@@ -15,7 +15,8 @@ Or double-click / run:
 Agent jobs run in a separate ``worker.py`` process so embedding/LLM
 memory pressure cannot kill the Streamlit server. Live stage progress
 is tailed from an NDJSON progress file; completed runs are kept in a
-capped sidebar history.
+capped sidebar history. Session conversation memory (repo/targets/short
+summaries) is owned by the Streamlit process via ``ui_memory``.
 """
 
 from __future__ import annotations
@@ -64,10 +65,29 @@ from ui_history import (  # noqa: E402
     make_run_entry,
     summarize_result,
 )
+from ui_memory import (  # noqa: E402
+    build_streamlit_conversation_memory,
+    clear_conversation_memory,
+    memory_target,
+    record_memory_message,
+    record_repository_loaded,
+    remembered_repository_reference,
+    store_memory_target,
+    summarize_analysis_for_memory,
+    summarize_documentation_for_memory,
+    summarize_testing_for_memory,
+)
 from ui_reports import (  # noqa: E402
     render_analysis_report,
     render_documentation_result,
     render_testing_result,
+)
+
+#: Sidebar widget keys prefilling from ConversationMemory targets.
+_SIDEBAR_TARGET_KEYS = (
+    "sidebar_file_path",
+    "sidebar_function_name",
+    "sidebar_class_name",
 )
 
 DOC_MODES = ("readme", "file", "function", "class")
@@ -490,7 +510,7 @@ def _render_stage_timeline(log_lines: List[str], *, elapsed: float) -> None:
 
 
 def _init_state() -> None:
-    """Ensure session keys exist and hydrate history from disk once."""
+    """Ensure session keys exist and hydrate history/memory from disk once."""
     defaults = {
         "repo_path": None,
         "repo_reference": "",
@@ -509,6 +529,8 @@ def _init_state() -> None:
         "active_job": None,
         "job_log": [],
         "job_show_stages": True,
+        "conversation_memory": None,
+        "memory_bootstrapped": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -525,6 +547,35 @@ def _init_state() -> None:
             st.session_state.provider_status = provider_status_message()
         except Exception:
             st.session_state.provider_status = ""
+    if not st.session_state.memory_bootstrapped or st.session_state.conversation_memory is None:
+        st.session_state.conversation_memory = build_streamlit_conversation_memory()
+        st.session_state.memory_bootstrapped = True
+        _ensure_sidebar_target_defaults()
+        if not st.session_state.repo_reference:
+            remembered = remembered_repository_reference(
+                st.session_state.conversation_memory
+            )
+            if remembered and "repo_input" not in st.session_state:
+                st.session_state.repo_input = remembered
+
+
+def _ensure_sidebar_target_defaults() -> None:
+    """Prefill docs/testing sidebar keys from memory once per session."""
+    remembered = memory_target(st.session_state.get("conversation_memory"))
+    mapping = {
+        "sidebar_file_path": remembered["file_path"],
+        "sidebar_function_name": remembered["function_name"],
+        "sidebar_class_name": remembered["class_name"],
+    }
+    for key, value in mapping.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _clear_sidebar_target_keys() -> None:
+    """Drop sidebar target widget keys so empty memory does not re-prefill."""
+    for key in _SIDEBAR_TARGET_KEYS:
+        st.session_state.pop(key, None)
 
 
 def _clear_results() -> None:
@@ -568,6 +619,89 @@ def _load_repository(reference: str) -> None:
     st.session_state.repo_reference = ref
     st.session_state.repo_path = path
     st.session_state.last_error = ""
+    record_repository_loaded(
+        st.session_state.get("conversation_memory"),
+        ref,
+        path,
+    )
+
+
+def _user_instruction_for_job(job_state: Dict[str, Any]) -> str:
+    """Short user-turn text for ConversationMemory (CLI-parity style)."""
+    agent = str(job_state.get("agent") or "")
+    if agent == "Analysis":
+        question = str(job_state.get("question") or "").strip()
+        return f"Analysis: {question}" if question else "Analysis"
+    if agent == "Documentation":
+        parts = ["Documentation"]
+        mode = str(job_state.get("mode") or "").strip()
+        if mode:
+            parts.append(f"mode={mode}")
+        file_path = str(job_state.get("file_path") or "").strip()
+        function_name = str(job_state.get("function_name") or "").strip()
+        class_name = str(job_state.get("class_name") or "").strip()
+        if file_path:
+            parts.append(f"file={file_path}")
+        if function_name:
+            parts.append(f"function={function_name}")
+        if class_name:
+            parts.append(f"class={class_name}")
+        return " ".join(parts)
+    if agent == "Testing":
+        parts = ["Testing"]
+        mode = str(job_state.get("mode") or "").strip()
+        if mode:
+            parts.append(f"mode={mode}")
+        file_path = str(job_state.get("file_path") or "").strip()
+        function_name = str(job_state.get("function_name") or "").strip()
+        if file_path:
+            parts.append(f"file={file_path}")
+        if function_name:
+            parts.append(f"function={function_name}")
+        return " ".join(parts)
+    return agent or "Run"
+
+
+def _record_job_memory(
+    job_state: Dict[str, Any],
+    *,
+    ok: bool,
+    result: Optional[Dict[str, Any]] = None,
+    error: str = "",
+) -> None:
+    """Record short user/assistant turns after a Load/Run finishes."""
+    memory = st.session_state.get("conversation_memory")
+    if memory is None:
+        return
+
+    agent = str(job_state.get("agent") or "")
+    record_memory_message(memory, "user", _user_instruction_for_job(job_state))
+
+    if not ok:
+        record_memory_message(memory, "assistant", (error or f"{agent} failed.").strip())
+        return
+
+    payload = result if isinstance(result, dict) else {}
+    if agent == "Analysis":
+        summary = summarize_analysis_for_memory(payload)
+    elif agent == "Documentation":
+        store_memory_target(
+            memory,
+            file_path=str(job_state.get("file_path") or ""),
+            function_name=str(job_state.get("function_name") or ""),
+            class_name=str(job_state.get("class_name") or ""),
+        )
+        summary = summarize_documentation_for_memory(payload)
+    elif agent == "Testing":
+        store_memory_target(
+            memory,
+            file_path=str(job_state.get("file_path") or ""),
+            function_name=str(job_state.get("function_name") or ""),
+        )
+        summary = summarize_testing_for_memory(payload)
+    else:
+        summary = f"{agent} completed."
+    record_memory_message(memory, "assistant", summary)
 
 
 def _tail_progress(
@@ -778,6 +912,11 @@ def _start_worker(
         "job": job,
         "agent": agent,
         "target": target,
+        "question": str(fields.get("question") or ""),
+        "mode": str(fields.get("mode") or ""),
+        "file_path": str(fields.get("file_path") or ""),
+        "function_name": str(fields.get("function_name") or ""),
+        "class_name": str(fields.get("class_name") or ""),
         "out_path": out_path,
         "progress_path": progress_path,
         "stderr_path": stderr_path,
@@ -823,6 +962,7 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
                 error=message,
                 started_at=started_at,
             )
+            _record_job_memory(job_state, ok=False, error=message)
             _set_active_tab(agent)
             return
 
@@ -847,6 +987,7 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
                     result=result,
                     started_at=started_at,
                 )
+                _record_job_memory(job_state, ok=True, result=result)
                 return
             message = f"{agent} failed: Worker returned no result object."
         else:
@@ -869,6 +1010,7 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
             error=message,
             started_at=started_at,
         )
+        _record_job_memory(job_state, ok=False, error=message)
         _set_active_tab(agent)
     finally:
         _cleanup_paths(out_path, progress_path, stderr_path)
@@ -1117,14 +1259,79 @@ def _render_history_sidebar() -> None:
             st.rerun()
 
 
+def _render_memory_sidebar() -> None:
+    """Compact Session memory panel (conversational context, not run history)."""
+    with st.sidebar.expander("Session memory", expanded=False):
+        memory = st.session_state.get("conversation_memory")
+        if memory is None:
+            st.caption("Memory unavailable.")
+            return
+
+        meta = getattr(memory, "metadata", {}) or {}
+        repo_ref = str(meta.get("repository_reference") or "").strip()
+        repo_path = str(meta.get("repository_path") or "").strip()
+        target = memory_target(memory)
+
+        if repo_ref or repo_path:
+            if repo_ref:
+                st.caption(f"Repo: `{repo_ref}`")
+            if repo_path:
+                st.caption(f"Path: `{repo_path}`")
+        else:
+            st.caption("No repository remembered.")
+
+        target_bits = []
+        if target["file_path"]:
+            target_bits.append(f"file=`{target['file_path']}`")
+        if target["function_name"]:
+            target_bits.append(f"function=`{target['function_name']}`")
+        if target["class_name"]:
+            target_bits.append(f"class=`{target['class_name']}`")
+        if target_bits:
+            st.caption("Last target: " + " · ".join(target_bits))
+
+        turns = memory.get_history(limit=8)
+        if turns:
+            st.markdown("**Recent turns**")
+            for message in turns:
+                role = str(getattr(message, "role", "") or "message")
+                content = str(getattr(message, "content", "") or "").strip()
+                if len(content) > 160:
+                    content = content[:157].rstrip() + "..."
+                st.caption(f"{role}: {content}")
+        else:
+            st.caption("No conversation turns yet.")
+
+        if st.button("Clear memory", key="clear_memory", width="stretch"):
+            clear_conversation_memory(memory)
+            _clear_sidebar_target_keys()
+            st.session_state.pop("repo_input", None)
+            remembered = remembered_repository_reference(memory)
+            if not remembered:
+                st.session_state.repo_input = "examples/demo_repo"
+            _ensure_sidebar_target_defaults()
+            st.rerun()
+
+
 def _render_sidebar() -> None:
     """Draw controls and return nothing; actions mutate session state."""
     st.sidebar.title("Codebase Assistant")
     st.sidebar.caption("Browse analysis, docs, and test reports")
 
+    _ensure_sidebar_target_defaults()
+    if "repo_input" not in st.session_state:
+        remembered = remembered_repository_reference(
+            st.session_state.get("conversation_memory")
+        )
+        st.session_state.repo_input = (
+            st.session_state.repo_reference
+            or remembered
+            or "examples/demo_repo"
+        )
+
     reference = st.sidebar.text_input(
         "Repository path or GitHub URL",
-        value=st.session_state.repo_reference or "examples/demo_repo",
+        key="repo_input",
         help="Local path relative to Project/, absolute path, or HTTPS GitHub URL.",
     )
 
@@ -1139,6 +1346,7 @@ def _render_sidebar() -> None:
         st.sidebar.caption(st.session_state.provider_status)
 
     _render_history_sidebar()
+    _render_memory_sidebar()
 
     st.sidebar.divider()
     agent = st.sidebar.radio("Agent", AGENTS, index=0, disabled=busy)
@@ -1164,13 +1372,17 @@ def _render_sidebar() -> None:
             "Documentation mode", DOC_MODES, index=2, disabled=busy
         )
         if doc_mode in {"file", "function", "class"}:
-            file_path = st.sidebar.text_input("File path", value="", disabled=busy)
+            file_path = st.sidebar.text_input(
+                "File path", key="sidebar_file_path", disabled=busy
+            )
         if doc_mode == "function":
             function_name = st.sidebar.text_input(
-                "Function name", value="", disabled=busy
+                "Function name", key="sidebar_function_name", disabled=busy
             )
         if doc_mode == "class":
-            class_name = st.sidebar.text_input("Class name", value="", disabled=busy)
+            class_name = st.sidebar.text_input(
+                "Class name", key="sidebar_class_name", disabled=busy
+            )
         write_to_disk = st.sidebar.checkbox(
             "Write documentation to disk", value=False, disabled=busy
         )
@@ -1184,11 +1396,20 @@ def _render_sidebar() -> None:
             "Testing mode", TEST_MODES, index=2, disabled=busy
         )
         if test_mode in {"file", "function"}:
-            file_path = st.sidebar.text_input("File path", value="", disabled=busy)
+            file_path = st.sidebar.text_input(
+                "File path", key="sidebar_file_path", disabled=busy
+            )
         if test_mode == "function":
             function_name = st.sidebar.text_input(
-                "Function name", value="", disabled=busy
+                "Function name", key="sidebar_function_name", disabled=busy
             )
+
+    # Keys may be unbound when the active mode hides those widgets.
+    file_path = str(st.session_state.get("sidebar_file_path") or file_path or "")
+    function_name = str(
+        st.session_state.get("sidebar_function_name") or function_name or ""
+    )
+    class_name = str(st.session_state.get("sidebar_class_name") or class_name or "")
 
     run_disabled = (not bool(st.session_state.repo_path)) or busy
     if st.sidebar.button(

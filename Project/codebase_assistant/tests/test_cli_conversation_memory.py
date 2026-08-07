@@ -25,6 +25,7 @@ if str(_APP_DIR) not in sys.path:
     sys.path.insert(0, str(_APP_DIR))
 
 import main as app_main  # noqa: E402
+from ui_memory import MAX_MEMORY_CONTENT_CHARS  # noqa: E402
 from codebase_assistant.agents.code_analysis_agent import (  # noqa: E402
     CodeAnalysisAgent,
 )
@@ -157,7 +158,7 @@ def test_record_repository_and_agent_summaries(
     assert "# Huge README" not in joined
     assert "def test_a()" not in joined
     assert "xxxx" not in joined
-    assert all(len(text) <= app_main._MAX_MEMORY_CONTENT_CHARS for text in texts)
+    assert all(len(text) <= MAX_MEMORY_CONTENT_CHARS for text in texts)
 
 
 def test_persisted_memory_restores_on_restart(tmp_path: Path) -> None:
