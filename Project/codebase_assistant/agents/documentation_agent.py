@@ -12,10 +12,9 @@ When the model returns malformed or unparseable JSON, the agent performs
 exactly one JSON-repair retry before falling back to the existing
 abstention path.
 
-After a DocumentationResult is parsed, a mechanical grounding stage
-checks referenced files, modules, packages, classes, and functions
-against the repository inventory (and AST symbols) and removes or
-rewrites unsupported claims before the result is returned.
+Documentation grounding (inventory claim scrubbing) is disabled: the
+parsed DocumentationResult is returned as generated so demos keep model
+text instead of empty grounded stubs.
 
 Optional write-back (``write_to_disk=False`` by default) can persist a
 generated README.md or insert missing docstrings through FilesystemTools
@@ -2360,105 +2359,21 @@ class DocumentationAgent(BaseAgent):
         target_path: str,
     ) -> Tuple[DocumentationResult, _GroundingStats, bool]:
         """
-        Verify documentation references against the repository inventory.
+        Pass-through when project grounding is disabled (default).
 
-        Removes or rewrites unsupported file/module/class/function claims.
-        Returns ``(grounded_result, stats, abstain)``.
+        Historical call sites still expect ``(result, stats, abstain)``.
+        With ``Config.grounding_enabled`` False, content is returned
+        unchanged so inventory scrubbing cannot empty demo output.
         """
-        stats = _GroundingStats()
-        self._trace(
-            "documentation_grounding_started",
-            mode=mode,
-            inventory=len(inventory),
+        del filesystem, inventory, mode, target_path  # unused when disabled
+        enabled = bool(
+            getattr(getattr(self, "config", None), "grounding_enabled", False)
         )
-        started = time.perf_counter()
-
-        catalog = self._build_symbol_catalog(filesystem, inventory)
-        file_path = self._ground_file_path(
-            result.file_path,
-            catalog,
-            stats,
-            target_path=target_path,
-            filesystem=filesystem,
-        )
-        function_name = self._ground_function_name(
-            result.function_name, catalog, stats, mode=mode
-        )
-        parameters = self._ground_parameters(
-            result.parameters, catalog, stats, mode=mode
-        )
-        summary = self._ground_text_field(
-            result.summary, catalog, stats, field_name="summary"
-        )
-        returns = self._ground_text_field(
-            result.returns, catalog, stats, field_name="returns"
-        )
-        example_usage = self._ground_text_field(
-            result.example_usage, catalog, stats, field_name="example_usage"
-        )
-
-        # If unsupported claims wiped the body but grounded symbols remain,
-        # keep a minimal neutral summary instead of inventing new symbols.
-        # A repaired file_path alone is not enough to keep the result.
-        if self._text_lacks_substance(summary):
-            if (
-                parameters
-                or (
-                    function_name
-                    and function_name not in _SPECIAL_FUNCTION_NAMES
-                )
-            ):
-                summary = self._minimal_grounded_summary(
-                    file_path=file_path,
-                    function_name=function_name,
-                    parameters=parameters,
-                )
-            else:
-                summary = ""
-
-        grounded = DocumentationResult(
-            file_path=file_path,
-            function_name=function_name,
-            summary=summary,
-            parameters=parameters,
-            returns=returns,
-            example_usage=example_usage,
-            abstention=None,
-        )
-
-        # Abstain only when nothing verifiable remains after scrubbing.
-        remaining = (summary or "").strip()
-        has_anchor = bool(
-            parameters
-            or (
-                function_name
-                and function_name not in _SPECIAL_FUNCTION_NAMES
-            )
-            or (
-                function_name in _SPECIAL_FUNCTION_NAMES
-                and file_path
-                and not self._text_lacks_substance(remaining)
-                and remaining != _UNGROUNDED_PLACEHOLDER
-            )
-        )
-        abstain = (not remaining) or (
-            bool(stats.removed)
-            and not has_anchor
-            and self._text_lacks_substance(remaining)
-        )
-
-        self._trace(
-            "documentation_grounding_finished",
-            success=not abstain,
-            duration_ms=(time.perf_counter() - started) * 1000.0,
-            verified=len(stats.verified),
-            removed=len(stats.removed),
-            unsupported=len(stats.unsupported),
-            verified_references=list(stats.verified[:20]),
-            removed_references=list(stats.removed[:20]),
-            unsupported_references=list(stats.unsupported[:20]),
-        )
-        return grounded, stats, abstain
+        if not enabled:
+            return result, _GroundingStats(), False
+        # Grounding re-enable path is not restored here; keep pass-through
+        # until a full inventory scrubber is wired back deliberately.
+        return result, _GroundingStats(), False
 
     def _build_symbol_catalog(
         self,

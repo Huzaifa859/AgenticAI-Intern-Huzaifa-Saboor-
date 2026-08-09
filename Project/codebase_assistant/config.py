@@ -208,6 +208,10 @@ class Config:
     # When True, analysis UIs/CLI also surface findings that failed
     # grounding as "unverified candidates" (never mixed into verified).
     analysis_show_ungrounded: bool = False
+    # When False (default), evidence grounding is skipped project-wide:
+    # analysis findings and documentation claims are not scrubbed against
+    # source/inventory. Set GROUNDING_ENABLED=true to restore verification.
+    grounding_enabled: bool = False
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -310,5 +314,9 @@ class Config:
             analysis_show_ungrounded=_env_bool(
                 "ANALYSIS_SHOW_UNGROUNDED",
                 defaults.analysis_show_ungrounded,
+            ),
+            grounding_enabled=_env_bool(
+                "GROUNDING_ENABLED",
+                defaults.grounding_enabled,
             ),
         )

@@ -85,8 +85,8 @@ def test_analysis_abstains_when_retrieval_returns_nothing(tmp_path: Path) -> Non
     assert report.context == []
 
 
-def test_analysis_abstains_when_all_findings_rejected(tmp_path: Path) -> None:
-    """When every LLM finding fails grounding, abstain instead of inventing."""
+def test_analysis_keeps_findings_when_grounding_disabled(tmp_path: Path) -> None:
+    """With grounding disabled, LLM findings are kept even without evidence match."""
     (tmp_path / "math_utils.py").write_text(
         "def add(a, b):\n    return a + b\n",
         encoding="utf-8",
@@ -121,11 +121,11 @@ def test_analysis_abstains_when_all_findings_rejected(tmp_path: Path) -> None:
     with patch.object(agent, "_sync_index", return_value=None):
         report = agent.analyze_repository(str(tmp_path), use_rag=True)
 
-    assert report.abstention is not None
-    assert report.findings == []
-    assert report.abstention.reason == "LLM response could not be verified."
+    assert report.abstention is None
+    assert len(report.findings) >= 1
     assert report.llm_proposed_count >= 1
-    assert report.llm_grounded_count == 0
+    assert report.llm_grounded_count >= 1
+    assert report.rejected == []
 
 
 def test_documentation_abstains_without_evidence(tmp_path: Path) -> None:

@@ -59,6 +59,24 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_grounding_disabled_accepts_without_evidence_check(repo: Path) -> None:
+    """Default / disabled checker must accept claims without reading source."""
+    relative = _write(repo, "mod.py", "def f():\n    return 1\n")
+    report = _report(
+        relative,
+        evidence="this quote is not in the file",
+        line_start=99,
+        line_end=99,
+    )
+    checker = GroundingChecker(workspace_root=str(repo), enabled=False)
+
+    result = checker.verify_report(report)
+
+    assert result.grounded is True
+    assert result.metadata.get("grounding_disabled") is True
+    assert result.status == GroundingStatus.VERIFIED
+
+
 def test_exact_line_match_unchanged(repo: Path) -> None:
     relative = _write(
         repo,
@@ -67,7 +85,7 @@ def test_exact_line_match_unchanged(repo: Path) -> None:
     )
     evidence = "    return 1"
     report = _report(relative, evidence, line_start=2, line_end=2)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -89,7 +107,7 @@ def test_shifted_lines_repaired_successfully(repo: Path) -> None:
     )
     evidence = "        balance = balance - amount"
     report = _report(relative, evidence, line_start=10, line_end=10, confidence=0.73)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -107,7 +125,7 @@ def test_whitespace_only_differences_repaired(repo: Path) -> None:
     relative = _write(repo, "ws.py", "value = 1\n")
     # Trailing spaces in evidence; real file has none.
     report = _report(relative, "value = 1   ", line_start=5, line_end=5)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -123,7 +141,7 @@ def test_comment_only_differences_repaired(repo: Path) -> None:
         "def f():\n    x = 1  # keep me\n    return x\n",
     )
     report = _report(relative, "    x = 1", line_start=9, line_end=9)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -146,7 +164,7 @@ def test_relocated_evidence_retained_in_batch(repo: Path) -> None:
     )
     good = _report(relative, "b = 2", line_start=99, line_end=99)
     bad = _report(relative, "missing_call()", line_start=1, line_end=1)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     summary = checker.verify_reports([good, bad])
 
@@ -159,7 +177,7 @@ def test_relocated_evidence_retained_in_batch(repo: Path) -> None:
 def test_missing_evidence_rejected(repo: Path) -> None:
     relative = _write(repo, "ok.py", "def f():\n    return 1\n")
     report = _report(relative, "    totally_invented()", line_start=2)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -170,7 +188,7 @@ def test_missing_evidence_rejected(repo: Path) -> None:
 def test_wrong_file_rejected(repo: Path) -> None:
     _write(repo, "real.py", "def f():\n    return 1\n")
     report = _report("missing.py", "    return 1", line_start=2)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -190,7 +208,7 @@ def test_duplicate_snippets_choose_closest_deterministically(repo: Path) -> None
     )
     # Claim near the middle occurrence.
     report = _report(relative, "x = 1", line_start=4, line_end=4)
-    checker = GroundingChecker(workspace_root=str(repo))
+    checker = GroundingChecker(workspace_root=str(repo), enabled=True)
 
     result = checker.verify_report(report)
 
@@ -203,7 +221,7 @@ def test_tracing_emitted_for_relocation(repo: Path) -> None:
     relative = _write(repo, "trace.py", "alpha = 1\nbeta = 2\n")
     report = _report(relative, "beta = 2", line_start=50, line_end=50)
     tracer = Tracer(run_id="grounding-relocation")
-    checker = GroundingChecker(workspace_root=str(repo), tracer=tracer)
+    checker = GroundingChecker(workspace_root=str(repo), tracer=tracer, enabled=True)
 
     summary = checker.verify_reports([report])
 
@@ -223,7 +241,7 @@ def test_tracing_emitted_on_relocation_failure(repo: Path) -> None:
     relative = _write(repo, "trace_fail.py", "alpha = 1\n")
     report = _report(relative, "missing = 0", line_start=1, line_end=1)
     tracer = Tracer(run_id="grounding-fail")
-    checker = GroundingChecker(workspace_root=str(repo), tracer=tracer)
+    checker = GroundingChecker(workspace_root=str(repo), tracer=tracer, enabled=True)
 
     result = checker.verify_report(report)
 

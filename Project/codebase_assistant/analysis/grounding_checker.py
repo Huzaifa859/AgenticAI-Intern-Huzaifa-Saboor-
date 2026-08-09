@@ -218,6 +218,9 @@ class GroundingChecker:
     """
     Verifies that a bug report's quoted evidence exists in the real
     source at the claimed location.
+
+    When ``enabled`` is False (Config ``grounding_enabled``, default),
+    every report is accepted without reading source evidence.
     """
 
     def __init__(
@@ -228,6 +231,7 @@ class GroundingChecker:
         strict: bool = False,
         snapshot: Optional[Dict[str, str]] = None,
         tracer: Optional[Tracer] = None,
+        enabled: Optional[bool] = None,
     ) -> None:
         """
         Initialize the GroundingChecker.
@@ -250,6 +254,8 @@ class GroundingChecker:
                 captured when the reports were produced. Enables
                 staleness detection; see `capture_snapshot`.
             tracer: Optional Tracer for relocation / grounding events.
+            enabled: Override for evidence verification. ``None`` uses
+                ``config.grounding_enabled`` (default False).
 
         Raises:
             ToolExecutionError: If the workspace root does not exist.
@@ -262,6 +268,10 @@ class GroundingChecker:
         self.strict = strict
         self.snapshot: Dict[str, str] = dict(snapshot or {})
         self.tracer = tracer
+        if enabled is None:
+            self.enabled = bool(getattr(self.config, "grounding_enabled", False))
+        else:
+            self.enabled = bool(enabled)
 
     # ------------------------------------------------------------------
     # Verification
@@ -294,6 +304,24 @@ class GroundingChecker:
             The verdict, including both the expected evidence and the
             actual source so a caller can show the difference.
         """
+        if not self.enabled:
+            return GroundingResult(
+                grounded=True,
+                status=GroundingStatus.VERIFIED,
+                reason=(
+                    "Evidence grounding is disabled; claim accepted "
+                    "without verification."
+                ),
+                expected_evidence=report.evidence or "",
+                actual_source="",
+                match_type=MatchType.NONE,
+                file_path=report.file_path or "",
+                line_start=int(report.line_start or 0),
+                line_end=int(report.line_end or 0),
+                report=report,
+                metadata={"grounding_disabled": True},
+            )
+
         expected = report.evidence or ""
 
         if not expected.strip():

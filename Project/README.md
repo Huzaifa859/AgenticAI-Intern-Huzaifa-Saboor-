@@ -7,7 +7,7 @@
 
 A multi-agent AI assistant that helps developers understand, debug, document, and test Python repositories.
 
-It ingests a local path or public GitHub URL, indexes the codebase with RAG, and routes work through a Supervisor to specialized agents — Code Analysis, Documentation, and Testing — while grounding LLM claims against real source text.
+It ingests a local path or public GitHub URL, indexes the codebase with RAG, and routes work through a Supervisor to specialized agents — Code Analysis, Documentation, and Testing. Evidence grounding is off by default (`GROUNDING_ENABLED=false`) so findings and docs are not discarded by claim scrubbing.
 
 > **Problem it solves:** inherited or unfamiliar codebases are slow to audit by hand. This project turns repository analysis, documentation drafts, and pytest generation into a single, structured multi-agent pipeline with retrieval, tracing, and memory.
 
@@ -409,9 +409,10 @@ Variables below are loaded by `Config.load()` (from `Project/.env` and the proce
 | `RERANK_MODEL_NAME` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
 | `RERANK_CANDIDATES` | No | `24` | Candidate pool size before rerank |
 | `LOG_LEVEL` | No | `INFO` | Logging threshold |
-| `DOCUMENTATION_LENIENT` | No | `true` | Keep imperfect documentation LLM text (with warnings) instead of emptying on JSON/grounding failures. Set `false` for strict abstention. |
+| `DOCUMENTATION_LENIENT` | No | `true` | Keep imperfect documentation LLM text (with warnings) instead of emptying on JSON-repair failures. Set `false` for strict abstention. Documentation claim grounding is disabled. |
 | `TESTING_LENIENT` | No | `true` | Salvage pytest source from non-JSON testing model output instead of abstaining with an empty suite. Set `false` for strict abstention. |
-| `ANALYSIS_SHOW_UNGROUNDED` | No | `false` | When `true`, the CLI analysis report also prints findings that failed grounding as unverified candidates. The Streamlit UI has a separate checkbox for the same view. |
+| `ANALYSIS_SHOW_UNGROUNDED` | No | `false` | When `true`, the CLI analysis report also prints findings that failed grounding as unverified candidates. The Streamlit UI has a separate checkbox for the same view. Only relevant when `GROUNDING_ENABLED=true`. |
+| `GROUNDING_ENABLED` | No | `false` | When `true`, restore evidence grounding for analysis findings (and allow re-enabling documentation claim scrubbing later). Default `false` keeps model/static findings without discarding ungrounded claims. |
 | `CA_WORKER_URL` | No | `http://127.0.0.1:8765` | Base URL for the long-lived warm Streamlit worker (`GET /health`, `POST /jobs`). Localhost only; not published from Docker. |
 | `CA_WORKER_PORT` | No | `8765` | Port for `app/worker_server.py` (and auto-spawn from the UI). |
 | `CA_WORKER_HOST` | No | `127.0.0.1` | Bind address for the warm worker server. |

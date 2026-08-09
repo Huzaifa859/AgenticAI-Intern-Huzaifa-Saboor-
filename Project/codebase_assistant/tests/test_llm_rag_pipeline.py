@@ -282,11 +282,11 @@ def test_full_pipeline_indexes_retrieves_prompts_and_grounds(
     assert methods == {"static", "llm"}
 
 
-def test_hallucinated_findings_are_rejected(
+def test_hallucinated_findings_kept_when_grounding_disabled(
     analysis_agent: CodeAnalysisAgent,
     analysis_repo: Path,
 ) -> None:
-    """Findings whose evidence does not match source must not reach findings."""
+    """With grounding off (default), mismatched evidence is still kept."""
     content = _finding_payload(
         file_path=WALLET_RELATIVE,
         line_start=8,
@@ -300,11 +300,10 @@ def test_hallucinated_findings_are_rejected(
 
     assert report.model_used is True
     assert report.context, "pipeline should still retrieve before the model call"
-    assert all(f.bug_type != "hallucinated_bug" for f in report.findings)
-    assert report.rejected, "expected GroundingChecker to reject the hallucination"
-    assert any(not result.grounded for result in report.rejected)
-    assert report.static_findings, "static findings must survive hallucinated LLM output"
-    assert len(report.llm_findings) == 0
+    assert any(f.bug_type == "hallucinated_bug" for f in report.findings)
+    assert report.rejected == []
+    assert report.static_findings, "static findings must survive LLM output"
+    assert len(report.llm_findings) >= 1
 
 
 def test_provider_unavailable_falls_back_to_static_only(

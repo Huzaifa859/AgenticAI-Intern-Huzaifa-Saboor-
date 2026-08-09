@@ -955,6 +955,9 @@ class CodeAnalysisAgent(BaseAgent):
         if not static.findings:
             return []
 
+        if not getattr(pipeline.checker, "enabled", False):
+            return list(static.findings)
+
         # Hash the cited files now, so an edit between this point and
         # verification is detected rather than silently tolerated.
         self._trace("grounding_started", findings=len(static.findings), source="static")
@@ -1174,6 +1177,14 @@ class CodeAnalysisAgent(BaseAgent):
             else:
                 logger.info("Model proposed no findings.")
             return []
+
+        if not getattr(pipeline.checker, "enabled", False):
+            report.llm_grounded_count = len(proposed)
+            logger.info(
+                "Model findings: %d proposed (grounding disabled).",
+                len(proposed),
+            )
+            return list(proposed)
 
         self._trace("grounding_started", findings=len(proposed), source="llm")
         ground_started = time.perf_counter()

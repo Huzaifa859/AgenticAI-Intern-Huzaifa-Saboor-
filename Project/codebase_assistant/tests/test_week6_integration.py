@@ -136,7 +136,9 @@ def test_week6_pipeline_produces_grounded_report(buggy_repository: Path) -> None
     missing = REQUIRED_BUG_TYPES - found_types
     assert not missing, f"missing expected bug types: {sorted(missing)}"
 
-    checker = GroundingChecker(workspace_root=repo)
+    # Explicitly enable grounding for this regression check; production
+    # defaults keep grounding off.
+    checker = GroundingChecker(workspace_root=repo, enabled=True)
     verification = checker.verify_reports(report.findings)
     assert len(verification.grounded) == len(report.findings)
     assert verification.rejected == []

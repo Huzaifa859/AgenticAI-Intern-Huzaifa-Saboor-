@@ -557,13 +557,13 @@ def test_lenient_mode_keeps_raw_model_text_when_json_fails(
 
 
 # ---------------------------------------------------------------------------
-# Documentation grounding / hallucination filtering
+# Documentation grounding disabled (content pass-through)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def grounded_repo(tmp_path: Path) -> Path:
-    """Repository with a real module layout for grounding checks."""
+    """Repository with a real module layout for documentation pass-through checks."""
     (tmp_path / "app").mkdir()
     (tmp_path / "app" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "app" / "auth.py").write_text(
@@ -602,7 +602,7 @@ def _grounding_payload(**overrides: Any) -> Dict[str, Any]:
 def test_grounding_all_references_valid(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Fully grounded documentation should succeed without removals."""
+    """Documentation succeeds and keeps model text without scrubbing."""
     from codebase_assistant.tracing.tracer import Tracer
 
     payload = _grounding_payload(
@@ -647,8 +647,7 @@ def test_grounding_all_references_valid(
     assert "authenticate" in response.output.summary
     assert "app/auth.py" in response.output.summary
     names = agent.tracer.event_names()
-    assert "documentation_grounding_started" in names
-    assert "documentation_grounding_finished" in names
+    assert "documentation_grounding_started" not in names
     assert "documentation_grounding_removed_claim" not in names
 
 
@@ -656,7 +655,7 @@ def test_grounding_all_references_valid(
 def test_grounding_nonexistent_file_removed(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Hallucinated file paths must be removed or rewritten."""
+    """With grounding disabled, model file paths are kept as returned."""
     payload = _grounding_payload(
         file_path="app/services/auth.py",
         function_name="authenticate",
@@ -680,10 +679,8 @@ def test_grounding_nonexistent_file_removed(
     )
 
     assert response.success is True
-    # Structured path is rewritten to a real inventory path (workspace-relative).
-    assert response.output.file_path in {"app/auth.py", "auth.py"}
-    assert "app/services/auth.py" not in response.output.summary
-    assert "app/services/auth.py" not in response.output.file_path
+    assert response.output.file_path == "app/services/auth.py"
+    assert "app/services/auth.py" in response.output.summary
     assert response.output.function_name == "authenticate"
 
 
@@ -691,7 +688,7 @@ def test_grounding_nonexistent_file_removed(
 def test_grounding_nonexistent_module_removed(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Unknown module claims should be stripped from README-style output."""
+    """With grounding disabled, README module claims are kept."""
     payload = _grounding_payload(
         file_path="app/auth.py",
         function_name="README",
@@ -716,16 +713,16 @@ def test_grounding_nonexistent_module_removed(
 
     assert response.success is True
     names = [item["name"] for item in response.output.parameters]
-    assert "app.services.billing" not in names
+    assert "app.services.billing" in names
     assert "app.auth" in names
-    assert "app.services.billing" not in response.output.summary
+    assert "app.services.billing" in response.output.summary
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
 def test_grounding_nonexistent_class_removed(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Hallucinated class names must not survive grounding."""
+    """With grounding disabled, class names from the model are kept."""
     payload = _grounding_payload(
         file_path="app/auth.py",
         function_name="authenticate",
@@ -760,9 +757,9 @@ def test_grounding_nonexistent_class_removed(
     )
 
     assert response.success is True
-    assert "AuthenticationService" not in response.output.summary
+    assert "AuthenticationService" in response.output.summary
     names = [item["name"] for item in response.output.parameters]
-    assert "AuthenticationService" not in names
+    assert "AuthenticationService" in names
     assert "AuthHelper" in names
 
 
@@ -770,7 +767,7 @@ def test_grounding_nonexistent_class_removed(
 def test_grounding_nonexistent_function_removed(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Hallucinated function symbols must be removed."""
+    """With grounding disabled, function symbols from the model are kept."""
     payload = _grounding_payload(
         file_path="app/auth.py",
         function_name="ghost_login",
@@ -805,10 +802,9 @@ def test_grounding_nonexistent_function_removed(
     )
 
     assert response.success is True
-    assert "ghost_login" not in (response.output.function_name or "")
-    assert "ghost_login" not in response.output.summary
+    assert "ghost_login" in response.output.summary
     names = [item["name"] for item in response.output.parameters]
-    assert "ghost_login" not in names
+    assert "ghost_login" in names
     assert "authenticate" in names
 
 
@@ -816,7 +812,7 @@ def test_grounding_nonexistent_function_removed(
 def test_grounding_mixed_valid_and_invalid_references(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """Valid references remain while invalid ones are scrubbed."""
+    """With grounding disabled, the full model summary/parameters are kept."""
     payload = _grounding_payload(
         file_path="app/auth.py",
         function_name="authenticate",
@@ -857,17 +853,17 @@ def test_grounding_mixed_valid_and_invalid_references(
     assert response.success is True
     assert "`authenticate`" in response.output.summary
     assert "app/auth.py" in response.output.summary
-    assert "app/services/auth.py" not in response.output.summary
-    assert "AuthenticationService" not in response.output.summary
+    assert "app/services/auth.py" in response.output.summary
+    assert "AuthenticationService" in response.output.summary
     names = [item["name"] for item in response.output.parameters]
-    assert names == ["authenticate"]
+    assert names == ["authenticate", "missing_fn"]
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
 def test_grounding_unchanged_when_everything_valid(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Grounding must be a no-op when every reference is already valid."""
+    """Disabled grounding is a no-op for valid documentation payloads."""
     original = dict(VALID_DOC_PAYLOAD)
     client = _mock_client(content=json.dumps(original))
     agent = _agent(client, _mock_retriever())
@@ -887,7 +883,7 @@ def test_grounding_unchanged_when_everything_valid(
 def test_grounding_abstains_when_nothing_can_be_verified(
     _mock_index: Any, grounded_repo: Path
 ) -> None:
-    """If every claim is unsupported, abstain instead of returning fiction."""
+    """With grounding disabled, unverifiable model text is still returned."""
     from codebase_assistant.tracing.tracer import Tracer
 
     payload = _grounding_payload(
@@ -921,11 +917,10 @@ def test_grounding_abstains_when_nothing_can_be_verified(
         )
     )
 
-    assert response.success is False
-    assert response.output.summary == ""
-    assert response.output.abstention is not None
-    assert "could not be grounded" in response.output.abstention.reason.lower()
-    assert "documentation_grounding_abstained" in agent.tracer.event_names()
+    assert response.success is True
+    assert "totally_fake" in response.output.summary
+    assert response.output.abstention is None
+    assert "documentation_grounding_abstained" not in agent.tracer.event_names()
 
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1441,7 @@ def test_targeted_nonexistent_function_abstains(
 def test_targeted_grounding_still_works(
     _mock_index: Any, targeted_repo: Path
 ) -> None:
-    """Scoped documentation still strips hallucinated references."""
+    """Scoped documentation keeps model text when grounding is disabled."""
     from codebase_assistant.tracing.tracer import Tracer
 
     payload = {
@@ -1487,10 +1482,10 @@ def test_targeted_grounding_still_works(
 
     assert response.success is True
     assert "authenticate" in response.output.summary.lower()
-    assert "ghost_helper" not in response.output.summary
-    assert "FakeModule" not in response.output.summary
+    assert "ghost_helper" in response.output.summary
+    assert "FakeModule" in response.output.summary
     param_names = [item["name"] for item in response.output.parameters]
-    assert "ghost_helper" not in param_names
+    assert "ghost_helper" in param_names
     assert "documentation_target_grounded" in agent.tracer.event_names()
 
 
@@ -1843,7 +1838,7 @@ def test_per_symbol_all_failures_abstain(
 def test_per_symbol_grounding_still_works(
     _mock_index: Any, multi_symbol_repo: Path
 ) -> None:
-    """Per-symbol grounding still strips hallucinated references."""
+    """Per-symbol docs keep model text when grounding is disabled."""
     payload = {
         "file_path": "math.py",
         "function_name": "add",
@@ -1877,8 +1872,8 @@ def test_per_symbol_grounding_still_works(
     )
 
     assert response.success is True
-    assert "ghost_helper" not in response.output.summary
-    assert "FakeModule" not in response.output.summary
+    assert "ghost_helper" in response.output.summary
+    assert "FakeModule" in response.output.summary
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
