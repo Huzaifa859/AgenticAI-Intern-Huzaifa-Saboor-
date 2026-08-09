@@ -158,23 +158,6 @@ _STAGE_WEIGHTS: Dict[str, Dict[str, float]] = {
 
 _PROGRESS_CSS = """
 <style>
-@keyframes ca-pulse {
-  0%, 100% { opacity: 0.45; }
-  50% { opacity: 1; }
-}
-@keyframes ca-ring {
-  0% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35); }
-  70% { box-shadow: 0 0 0 8px rgba(37, 99, 235, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
-}
-@keyframes ca-bar-sheen {
-  0% { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
-}
-@keyframes ca-fade-up {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
-}
 @keyframes ca-spin {
   to { transform: rotate(360deg); }
 }
@@ -187,21 +170,16 @@ div[data-testid="stStatusWidget"] {
   padding: 1rem 1.1rem 1.05rem;
   border-radius: 14px;
   border: 1px solid rgba(15, 23, 42, 0.10);
-  background:
-    radial-gradient(120% 80% at 0% 0%, rgba(37, 99, 235, 0.07), transparent 55%),
-    linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-  animation: ca-fade-up 0.35s ease-out;
+  /* Solid fill only — no fade/opacity animation (fragment refresh was
+     replaying enter animations and making cards twitch/brightness-shift). */
+  background: #ffffff;
 }
 .ca-run-card.ca-done {
-  background:
-    radial-gradient(120% 80% at 0% 0%, rgba(22, 163, 74, 0.08), transparent 55%),
-    #f0fdf4;
+  background: #f0fdf4;
   border-color: rgba(22, 163, 74, 0.25);
 }
 .ca-run-card.ca-error {
-  background:
-    radial-gradient(120% 80% at 0% 0%, rgba(220, 38, 38, 0.08), transparent 55%),
-    #fef2f2;
+  background: #fef2f2;
   border-color: rgba(220, 38, 38, 0.25);
 }
 .ca-run-top {
@@ -281,39 +259,24 @@ div[data-testid="stStatusWidget"] {
 .ca-bar-fill {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #1d4ed8 0%, #0f766e 55%, #2563eb 100%);
-  background-size: 200% 100%;
-  animation: ca-bar-sheen 2.4s linear infinite;
+  background: #2563eb;
   transition: width 0.45s ease;
 }
 .ca-run-card.ca-done .ca-bar-fill {
-  animation: none;
   background: #16a34a;
 }
 .ca-run-card.ca-error .ca-bar-fill {
-  animation: none;
   background: #dc2626;
 }
 .ca-bar-glow {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(255,255,255,0.35) 50%,
-    transparent 100%
-  );
-  background-size: 40% 100%;
-  animation: ca-bar-sheen 1.8s ease-in-out infinite;
-  pointer-events: none;
-  opacity: 0.55;
+  display: none;
 }
 .ca-stage-panel {
   margin: 0.35rem 0 0.25rem;
   padding: 0.75rem 0.85rem 0.65rem;
   border-radius: 12px;
   border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(248, 250, 252, 0.9);
+  background: #f8fafc;
 }
 .ca-stage-panel-head {
   display: flex;
@@ -343,10 +306,9 @@ div[data-testid="stStatusWidget"] {
   color: #334155;
   font-size: 0.88rem;
   line-height: 1.35;
-  animation: ca-fade-up 0.3s ease-out;
 }
 .ca-stage-item.ca-active {
-  background: rgba(37, 99, 235, 0.07);
+  background: #eff6ff;
   color: #0f172a;
   font-weight: 550;
 }
@@ -366,7 +328,6 @@ div[data-testid="stStatusWidget"] {
 }
 .ca-stage-item.ca-active .ca-stage-mark {
   background: #2563eb;
-  animation: ca-pulse 1.1s ease-in-out infinite, ca-ring 1.6s ease-out infinite;
 }
 div[data-testid="stProgress"] > div {
   border-radius: 999px !important;
@@ -381,7 +342,7 @@ div[data-testid="stProgress"] > div > div {
   border-radius: 10px;
   padding: 0.55rem 0.65rem 0.45rem;
   margin-bottom: 0.45rem;
-  background: rgba(255, 255, 255, 0.72);
+  background: #ffffff;
 }
 .ca-history-title {
   font-size: 0.84rem;
