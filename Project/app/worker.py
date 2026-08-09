@@ -2,10 +2,11 @@
 app/worker.py
 =============
 
-Run one agent job in a separate process and write a JSON result file.
+Run one agent job and write a JSON result file.
 
-Used by the Streamlit UI so embedding/LLM memory pressure or a worker
-crash cannot take down the Streamlit server.
+Used by:
+- one-shot CLI: ``python app/worker.py --job ...``
+- long-lived ``worker_server.py`` (warm Supervisor + embeddings)
 
 Optional ``--progress`` writes NDJSON stage lines for live UI updates.
 
@@ -24,7 +25,7 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,11 +124,14 @@ class ProgressWriter:
             pass
 
 
-def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> None:
-    """Forward selected Tracer.record calls into the progress file."""
+def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> Callable[[], None]:
+    """Forward selected Tracer.record calls into the progress file.
+
+    Returns a restore callable that puts the original ``record`` back.
+    """
     tracer = getattr(supervisor, "tracer", None)
     if tracer is None or not progress.path:
-        return
+        return lambda: None
     original_record = tracer.record
 
     def record(event_type: Any, name: str, **metadata: Any) -> None:
@@ -137,7 +141,6 @@ def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> None:
             return
         message = _STAGE_MESSAGES.get(stage)
         if message is None:
-            # Keep high-signal agent stages; skip noisy internals.
             interesting = (
                 stage.startswith("documentation_")
                 or stage.startswith("testing_")
@@ -153,6 +156,11 @@ def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> None:
         progress.emit(stage, message)
 
     tracer.record = record  # type: ignore[method-assign]
+
+    def restore() -> None:
+        tracer.record = original_record  # type: ignore[method-assign]
+
+    return restore
 
 
 def _finding_to_dict(finding: Any) -> Dict[str, Any]:
@@ -176,12 +184,7 @@ def _finding_to_dict(finding: Any) -> Dict[str, Any]:
 
 
 def _ungrounded_candidates_from_report(report: Any) -> List[Dict[str, Any]]:
-    """
-    Slim view of grounding rejections for the UI.
-
-    These are never mixed into verified ``findings``; the Streamlit checkbox
-    only controls whether they are displayed.
-    """
+    """Slim view of grounding rejections for the UI."""
     candidates: List[Dict[str, Any]] = []
     for result in list(getattr(report, "rejected", None) or []):
         nested = getattr(result, "report", None)
@@ -270,6 +273,129 @@ def _write(path: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
+class JobCancelled(Exception):
+    """Raised when a cooperative cancel is requested before/during a job."""
+
+
+def execute_job(
+    *,
+    job: str,
+    repo: str,
+    out: str,
+    progress_path: str = "",
+    question: str = "Find bugs and potential issues",
+    mode: str = "",
+    file_path: str = "",
+    function_name: str = "",
+    class_name: str = "",
+    write_to_disk: bool = False,
+    replace_existing: bool = False,
+    supervisor: Any = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """
+    Run one agent job, write ``out``, and return the result payload.
+
+    When ``supervisor`` is provided (warm worker server), it is reused so
+    embeddings stay loaded. Otherwise a fresh Supervisor is built.
+    """
+    progress = ProgressWriter(progress_path)
+    progress.emit("job_started", f"Starting {job} job...")
+
+    def _cancelled() -> bool:
+        return bool(should_cancel and should_cancel())
+
+    try:
+        if _cancelled():
+            raise JobCancelled("cancelled by user")
+
+        from service import (
+            build_supervisor,
+            run_analysis,
+            run_documentation,
+            run_testing,
+        )
+
+        owns_supervisor = supervisor is None
+        if owns_supervisor:
+            supervisor = build_supervisor()
+        restore_tracer = _attach_tracer_progress(supervisor, progress)
+        try:
+            if _cancelled():
+                raise JobCancelled("cancelled by user")
+
+            if job == "analysis":
+                progress.emit("analysis_started", "Starting code analysis...")
+                report = run_analysis(supervisor, repo, question=question)
+                payload: Dict[str, Any] = {
+                    "ok": True,
+                    "job": job,
+                    "result": _analysis_to_dict(report),
+                }
+            elif job == "documentation":
+                progress.emit("documentation_started", "Starting documentation...")
+                result = run_documentation(
+                    supervisor,
+                    repo,
+                    mode=mode,
+                    file_path=file_path,
+                    function_name=function_name,
+                    class_name=class_name,
+                    write_to_disk=bool(write_to_disk),
+                    replace_existing=bool(replace_existing),
+                )
+                payload = {
+                    "ok": True,
+                    "job": job,
+                    "result": result.model_dump(),
+                }
+            elif job == "testing":
+                progress.emit("testing_started", "Starting test generation...")
+                result = run_testing(
+                    supervisor,
+                    repo,
+                    mode=mode,
+                    file_path=file_path,
+                    function_name=function_name,
+                )
+                payload = {
+                    "ok": True,
+                    "job": job,
+                    "result": result.model_dump(),
+                }
+            else:
+                raise ValueError(f"Unknown job type: {job!r}")
+
+            if _cancelled():
+                raise JobCancelled("cancelled by user")
+
+            _write(out, payload)
+            progress.emit("job_finished", f"{job.capitalize()} job complete")
+            return payload
+        finally:
+            restore_tracer()
+    except JobCancelled as exc:
+        payload = {
+            "ok": False,
+            "job": job,
+            "error": str(exc) or "cancelled by user",
+            "cancelled": True,
+        }
+        _write(out, payload)
+        progress.emit("job_failed", "Job cancelled")
+        return payload
+    except Exception as exc:  # noqa: BLE001 — always emit a JSON error payload
+        payload = {
+            "ok": False,
+            "job": job,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        progress.emit("job_failed", f"Worker failed: {exc}")
+        _write(out, payload)
+        return payload
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Codebase Assistant UI worker")
     parser.add_argument(
@@ -293,72 +419,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--replace-existing", action="store_true")
     args = parser.parse_args(argv)
 
-    progress = ProgressWriter(args.progress)
-    progress.emit("job_started", f"Starting {args.job} job...")
-
-    try:
-        from service import (
-            build_supervisor,
-            run_analysis,
-            run_documentation,
-            run_testing,
-        )
-
-        supervisor = build_supervisor()
-        _attach_tracer_progress(supervisor, progress)
-
-        if args.job == "analysis":
-            progress.emit("analysis_started", "Starting code analysis...")
-            report = run_analysis(
-                supervisor, args.repo, question=args.question
-            )
-            payload = {"ok": True, "job": args.job, "result": _analysis_to_dict(report)}
-        elif args.job == "documentation":
-            progress.emit("documentation_started", "Starting documentation...")
-            result = run_documentation(
-                supervisor,
-                args.repo,
-                mode=args.mode,
-                file_path=args.file,
-                function_name=args.function,
-                class_name=args.class_name,
-                write_to_disk=bool(args.write_to_disk),
-                replace_existing=bool(args.replace_existing),
-            )
-            payload = {
-                "ok": True,
-                "job": args.job,
-                "result": result.model_dump(),
-            }
-        else:
-            progress.emit("testing_started", "Starting test generation...")
-            result = run_testing(
-                supervisor,
-                args.repo,
-                mode=args.mode,
-                file_path=args.file,
-                function_name=args.function,
-            )
-            payload = {
-                "ok": True,
-                "job": args.job,
-                "result": result.model_dump(),
-            }
-        _write(args.out, payload)
-        progress.emit("job_finished", f"{args.job.capitalize()} job complete")
-        return 0
-    except Exception as exc:  # noqa: BLE001 — always emit a JSON error payload
-        progress.emit("job_failed", f"Worker failed: {exc}")
-        _write(
-            args.out,
-            {
-                "ok": False,
-                "job": args.job,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            },
-        )
-        return 1
+    payload = execute_job(
+        job=args.job,
+        repo=args.repo,
+        out=args.out,
+        progress_path=args.progress,
+        question=args.question,
+        mode=args.mode,
+        file_path=args.file,
+        function_name=args.function,
+        class_name=args.class_name,
+        write_to_disk=bool(args.write_to_disk),
+        replace_existing=bool(args.replace_existing),
+    )
+    return 0 if payload.get("ok") else 1
 
 
 if __name__ == "__main__":

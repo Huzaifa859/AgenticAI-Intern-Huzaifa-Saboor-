@@ -412,6 +412,9 @@ Variables below are loaded by `Config.load()` (from `Project/.env` and the proce
 | `DOCUMENTATION_LENIENT` | No | `true` | Keep imperfect documentation LLM text (with warnings) instead of emptying on JSON/grounding failures. Set `false` for strict abstention. |
 | `TESTING_LENIENT` | No | `true` | Salvage pytest source from non-JSON testing model output instead of abstaining with an empty suite. Set `false` for strict abstention. |
 | `ANALYSIS_SHOW_UNGROUNDED` | No | `false` | When `true`, the CLI analysis report also prints findings that failed grounding as unverified candidates. The Streamlit UI has a separate checkbox for the same view. |
+| `CA_WORKER_URL` | No | `http://127.0.0.1:8765` | Base URL for the long-lived warm Streamlit worker (`GET /health`, `POST /jobs`). Localhost only; not published from Docker. |
+| `CA_WORKER_PORT` | No | `8765` | Port for `app/worker_server.py` (and auto-spawn from the UI). |
+| `CA_WORKER_HOST` | No | `127.0.0.1` | Bind address for the warm worker server. |
 
 Model identifiers (`openrouter_model`, `claude_model`, `ollama_model`) are Config defaults (`nvidia/nemotron-3-ultra-550b-a55b:free` and `llama3`) unless changed in code/configuration objects.
 
@@ -490,7 +493,7 @@ streamlit run app/streamlit_app.py --server.fileWatcherType=none
 
 `Project/.streamlit/config.toml` sets `server.headless = false` so Streamlit auto-opens a browser tab on startup (uses your OS default browser; `run_ui.bat` prefers Chrome when installed). It also disables the file watcher (Chroma writes used to restart the app mid-run).
 
-Agent jobs run in a separate `app/worker.py` process so embedding/LLM memory use cannot kill the Streamlit server.
+Agent jobs prefer a long-lived warm worker (`app/worker_server.py`) that keeps the Supervisor and `sentence-transformers` model loaded across Runs. Streamlit submits jobs over localhost HTTP (`CA_WORKER_URL`, default `http://127.0.0.1:8765`). On first Run the UI auto-spawns the server if needed (or start it manually with `run_worker_server.bat`). The first boot still pays the embedding preload once; later Analysis / Docs / Testing reuse the warm model. If the server cannot start, the UI falls back to a one-shot `app/worker.py` subprocess. Progress and results still use temp NDJSON/JSON files.
 
 While a job runs, the UI polls an NDJSON progress file from the worker and shows **live stage updates** with a progress bar (indexing, model call, grounding, pytest, and similar). Use **Stop run** to cancel a long job. This is stage progress only — not LLM token streaming into the chat pane.
 
@@ -533,9 +536,12 @@ Browser
    │
    ▼
 Streamlit (:8501)
+   │  localhost HTTP
+   ▼
+Warm worker (:8765, not published)
    │
    ▼
-Supervisor  (+ worker subprocess in same container)
+Supervisor + warm embeddings
    │
    ▼
 Agents (Analysis / Documentation / Testing)
@@ -543,6 +549,8 @@ Agents (Analysis / Documentation / Testing)
    ▼
 OpenRouter
 ```
+
+The image entrypoint (`app/docker_entrypoint.py`) starts `worker_server.py` before Streamlit. Only port `8501` is published.
 
 ### Persistent volume (`ca_data` → `/data`)
 
@@ -653,9 +661,13 @@ Project/
 │   ├── ui_memory.py            # Shared ConversationMemory helpers (CLI + Streamlit)
 │   ├── ui_paths.py             # DATA_DIR / Chroma / memory / history path helpers
 │   ├── ui_export.py            # Markdown/JSON download helpers
-│   ├── worker.py               # Isolated agent job subprocess (+ progress NDJSON)
+│   ├── worker.py               # Shared execute_job + one-shot CLI worker
+│   ├── worker_server.py        # Long-lived warm worker (HTTP localhost)
+│   ├── worker_client.py        # Streamlit helpers for warm worker HTTP API
+│   ├── docker_entrypoint.py    # Docker: start warm worker, then Streamlit
 │   └── streamlit_app.py        # Streamlit web UI entry point
 ├── run_ui.bat                  # Launch Streamlit UI
+├── run_worker_server.bat       # Optional manual warm-worker start
 ├── run_mcp.bat                 # Launch MCP stdio server
 ├── run_mcp_claude.bat          # Claude Desktop-friendly MCP launcher
 ├── Dockerfile                  # Streamlit image (OpenRouter)

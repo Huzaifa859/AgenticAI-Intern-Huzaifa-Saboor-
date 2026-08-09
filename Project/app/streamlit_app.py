@@ -12,9 +12,10 @@ Or double-click / run:
 
     run_ui.bat
 
-Agent jobs run in a separate ``worker.py`` process so embedding/LLM
-memory pressure cannot kill the Streamlit server. Live stage progress
-is tailed from an NDJSON progress file; completed runs are kept in a
+Agent jobs prefer a long-lived warm ``worker_server`` (embeddings +
+Supervisor stay loaded). If that server is unavailable, Streamlit falls
+back to a one-shot ``worker.py`` subprocess. Live stage progress is
+tailed from an NDJSON progress file; completed runs are kept in a
 capped sidebar history. Session conversation memory (repo/targets/short
 summaries) is owned by the Streamlit process via ``ui_memory``.
 """
@@ -41,6 +42,13 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
+
+from worker_client import (  # noqa: E402
+    cancel_job as _cancel_warm_job,
+    ensure_worker_server,
+    job_status as _warm_job_status,
+    submit_job as _submit_warm_job,
+)
 
 from codebase_assistant.exceptions.tool_exceptions import (  # noqa: E402
     InvalidRepositoryURLError,
@@ -741,7 +749,9 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _worker_exited(job_state: Dict[str, Any]) -> bool:
-    """Return True when the worker subprocess has exited (or is a zombie)."""
+    """Return True when the one-shot worker subprocess has exited."""
+    if str(job_state.get("transport") or "") == "warm":
+        return False
     process = job_state.get("process")
     if isinstance(process, subprocess.Popen):
         try:
@@ -750,6 +760,22 @@ def _worker_exited(job_state: Dict[str, Any]) -> bool:
         except OSError:
             return True
     return not _pid_alive(int(job_state.get("pid") or 0))
+
+
+def _warm_job_finished(job_state: Dict[str, Any]) -> bool:
+    """Return True when the warm worker reports a terminal job status."""
+    if str(job_state.get("transport") or "") != "warm":
+        return False
+    job_id = str(job_state.get("job_id") or "")
+    if not job_id:
+        return False
+    try:
+        status = str(_warm_job_status(job_id).get("status") or "")
+    except Exception:
+        # If the server vanished, fall back to result-file readiness.
+        return _result_ready(job_state)
+    job_state["warm_status"] = status
+    return status in {"done", "error", "cancelled"}
 
 
 def _result_ready(job_state: Dict[str, Any]) -> bool:
@@ -839,27 +865,17 @@ def _apply_success_result(agent: str, result: Dict[str, Any], target: str) -> No
     _set_active_tab(agent)
 
 
-def _start_worker(
-    agent: str,
+def _start_oneshot_worker(
+    *,
     job: str,
     repo_path: str,
-    *,
-    target: str,
-    **fields: Any,
-) -> None:
-    """Launch the worker subprocess and park state for the live monitor."""
-    fd, out_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".json")
-    os.close(fd)
-    progress_fd, progress_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".ndjson")
-    os.close(progress_fd)
-    err_fd, stderr_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".err")
-    os.close(err_fd)
-    try:
-        with open(progress_path, "w", encoding="utf-8"):
-            pass
-    except OSError:
-        pass
-
+    out_path: str,
+    progress_path: str,
+    stderr_path: str,
+    fields: Dict[str, Any],
+    env: Dict[str, str],
+) -> subprocess.Popen:
+    """Launch the legacy one-shot worker.py subprocess."""
     cmd = [
         sys.executable,
         _WORKER_PATH,
@@ -887,13 +903,9 @@ def _start_worker(
     if fields.get("replace_existing"):
         cmd.append("--replace-existing")
 
-    env = os.environ.copy()
-    env.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
-    env.setdefault("MEMORY_STORE_PATH", memory_store_path())
-
     err_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
     try:
-        process = subprocess.Popen(
+        return subprocess.Popen(
             cmd,
             cwd=_PROJECT_ROOT,
             env=env,
@@ -901,23 +913,94 @@ def _start_worker(
             stderr=err_handle,
             text=True,
         )
-    except Exception:
-        err_handle.close()
-        _cleanup_paths(out_path, progress_path, stderr_path)
-        raise
     finally:
-        # Child keeps the inherited handle; parent can close its copy.
         try:
             err_handle.close()
         except OSError:
             pass
 
+
+def _start_worker(
+    agent: str,
+    job: str,
+    repo_path: str,
+    *,
+    target: str,
+    **fields: Any,
+) -> None:
+    """Submit a job to the warm worker (or one-shot fallback) and monitor it."""
+    fd, out_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".json")
+    os.close(fd)
+    progress_fd, progress_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".ndjson")
+    os.close(progress_fd)
+    err_fd, stderr_path = tempfile.mkstemp(prefix="ca_ui_", suffix=".err")
+    os.close(err_fd)
+    try:
+        with open(progress_path, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+
+    env = os.environ.copy()
+    env.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
+    env.setdefault("MEMORY_STORE_PATH", memory_store_path())
+
+    transport = "oneshot"
+    process: Optional[subprocess.Popen] = None
+    job_id = ""
+    stage_message = "Starting worker…"
+    log_line = "Queued — launching isolated worker process…"
+
+    health = ensure_worker_server(env=env)
+    if health is not None and health.get("model_loaded"):
+        try:
+            submitted = _submit_warm_job(
+                {
+                    "job": job,
+                    "repo": repo_path,
+                    "out": out_path,
+                    "progress": progress_path,
+                    "question": str(fields.get("question") or ""),
+                    "mode": str(fields.get("mode") or ""),
+                    "file": str(fields.get("file_path") or ""),
+                    "function": str(fields.get("function_name") or ""),
+                    "class_name": str(fields.get("class_name") or ""),
+                    "write_to_disk": bool(fields.get("write_to_disk")),
+                    "replace_existing": bool(fields.get("replace_existing")),
+                }
+            )
+            job_id = str(submitted.get("id") or "")
+            transport = "warm"
+            stage_message = "Warm worker ready…"
+            log_line = "Queued — using warm worker (embeddings already loaded)…"
+        except Exception:
+            transport = "oneshot"
+
+    if transport != "warm":
+        try:
+            process = _start_oneshot_worker(
+                job=job,
+                repo_path=repo_path,
+                out_path=out_path,
+                progress_path=progress_path,
+                stderr_path=stderr_path,
+                fields=fields,
+                env=env,
+            )
+        except Exception:
+            _cleanup_paths(out_path, progress_path, stderr_path)
+            raise
+        stage_message = "Starting worker…"
+        log_line = "Queued — launching isolated worker process…"
+
     started = time.monotonic()
-    st.session_state.job_log = ["Queued — launching isolated worker process…"]
+    st.session_state.job_log = [log_line]
     # Reset stages visibility for each new run; user can hide during the run.
     st.session_state.job_show_stages = True
     st.session_state.active_job = {
-        "pid": int(process.pid or 0),
+        "transport": transport,
+        "job_id": job_id,
+        "pid": int(process.pid or 0) if process is not None else 0,
         # Keep the Popen handle so we can poll()/wait() and reap zombies on Linux.
         "process": process,
         "job": job,
@@ -933,13 +1016,14 @@ def _start_worker(
         "stderr_path": stderr_path,
         "offset": 0,
         "fraction": 0.02,
-        "stage_message": "Starting worker…",
+        "stage_message": stage_message,
         "started_mono": started,
         "started_at": _local_now_iso(),
         "last_creep": started,
         "last_message": "",
         "cancelled": False,
         "terminal_stage": False,
+        "warm_status": "",
     }
     st.session_state.last_agent = agent
     st.session_state.last_error = ""
@@ -965,13 +1049,19 @@ def _finalize_active_job(*, cancelled: bool = False) -> None:
 
     try:
         if cancelled:
+            warm_id = str(job_state.get("job_id") or "")
+            if str(job_state.get("transport") or "") == "warm" and warm_id:
+                try:
+                    _cancel_warm_job(warm_id)
+                except Exception:
+                    pass
             if isinstance(process, subprocess.Popen):
                 try:
                     process.kill()
                     process.wait(timeout=2)
                 except Exception:
                     _kill_pid(pid)
-            else:
+            elif pid > 0:
                 _kill_pid(pid)
             message = f"{agent} cancelled by user"
             st.session_state.last_error = message
@@ -1100,14 +1190,17 @@ def _poll_active_job() -> None:
         job_state["last_creep"] = now
 
     st.session_state.active_job = job_state
-    # Finalize when the process exits OR when the worker already wrote the
-    # terminal result (avoids Linux zombie PIDs leaving the bar at 100%).
-    if _worker_exited(job_state) or (
-        job_state.get("terminal_stage") and _result_ready(job_state)
+    # Finalize when the one-shot process exits, the warm server reports a
+    # terminal status, or the worker already wrote the result JSON.
+    if (
+        _worker_exited(job_state)
+        or _warm_job_finished(job_state)
+        or (job_state.get("terminal_stage") and _result_ready(job_state))
     ):
         # Small grace so the worker can flush result JSON.
         time.sleep(0.15)
-        _finalize_active_job(cancelled=False)
+        warm_status = str(job_state.get("warm_status") or "")
+        _finalize_active_job(cancelled=warm_status == "cancelled")
 
 
 @st.fragment(run_every=timedelta(seconds=1.5))

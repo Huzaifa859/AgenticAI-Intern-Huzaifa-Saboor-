@@ -46,12 +46,12 @@ ENV PYTHONPATH=/app \
     CODEBASE_ASSISTANT_DATA_DIR=/data \
     CHROMA_PERSIST_DIR=/data/chroma \
     MEMORY_STORE_PATH=/data/memory \
-    RUN_HISTORY_PATH=/data/history/ui_run_history.jsonl
+    RUN_HISTORY_PATH=/data/history/ui_run_history.jsonl \
+    CA_WORKER_HOST=127.0.0.1 \
+    CA_WORKER_PORT=8765 \
+    CA_WORKER_URL=http://127.0.0.1:8765
 
 EXPOSE 8501
 
-CMD ["streamlit", "run", "app/streamlit_app.py", \
-     "--server.address=0.0.0.0", \
-     "--server.port=8501", \
-     "--server.headless=true", \
-     "--server.fileWatcherType=none"]
+# Warm worker on localhost:8765, then Streamlit on :8501 (only :8501 published).
+CMD ["python", "app/docker_entrypoint.py"]
