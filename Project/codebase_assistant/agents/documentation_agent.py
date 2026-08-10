@@ -903,16 +903,24 @@ class DocumentationAgent(BaseAgent):
         verified_total = 0
         removed_total = 0
 
-        for symbol in selected:
+        # Run per-symbol LLM calls concurrently. Each call is independent
+        # (no shared mutable state), so ThreadPoolExecutor gives the same
+        # real-world speed as asyncio for network-bound work without
+        # requiring any changes to the synchronous provider.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        _MAX_DOC_WORKERS = 10
+
+        def _run_one(symbol):  # type: ignore[no-untyped-def]
             self._trace(
                 "documentation_symbol_started",
                 symbol=symbol.qualname,
                 module=symbol.module_path,
                 kind=symbol.kind,
             )
-            symbol_started = time.perf_counter()
+            t0 = time.perf_counter()
             try:
-                symbol_result, grounded_ok, v_count, r_count = self._document_one_symbol(
+                result, grounded_ok, v_count, r_count = self._document_one_symbol(
                     symbol=symbol,
                     mode=mode,
                     instruction=instruction,
@@ -920,85 +928,94 @@ class DocumentationAgent(BaseAgent):
                     inventory=inventory,
                     target_path=target_path,
                 )
+                return symbol, result, grounded_ok, v_count, r_count, None, t0
             except Exception as exc:
-                logger.warning(
-                    "Documentation failed for symbol %s: %s", symbol.qualname, exc
-                )
-                self._trace(
-                    "documentation_symbol_failed",
-                    symbol=symbol.qualname,
-                    module=symbol.module_path,
-                    error=str(exc),
-                    duration_ms=(time.perf_counter() - symbol_started) * 1000.0,
-                )
-                warnings.append(f"{symbol.qualname}: {exc}")
-                continue
+                return symbol, None, False, 0, 0, exc, t0
 
-            duration_ms = (time.perf_counter() - symbol_started) * 1000.0
-            has_body = bool(
-                symbol_result.summary and symbol_result.summary.strip()
-            )
-            clean = (
-                grounded_ok
-                and has_body
-                and symbol_result.abstention is None
-            )
-            if clean:
-                partial_results.append(symbol_result)
-                verified_total += v_count
-                removed_total += r_count
-                self._trace(
-                    "documentation_symbol_finished",
-                    symbol=symbol.qualname,
-                    module=symbol.module_path,
-                    duration_ms=duration_ms,
-                    success=True,
+        with ThreadPoolExecutor(max_workers=_MAX_DOC_WORKERS) as pool:
+            futures = {pool.submit(_run_one, sym): sym for sym in selected}
+            for future in as_completed(futures):
+                symbol, symbol_result, grounded_ok, v_count, r_count, exc, symbol_started = future.result()
+
+                if exc is not None:
+                    logger.warning(
+                        "Documentation failed for symbol %s: %s", symbol.qualname, exc
+                    )
+                    self._trace(
+                        "documentation_symbol_failed",
+                        symbol=symbol.qualname,
+                        module=symbol.module_path,
+                        error=str(exc),
+                        duration_ms=(time.perf_counter() - symbol_started) * 1000.0,
+                    )
+                    warnings.append(f"{symbol.qualname}: {exc}")
+                    continue
+
+                duration_ms = (time.perf_counter() - symbol_started) * 1000.0
+                has_body = bool(
+                    symbol_result.summary and symbol_result.summary.strip()
                 )
-            elif has_body and self._lenient():
-                # Demo path: keep imperfect model text instead of dropping it.
-                kept = DocumentationResult(
-                    file_path=symbol_result.file_path,
-                    function_name=symbol_result.function_name,
-                    summary=symbol_result.summary,
-                    parameters=list(symbol_result.parameters or []),
-                    returns=symbol_result.returns or "",
-                    example_usage=symbol_result.example_usage or "",
-                    abstention=None,
+                clean = (
+                    grounded_ok
+                    and has_body
+                    and symbol_result.abstention is None
                 )
-                partial_results.append(kept)
-                verified_total += v_count
-                removed_total += r_count
-                reason = (
-                    symbol_result.abstention.reason
-                    if symbol_result.abstention is not None
-                    else "imperfect grounding or JSON shape"
-                )
-                warnings.append(
-                    f"{symbol.qualname}: kept model output despite {reason}"
-                )
-                self._trace(
-                    "documentation_symbol_finished",
-                    symbol=symbol.qualname,
-                    module=symbol.module_path,
-                    duration_ms=duration_ms,
-                    success=True,
-                    lenient=True,
-                    reason=reason,
-                )
-            else:
-                reason = (
-                    symbol_result.abstention.reason
-                    if symbol_result.abstention is not None
-                    else "empty or ungrounded documentation"
-                )
-                warnings.append(f"{symbol.qualname}: {reason}")
-                self._trace(
-                    "documentation_symbol_failed",
-                    symbol=symbol.qualname,
-                    module=symbol.module_path,
-                    reason=reason,
-                    duration_ms=duration_ms,
-                )
+                if clean:
+                    partial_results.append(symbol_result)
+                    verified_total += v_count
+                    removed_total += r_count
+                    self._trace(
+                        "documentation_symbol_finished",
+                        symbol=symbol.qualname,
+                        module=symbol.module_path,
+                        duration_ms=duration_ms,
+                        success=True,
+                    )
+                elif has_body and self._lenient():
+                    # Demo path: keep imperfect model text instead of dropping it.
+                    kept = DocumentationResult(
+                        file_path=symbol_result.file_path,
+                        function_name=symbol_result.function_name,
+                        summary=symbol_result.summary,
+                        parameters=list(symbol_result.parameters or []),
+                        returns=symbol_result.returns or "",
+                        example_usage=symbol_result.example_usage or "",
+                        abstention=None,
+                    )
+                    partial_results.append(kept)
+                    verified_total += v_count
+                    removed_total += r_count
+                    reason = (
+                        symbol_result.abstention.reason
+                        if symbol_result.abstention is not None
+                        else "imperfect grounding or JSON shape"
+                    )
+                    warnings.append(
+                        f"{symbol.qualname}: kept model output despite {reason}"
+                    )
+                    self._trace(
+                        "documentation_symbol_finished",
+                        symbol=symbol.qualname,
+                        module=symbol.module_path,
+                        duration_ms=duration_ms,
+                        success=True,
+                        lenient=True,
+                        reason=reason,
+                    )
+                else:
+                    reason = (
+                        symbol_result.abstention.reason
+                        if symbol_result.abstention is not None
+                        else "empty or ungrounded documentation"
+                    )
+                    warnings.append(f"{symbol.qualname}: {reason}")
+                    self._trace(
+                        "documentation_symbol_failed",
+                        symbol=symbol.qualname,
+                        module=symbol.module_path,
+                        reason=reason,
+                        duration_ms=duration_ms,
+                    )
 
         if not partial_results:
             # Prefer concrete failure reasons when they are uniform / singular

@@ -780,14 +780,24 @@ class TestingAgent(BaseAgent):
         repair_excerpts: List[str] = []
         seen_excerpt_paths: Set[str] = set()
 
-        for symbol in selected:
+        # Run per-symbol LLM calls concurrently. Each call is fully independent
+        # (separate prompt, no shared mutable state between symbols).
+        # ThreadPoolExecutor is preferred over asyncio: it reuses the existing
+        # synchronous provider without any provider rewrites, and network-bound
+        # work releases the GIL so threads are truly concurrent.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        _MAX_TEST_WORKERS = 10
+
+        def _run_one_symbol(symbol):  # type: ignore[no-untyped-def]
+            """Generate tests for one symbol; returns all data needed by caller."""
             self._trace(
                 "testing_symbol_generation_started",
                 kind=symbol.kind,
                 symbol=symbol.qualname,
                 module_path=symbol.module_path,
             )
-            symbol_started = time.perf_counter()
+            t0 = time.perf_counter()
             query = " ".join(
                 part
                 for part in (
@@ -800,8 +810,26 @@ class TestingAgent(BaseAgent):
                 if part
             )
             chunks = self._retrieve_context(query, symbol.module_path)
-            if chunks:
-                repair_chunks.extend(chunks)
+
+            # Collect repair excerpt for this module (thread-local, returned).
+            module_excerpt = None
+            try:
+                if filesystem.file_exists(symbol.module_path):
+                    module_text = filesystem.read_file(symbol.module_path)
+                    module_excerpt = (
+                        symbol.module_path,
+                        self._format_file_excerpt(
+                            symbol.module_path,
+                            module_text,
+                            _MAX_FILE_CHARS_WITH_RETRIEVAL,
+                        ),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not read module %s for repair context: %s",
+                    symbol.module_path,
+                    exc,
+                )
 
             excerpt = self._format_file_excerpt(
                 symbol.module_path,
@@ -809,25 +837,6 @@ class TestingAgent(BaseAgent):
                 max_chars=_MAX_FILE_CHARS,
             )
             source_excerpts = [excerpt]
-            if symbol.module_path not in seen_excerpt_paths:
-                # Prefer a broader module excerpt for repair context.
-                try:
-                    if filesystem.file_exists(symbol.module_path):
-                        module_text = filesystem.read_file(symbol.module_path)
-                        repair_excerpts.append(
-                            self._format_file_excerpt(
-                                symbol.module_path,
-                                module_text,
-                                _MAX_FILE_CHARS_WITH_RETRIEVAL,
-                            )
-                        )
-                        seen_excerpt_paths.add(symbol.module_path)
-                except Exception as exc:
-                    logger.warning(
-                        "Could not read module %s for repair context: %s",
-                        symbol.module_path,
-                        exc,
-                    )
 
             prompt = self._build_symbol_prompt(
                 instruction=instruction,
@@ -871,9 +880,9 @@ class TestingAgent(BaseAgent):
                     success=False,
                     symbol=symbol.qualname,
                     error=str(exc),
-                    duration_ms=(time.perf_counter() - symbol_started) * 1000.0,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
                 )
-                continue
+                return None, chunks, module_excerpt
 
             self._trace(
                 "model_response",
@@ -939,10 +948,23 @@ class TestingAgent(BaseAgent):
                 success=bool(normalized.generated_tests),
                 symbol=symbol.qualname,
                 files=len(normalized.generated_tests),
-                duration_ms=(time.perf_counter() - symbol_started) * 1000.0,
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
             )
-            if normalized.generated_tests:
-                partial_results.append(normalized)
+            return normalized, chunks, module_excerpt
+
+        with ThreadPoolExecutor(max_workers=_MAX_TEST_WORKERS) as pool:
+            futures = [pool.submit(_run_one_symbol, sym) for sym in selected]
+            for future in as_completed(futures):
+                normalized, sym_chunks, module_excerpt = future.result()
+                if sym_chunks:
+                    repair_chunks.extend(sym_chunks)
+                if module_excerpt is not None:
+                    path, text = module_excerpt
+                    if path not in seen_excerpt_paths:
+                        repair_excerpts.append(text)
+                        seen_excerpt_paths.add(path)
+                if normalized is not None and normalized.generated_tests:
+                    partial_results.append(normalized)
 
         result = self._merge_testing_results(partial_results)
         self._trace(
