@@ -131,6 +131,53 @@ def test_successful_chat_completion(
 
 @patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
 @patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_response_format_forwarded_in_payload(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """Structured JSON response_format must be sent to OpenRouter."""
+    mock_post.return_value = _http_response(
+        200, _success_payload(content='{"ok": true}')
+    )
+    provider = _provider()
+
+    provider.generate(
+        MESSAGES,
+        response_format={"type": "json_object"},
+    )
+
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["response_format"] == {"type": "json_object"}
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_response_format_rejected_retries_without_format(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """HTTP 400 on response_format should retry once without the constraint."""
+    mock_post.side_effect = [
+        _http_response(400, {"error": {"message": "unsupported response_format"}}),
+        _http_response(200, _success_payload(content='{"ok": true}')),
+    ]
+    provider = _provider()
+
+    result = provider.generate(
+        MESSAGES,
+        response_format={"type": "json_object"},
+    )
+
+    assert result.content == '{"ok": true}'
+    assert mock_post.call_count == 2
+    first_payload = mock_post.call_args_list[0].kwargs["json"]
+    second_payload = mock_post.call_args_list[1].kwargs["json"]
+    assert first_payload.get("response_format") == {"type": "json_object"}
+    assert "response_format" not in second_payload
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
 def test_malformed_response_raises_model_response_error(
     mock_post: MagicMock, mock_sleep: MagicMock
 ) -> None:

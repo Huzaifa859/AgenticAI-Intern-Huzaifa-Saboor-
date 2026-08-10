@@ -32,7 +32,6 @@ an exception.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -66,6 +65,11 @@ from ..tools.filesystem_tools import FilesystemTools
 from ..tools.registry import ToolRegistry
 from ..tracing.events import TraceEventType
 from ..tracing.tracer import Tracer
+from ..utils.json_output import (
+    JSON_OBJECT_RESPONSE_FORMAT,
+    extract_json_value,
+    log_json_parse_outcome,
+)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -91,8 +95,19 @@ MAX_STATIC_IN_PROMPT = 25
 #: model that copies it into its evidence can be forgiven.
 _GUTTER = re.compile(r"^\s*\d+\s*\|\s?")
 
-#: Fenced code block around a JSON payload.
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+#: Cap on raw output embedded in a single JSON-repair prompt.
+_MAX_JSON_REPAIR_RAW_CHARS = 6_000
+
+_JSON_REPAIR_SYSTEM_PROMPT = """\
+You are repairing malformed code-analysis JSON.
+
+This is a JSON repair step, not a new analysis.
+Return ONLY the corrected JSON object.
+Do not add explanations, Markdown, or code fences.
+Do not invent findings that are not recoverable from the raw output.
+Preserve every valid field and finding you can recover.
+Do not add fields outside the required shape.
+"""
 
 SYSTEM_PROMPT = """\
 You are a precise code analysis assistant. You find real bugs in real \
@@ -1131,7 +1146,8 @@ class CodeAnalysisAgent(BaseAgent):
                 [
                     ModelMessage(role="system", content=SYSTEM_PROMPT),
                     ModelMessage(role="user", content=prompt),
-                ]
+                ],
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
             )
         except Exception as exc:
             # Deliberately broad. A provider talks to the network and can
@@ -1159,7 +1175,43 @@ class CodeAnalysisAgent(BaseAgent):
 
         report.model_used = True
         raw_content = response.content or ""
-        report.llm_parse_failed = self._extract_json(raw_content) is None
+        payload, extract_error = extract_json_value(raw_content)
+        if payload is None and raw_content.strip():
+            log_json_parse_outcome(
+                agent="code_analysis",
+                stage="initial",
+                success=False,
+                error=extract_error,
+            )
+            repaired = self._retry_json_repair(
+                raw_output=raw_content,
+                parse_error=extract_error,
+            )
+            if repaired is not None:
+                raw_content = repaired
+                payload, extract_error = extract_json_value(raw_content)
+                log_json_parse_outcome(
+                    agent="code_analysis",
+                    stage="repair",
+                    success=payload is not None,
+                    error=extract_error,
+                )
+            else:
+                log_json_parse_outcome(
+                    agent="code_analysis",
+                    stage="repair",
+                    success=False,
+                    error="repair call failed or returned empty",
+                )
+        else:
+            log_json_parse_outcome(
+                agent="code_analysis",
+                stage="initial",
+                success=payload is not None,
+                error=extract_error,
+            )
+
+        report.llm_parse_failed = payload is None
         answer, proposed = self.parse_response(raw_content)
         report.answer = answer
         report.llm_proposed_count = len(proposed)
@@ -1464,8 +1516,8 @@ class CodeAnalysisAgent(BaseAgent):
         """
         Pull a JSON value out of a model response.
 
-        Tries the whole string, then a fenced block, then the first
-        balanced object or array found in the text.
+        Strips Markdown fences deterministically, then decodes a JSON
+        object or array. Does not invent missing fields.
 
         Args:
             content: Raw text from the model.
@@ -1473,50 +1525,72 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             The decoded value, or None if there is no JSON in it.
         """
-        text = (content or "").strip()
-        if not text:
+        value, _error = extract_json_value(content)
+        return value
+
+    def _retry_json_repair(
+        self,
+        *,
+        raw_output: str,
+        parse_error: str,
+    ) -> Optional[str]:
+        """
+        Perform exactly one surgical JSON-repair model call.
+
+        Returns the repaired raw text when the provider responds, or
+        ``None`` when the call fails. Parsing success is checked by the
+        caller.
+        """
+        if self.model_client is None:
             return None
 
-        for candidate in [text] + [m.strip() for m in _FENCE.findall(text)]:
-            try:
-                return json.loads(candidate)
-            except (ValueError, TypeError):
-                continue
+        raw_text = (raw_output or "").strip() or "(empty)"
+        if len(raw_text) > _MAX_JSON_REPAIR_RAW_CHARS:
+            raw_text = raw_text[:_MAX_JSON_REPAIR_RAW_CHARS] + "\n...[truncated]"
 
-        for opener, closer in (("{", "}"), ("[", "]")):
-            start = text.find(opener)
-            if start == -1:
-                continue
+        retry_prompt = (
+            "CODE ANALYSIS JSON REPAIR MODE\n"
+            "Return ONLY the corrected JSON object.\n"
+            "No Markdown, no code fences, no explanation.\n"
+            "Preserve recoverable information; do not invent findings.\n\n"
+            f"PARSER ERROR\n{parse_error or 'unknown'}\n\n"
+            f"RAW MODEL OUTPUT\n{raw_text}\n\n"
+            "Required shape:\n"
+            '{"answer": "...", "findings": []}\n'
+        )
+        self._trace(
+            "analysis_json_repair_started",
+            parse_error=parse_error,
+            raw_chars=len(raw_output or ""),
+        )
+        started = time.perf_counter()
+        try:
+            response = self.model_client.generate(
+                [
+                    ModelMessage(role="system", content=_JSON_REPAIR_SYSTEM_PROMPT),
+                    ModelMessage(role="user", content=retry_prompt),
+                ],
+                temperature=0.0,
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+            )
+        except Exception as exc:
+            logger.warning("Code analysis JSON repair call failed: %s", exc)
+            self._trace(
+                "analysis_json_repair_failed",
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return None
 
-            depth = 0
-            in_string = False
-            escaped = False
-
-            for position in range(start, len(text)):
-                char = text[position]
-
-                if in_string:
-                    if escaped:
-                        escaped = False
-                    elif char == "\\":
-                        escaped = True
-                    elif char == '"':
-                        in_string = False
-                    continue
-
-                if char == '"':
-                    in_string = True
-                elif char == opener:
-                    depth += 1
-                elif char == closer:
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(text[start : position + 1])
-                        except (ValueError, TypeError):
-                            break
-
-        return None
+        content = response.content or ""
+        self._trace(
+            "analysis_json_repair_finished",
+            success=bool(content.strip()),
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            content_chars=len(content),
+        )
+        return content if content.strip() else None
 
     # ------------------------------------------------------------------
     # Merging
