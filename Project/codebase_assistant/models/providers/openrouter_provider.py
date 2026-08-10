@@ -63,6 +63,24 @@ _FALLBACK_MODELS = (
 #: and 5xx also fall back, but only after their backoff retries.
 _FALLBACK_STATUS_CODES = frozenset({402, 404})
 
+#: Model slug prefixes/exact slugs known to honour ``response_format``.
+#: For all others the parameter is silently dropped before the request
+#: so the model does not misinterpret it and wrap JSON in prose.
+_JSON_MODE_SUPPORTED_PREFIXES = (
+    "openai/",
+    "anthropic/",
+    "meta-llama/llama-3",
+    "google/gemma-3",
+    "google/gemma-4",
+    "mistralai/",
+    "cohere/",
+)
+
+
+def _supports_json_mode(model: str) -> bool:
+    """Return True if *model* is known to honour ``response_format``."""
+    return any(model.startswith(prefix) for prefix in _JSON_MODE_SUPPORTED_PREFIXES)
+
 
 class _ModelUnavailable(Exception):
     """
@@ -261,7 +279,14 @@ class OpenRouterProvider(BaseProvider):
         }
         active_format = response_format
         if active_format is not None:
-            payload["response_format"] = active_format
+            if _supports_json_mode(model):
+                payload["response_format"] = active_format
+            else:
+                logger.debug(
+                    "Skipping response_format for %s (not in supported list).",
+                    model,
+                )
+                active_format = None
 
         url = f"{self.base_url}/chat/completions"
         headers = self._headers()

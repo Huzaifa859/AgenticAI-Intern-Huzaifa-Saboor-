@@ -544,7 +544,6 @@ def test_lenient_mode_keeps_raw_model_text_when_json_fails(
     )
     client.generate.side_effect = [
         ModelResponse(content=prose, usage={}, raw={}),
-        ModelResponse(content="still broken {{{", usage={}, raw={}),
     ]
     agent = _agent(client, _mock_retriever())
 
@@ -553,7 +552,8 @@ def test_lenient_mode_keeps_raw_model_text_when_json_fails(
     assert response.success is True
     assert response.output.abstention is None
     assert "intentional demo documentation" in response.output.summary
-    assert client.generate.call_count == 2
+    # Salvage now fires before repair: only 1 LLM call needed.
+    assert client.generate.call_count == 1
 
 
 # ---------------------------------------------------------------------------

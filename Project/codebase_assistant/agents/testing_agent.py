@@ -895,41 +895,44 @@ class TestingAgent(BaseAgent):
                     success=False,
                     error=parse_error,
                 )
-                repaired = self._retry_json_repair(
-                    raw_output=response.content or "",
-                    parse_error=parse_error,
-                    symbol=symbol,
-                )
-                if repaired is not None:
-                    parsed, repair_error = self._parse_response_with_status(
-                        repaired
+                # Try lenient salvage first — no extra LLM call, immediate result.
+                if self._lenient() and not parsed.generated_tests:
+                    salvaged = self._salvage_raw_testing(
+                        response.content or "",
+                        symbol=symbol,
                     )
-                    log_json_parse_outcome(
-                        agent="testing",
-                        stage="repair",
-                        success=repair_error is None,
-                        error=repair_error or "",
+                    if salvaged.generated_tests:
+                        self._trace(
+                            "testing_json_salvaged",
+                            success=True,
+                            symbol=symbol.qualname,
+                            files=len(salvaged.generated_tests),
+                        )
+                        parsed = salvaged
+                # Salvage failed or lenient mode off — try one JSON repair call.
+                if not parsed.generated_tests:
+                    repaired = self._retry_json_repair(
+                        raw_output=response.content or "",
+                        parse_error=parse_error,
+                        symbol=symbol,
                     )
-                else:
-                    log_json_parse_outcome(
-                        agent="testing",
-                        stage="repair",
-                        success=False,
-                        error="repair call failed or returned empty",
-                    )
-            if self._lenient() and not parsed.generated_tests:
-                salvaged = self._salvage_raw_testing(
-                    response.content or "",
-                    symbol=symbol,
-                )
-                if salvaged.generated_tests:
-                    self._trace(
-                        "testing_json_salvaged",
-                        success=True,
-                        symbol=symbol.qualname,
-                        files=len(salvaged.generated_tests),
-                    )
-                    parsed = salvaged
+                    if repaired is not None:
+                        parsed, repair_error = self._parse_response_with_status(
+                            repaired
+                        )
+                        log_json_parse_outcome(
+                            agent="testing",
+                            stage="repair",
+                            success=repair_error is None,
+                            error=repair_error or "",
+                        )
+                    else:
+                        log_json_parse_outcome(
+                            agent="testing",
+                            stage="repair",
+                            success=False,
+                            error="repair call failed or returned empty",
+                        )
             normalized = self._normalize_symbol_result(parsed, symbol)
             self._trace(
                 "testing_symbol_generation_finished",

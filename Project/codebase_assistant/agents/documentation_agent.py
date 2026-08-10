@@ -1471,6 +1471,25 @@ class DocumentationAgent(BaseAgent):
                 success=False,
                 error=parse_error,
             )
+            # Try lenient salvage first — no extra LLM call, immediate result.
+            if (
+                self._lenient()
+                and not (result.summary and result.summary.strip())
+                and (response.content or "").strip()
+            ):
+                salvaged = self._salvage_raw_documentation(
+                    response.content or "",
+                    default_file_path=default_file_path,
+                    default_function_name=default_function_name,
+                )
+                if salvaged.summary.strip():
+                    self._trace(
+                        "documentation_json_salvaged",
+                        success=True,
+                        summary_chars=len(salvaged.summary),
+                    )
+                    return salvaged
+            # Salvage failed or lenient mode is off — try one JSON repair call.
             result = self._retry_json_repair(
                 original_prompt=prompt,
                 raw_output=response.content or "",
@@ -1478,23 +1497,6 @@ class DocumentationAgent(BaseAgent):
                 default_file_path=default_file_path,
                 default_function_name=default_function_name,
             )
-        if (
-            self._lenient()
-            and not (result.summary and result.summary.strip())
-            and (response.content or "").strip()
-        ):
-            salvaged = self._salvage_raw_documentation(
-                response.content or "",
-                default_file_path=default_file_path,
-                default_function_name=default_function_name,
-            )
-            if salvaged.summary.strip():
-                self._trace(
-                    "documentation_json_salvaged",
-                    success=True,
-                    summary_chars=len(salvaged.summary),
-                )
-                return salvaged
         return result
 
     def _discover_documentable_symbols(

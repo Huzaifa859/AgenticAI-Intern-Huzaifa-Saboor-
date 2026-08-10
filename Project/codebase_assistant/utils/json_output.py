@@ -24,6 +24,9 @@ JSON_OBJECT_RESPONSE_FORMAT: Dict[str, str] = {"type": "json_object"}
 #: Fenced ```json ... ``` or ``` ... ``` block.
 _FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
+#: Trailing comma before a closing } or ] — invalid in JSON, common from LLMs.
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
 
 def json_schema_response_format(
     name: str, schema: Dict[str, Any], *, strict: bool = False
@@ -67,20 +70,63 @@ def strip_markdown_json_fences(text: str) -> str:
     return raw
 
 
+def sanitize_json_text(text: str) -> str:
+    """
+    Fix the most common LLM JSON formatting mistakes before parsing.
+
+    Applied *after* fence stripping, *before* ``json.loads``.
+    Only makes changes that are guaranteed safe (no invented fields):
+
+    * Trailing commas before ``}`` or ``]`` — e.g. ``{"a": 1,}``
+    * Single-quoted string delimiters — e.g. ``{'key': 'value'}``
+      (only when the text does not already parse as valid JSON, to
+      avoid corrupting legitimate apostrophes inside double-quoted strings).
+    """
+    if not text:
+        return text
+    # 1. Strip trailing commas (always safe).
+    sanitized = _TRAILING_COMMA.sub(r"\1", text)
+    # 2. Replace single-quoted delimiters only when the result would
+    #    be parseable — avoids mangling apostrophes in prose.
+    try:
+        json.loads(sanitized)
+        return sanitized  # already valid after comma fix
+    except json.JSONDecodeError:
+        pass
+    # Attempt single-quote → double-quote replacement.
+    single_quoted = re.sub(r"(?<!\\)'", '"', sanitized)
+    try:
+        json.loads(single_quoted)
+        return single_quoted
+    except json.JSONDecodeError:
+        pass
+    return sanitized  # return comma-fixed version; quote swap made it worse
+
+
 def extract_json_value(text: str) -> Tuple[Optional[Any], str]:
     """
     Decode a JSON value from model text.
 
-    Order: whole string (after fence strip) → first balanced ``{...}``
-    or ``[...]``. Returns ``(value, "")`` on success or
-    ``(None, error)`` on failure.
+    Order:
+    1. Whole string after fence-strip + sanitize.
+    2. Sanitized first balanced ``{...}`` or ``[...]`` block.
+
+    Returns ``(value, "")`` on success or ``(None, error)`` on failure.
     """
-    cleaned = strip_markdown_json_fences(text)
-    if not cleaned:
+    fenced = strip_markdown_json_fences(text)
+    if not fenced:
         return None, "Model response was empty."
 
+    # Try with sanitization first (fixes trailing commas / single quotes).
+    cleaned = sanitize_json_text(fenced)
     try:
         return json.loads(cleaned), ""
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: raw fence-stripped text without sanitization.
+    try:
+        return json.loads(fenced), ""
     except json.JSONDecodeError as exc:
         last_error = f"JSON decode error: {exc}"
 

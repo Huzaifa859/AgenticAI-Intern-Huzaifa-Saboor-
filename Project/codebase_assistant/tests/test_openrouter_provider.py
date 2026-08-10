@@ -134,11 +134,12 @@ def test_successful_chat_completion(
 def test_response_format_forwarded_in_payload(
     mock_post: MagicMock, mock_sleep: MagicMock
 ) -> None:
-    """Structured JSON response_format must be sent to OpenRouter."""
+    """Structured JSON response_format must be sent for supported models."""
     mock_post.return_value = _http_response(
         200, _success_payload(content='{"ok": true}')
     )
-    provider = _provider()
+    # Use a model that is in the JSON-mode allowlist so response_format is sent.
+    provider = _provider(model="meta-llama/llama-3.1-8b-instruct")
 
     provider.generate(
         MESSAGES,
@@ -160,7 +161,8 @@ def test_response_format_rejected_retries_without_format(
         _http_response(400, {"error": {"message": "unsupported response_format"}}),
         _http_response(200, _success_payload(content='{"ok": true}')),
     ]
-    provider = _provider()
+    # Use a model in the allowlist so response_format is actually sent on the first try.
+    provider = _provider(model="meta-llama/llama-3.1-8b-instruct")
 
     result = provider.generate(
         MESSAGES,
