@@ -1013,6 +1013,7 @@ class TestingAgent(BaseAgent):
             first_outcome = self._run_generated_tests(
                 workspace,
                 import_report.executable_tests or result.generated_tests,
+                target_path=target_path,
             )
             # Used-invalid imports with no executable suite should enter repair.
             if (
@@ -1103,12 +1104,13 @@ class TestingAgent(BaseAgent):
             A short execution summary suitable for appending to
             ``TestingResult.summary``.
         """
-        return self._run_generated_tests(workspace, generated_tests).summary
+        return self._run_generated_tests(workspace, generated_tests, target_path="").summary
 
     def _run_generated_tests(
         self,
         workspace: str,
         generated_tests: Dict[str, str],
+        target_path: str = "",
     ) -> _ExecutionOutcome:
         """
         Write and execute generated tests; return a structured outcome.
@@ -1177,7 +1179,7 @@ class TestingAgent(BaseAgent):
             )
 
             coverage = self._measure_coverage(
-                pytest_api, workspace=workspace, temp_dir=temp_dir
+                pytest_api, workspace=workspace, temp_dir=temp_dir, target_path=target_path
             )
             if coverage.summary:
                 summary = self._merge_summaries(summary, coverage.summary)
@@ -1279,6 +1281,7 @@ class TestingAgent(BaseAgent):
         second_outcome = self._run_generated_tests(
             workspace,
             repair_imports.executable_tests or repaired.generated_tests,
+            target_path=target_path,
         )
         coverage = (
             repaired.coverage_estimate
@@ -1552,6 +1555,7 @@ class TestingAgent(BaseAgent):
         *,
         workspace: str,
         temp_dir: str,
+        target_path: str = "",
     ) -> _CoverageMeasurement:
         """
         Run pytest-cov against the generated tests and parse line coverage.
@@ -1580,7 +1584,7 @@ class TestingAgent(BaseAgent):
 
         report_path = os.path.join(temp_dir, "coverage.json")
         cov_data_file = os.path.join(temp_dir, ".coverage")
-        targets = self._coverage_targets(workspace)
+        targets = self._coverage_targets(workspace, target_path=target_path)
         args = [
             temp_dir,
             "-q",
@@ -1676,13 +1680,41 @@ class TestingAgent(BaseAgent):
             else:
                 os.environ["COVERAGE_FILE"] = previous_cov_file
 
-    def _coverage_targets(self, workspace: str) -> List[str]:
+    def _coverage_targets(self, workspace: str, target_path: str = "") -> List[str]:
         """
         Choose ``--cov`` targets for the workspace under test.
 
-        Prefers top-level modules/packages; falls back to ``.`` when the
-        workspace inventory is empty.
+        When a specific target_path is provided (e.g. a file or sub-directory
+        the user asked to test), we scope coverage to just that target so the
+        reported percentage reflects the code that was actually tested rather
+        than the entire repository.
+
+        Falls back to scanning top-level modules/packages when no specific
+        target is given, and ultimately to ``.`` when the workspace inventory
+        is empty.
         """
+        # --- Scoped coverage: user asked to test a specific file or directory ---
+        if target_path:
+            # Normalise to a path relative to workspace
+            abs_target = os.path.abspath(target_path)
+            abs_workspace = os.path.abspath(workspace)
+            try:
+                rel = os.path.relpath(abs_target, abs_workspace)
+            except ValueError:
+                rel = target_path  # different drive on Windows — keep as-is
+
+            # Single Python file → use module name (strip .py)
+            if rel.endswith(".py") and not self._should_skip_path(rel):
+                return [rel[:-3].replace(os.sep, ".")]
+
+            # Directory → use it directly if it is a package, else its name
+            if os.path.isdir(abs_target):
+                # If the directory itself is the workspace root fall through
+                # to the full-repo scan so we don't return "."
+                if abs_target != abs_workspace:
+                    return [rel]
+
+        # --- Full-repo fallback: scan top-level modules/packages ---
         targets: List[str] = []
         try:
             entries = sorted(os.listdir(workspace))
