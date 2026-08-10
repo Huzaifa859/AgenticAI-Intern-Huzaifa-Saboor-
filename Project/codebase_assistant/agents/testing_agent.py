@@ -534,7 +534,9 @@ class TestingAgent(BaseAgent):
                     "common failure scenarios."
                 )
             result = self._run_pipeline(
-                workspace=self._workspace_for(target),
+                # Index against the repository root so Testing shares the
+                # same Chroma store / manifest as Analysis and Documentation.
+                workspace=self._workspace_for(repo_path or target),
                 target_path=target,
                 instruction=instruction or default_instruction,
                 focus_function=function_name,
@@ -2801,33 +2803,38 @@ class TestingAgent(BaseAgent):
 
     def _ensure_index(self, workspace: str) -> None:
         """
-        Index the workspace into the store the injected Retriever reads.
+        Index the workspace into the per-repository store Analysis uses.
 
-        Uses Indexer.update_index for incremental updates. Failures are
-        logged and swallowed so generation can continue from files.
+        Uses Indexer.update_index for incremental updates so unchanged
+        files skip re-embedding. Failures are logged and swallowed so
+        generation can continue from files.
         """
         if self.retriever is None:
             logger.info("No retriever configured; skipping testing indexing.")
             return
 
         from ..hooks.events import HookEvent
+        from ..rag.store_paths import vector_store_for_repository
 
         self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
         started = time.perf_counter()
         try:
-            vector_db = None
-            try:
-                vector_db = self.retriever.vector_db
-            except Exception:
-                vector_db = None
+            config = self.retriever.config
+            store_path = vector_store_for_repository(
+                config.chroma_persist_directory, workspace
+            )
+            if self.retriever.vector_store_path != store_path:
+                self.retriever.vector_store_path = store_path
+                self.retriever._vector_db = None
 
             indexer = Indexer(
-                vector_store_path=self.retriever.vector_store_path,
-                config=self.retriever.config,
+                vector_store_path=store_path,
+                config=config,
                 workspace_root=workspace,
-                vector_db=vector_db,
+                vector_db=self.retriever._vector_db,
             )
             update = indexer.update_index(".")
+            self.retriever._vector_db = indexer.vector_db
             logger.info("Testing index: %s", update.summary())
             self._hook(
                 HookEvent.AFTER_INGEST,

@@ -32,7 +32,6 @@ an exception.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -1714,8 +1713,11 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             The directory the index for this repository lives in.
         """
-        digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
-        return os.path.join(self.config.chroma_persist_directory, digest)
+        from ..rag.store_paths import vector_store_for_repository
+
+        return vector_store_for_repository(
+            self.config.chroma_persist_directory, root
+        )
 
     @staticmethod
     def _scope(pipeline: _Pipeline, repository_path: str) -> str:

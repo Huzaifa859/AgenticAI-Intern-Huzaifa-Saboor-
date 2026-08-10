@@ -538,7 +538,9 @@ class DocumentationAgent(BaseAgent):
                 )
             elif doc_type in {"module", "module_summary"} or "module summary" in lowered:
                 target = file_path or repo_path
-                workspace = self._workspace_for(target)
+                # Index against the repository root (same store as Analysis),
+                # not the parent of a targeted file.
+                workspace = self._workspace_for(repo_path or target)
                 result = self._run_pipeline(
                     mode="module",
                     workspace=workspace,
@@ -566,7 +568,7 @@ class DocumentationAgent(BaseAgent):
                 )
             else:
                 target = file_path or repo_path
-                workspace = self._workspace_for(target)
+                workspace = self._workspace_for(repo_path or target)
                 if class_name and not function_name:
                     doc_instruction = instruction or (
                         f"Generate documentation only for class {class_name} "
@@ -2816,33 +2818,39 @@ class DocumentationAgent(BaseAgent):
 
     def _ensure_index(self, workspace: str) -> None:
         """
-        Index the workspace into the store the injected Retriever reads.
+        Index the workspace into the per-repository store Analysis uses.
 
-        Uses the existing Indexer.update_index path. Failures are logged
-        and swallowed so documentation can still continue from files.
+        Uses Indexer.update_index so unchanged files skip re-embedding.
+        Failures are logged and swallowed so documentation can continue
+        from files.
         """
         if self.retriever is None:
             logger.info("No retriever configured; skipping documentation indexing.")
             return
 
         from ..hooks.events import HookEvent
+        from ..rag.store_paths import vector_store_for_repository
 
         self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
         started = time.perf_counter()
         try:
-            vector_db = None
-            try:
-                vector_db = self.retriever.vector_db
-            except Exception:
-                vector_db = None
+            config = self.retriever.config
+            store_path = vector_store_for_repository(
+                config.chroma_persist_directory, workspace
+            )
+            # Keep Retriever pointed at the same per-repo store Analysis uses.
+            if self.retriever.vector_store_path != store_path:
+                self.retriever.vector_store_path = store_path
+                self.retriever._vector_db = None
 
             indexer = Indexer(
-                vector_store_path=self.retriever.vector_store_path,
-                config=self.retriever.config,
+                vector_store_path=store_path,
+                config=config,
                 workspace_root=workspace,
-                vector_db=vector_db,
+                vector_db=self.retriever._vector_db,
             )
             update = indexer.update_index(".")
+            self.retriever._vector_db = indexer.vector_db
             logger.info("Documentation index: %s", update.summary())
             self._hook(
                 HookEvent.AFTER_INGEST,

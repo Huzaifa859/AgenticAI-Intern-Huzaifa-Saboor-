@@ -356,6 +356,11 @@ class Supervisor:
         # agent just indexed, so leave retriever unset and let _bind()
         # attach a Retriever to that Indexer.
         #
+        # DocumentationAgent / TestingAgent receive the Supervisor
+        # Retriever but rebind it in _ensure_index to the same
+        # chroma/<repo-hash>/ path Analysis uses, so incremental
+        # manifests are shared across agents on the warm worker.
+        #
         # DocumentationAgent uses the OpenRouter-backed client: repository
         # documentation needs longer, better-structured prose than the
         # local model produced. `ollama_model_client` stays available on
