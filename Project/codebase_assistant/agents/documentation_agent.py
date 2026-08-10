@@ -909,7 +909,7 @@ class DocumentationAgent(BaseAgent):
         # requiring any changes to the synchronous provider.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        _MAX_DOC_WORKERS = 10
+        _MAX_DOC_WORKERS = 20
 
         def _run_one(symbol):  # type: ignore[no-untyped-def]
             self._trace(

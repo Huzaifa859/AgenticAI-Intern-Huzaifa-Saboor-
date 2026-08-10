@@ -787,7 +787,7 @@ class TestingAgent(BaseAgent):
         # work releases the GIL so threads are truly concurrent.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        _MAX_TEST_WORKERS = 10
+        _MAX_TEST_WORKERS = 20
 
         def _run_one_symbol(symbol):  # type: ignore[no-untyped-def]
             """Generate tests for one symbol; returns all data needed by caller."""
