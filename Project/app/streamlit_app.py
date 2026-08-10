@@ -105,7 +105,7 @@ AGENTS = ("Analysis", "Documentation", "Testing")
 RESULT_TABS = ("Analysis", "Documentation", "Testing")
 
 
-@st.cache_resource(show_spinner="Starting warm worker…")
+@st.cache_resource
 def _auto_start_worker() -> None:
     """Spawn the warm worker once when Streamlit starts.
 
@@ -113,7 +113,7 @@ def _auto_start_worker() -> None:
     session regardless of how many times the page rerenders. If the worker
     is already running it returns immediately.
     """
-    ensure_worker_server()
+    ensure_worker_server(timeout_s=0.1)
 
 
 _auto_start_worker()
