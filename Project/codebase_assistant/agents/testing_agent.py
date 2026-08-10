@@ -64,11 +64,6 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
-from ..utils.json_output import (
-    JSON_OBJECT_RESPONSE_FORMAT,
-    extract_json_object,
-    log_json_parse_outcome,
-)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -135,33 +130,11 @@ _ALWAYS_ALLOWED_IMPORT_ROOTS = frozenset(
     }
 )
 
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _PYTHON_FENCE = re.compile(
     r"```(?:python)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE
 )
 _TEST_DEF = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.MULTILINE)
-
-#: Cap on raw output embedded in a single JSON-repair prompt.
-_MAX_JSON_REPAIR_RAW_CHARS = 6_000
-
-_JSON_REPAIR_SYSTEM_PROMPT = """\
-You are repairing malformed TestingResult JSON.
-
-This is a JSON repair step, not a new test-generation or pytest fix.
-Return ONLY the corrected TestingResult JSON object.
-Do not add explanations, Markdown, or code fences.
-Do not add fields outside the TestingResult schema.
-Preserve all recoverable test source and summary text from the raw output.
-
-Required shape:
-
-{
-  "summary": "What was tested.",
-  "generated_tests": {
-    "test_module_name.py": "complete pytest module source as a string"
-  },
-  "coverage_estimate": 0.0
-}
-"""
 
 _SYSTEM_PROMPT = """\
 You are a senior Python test engineer writing executable pytest modules.
@@ -850,7 +823,6 @@ class TestingAgent(BaseAgent):
                     ],
                     max_tokens=_TEST_MAX_TOKENS,
                     temperature=0.0,
-                    response_format=JSON_OBJECT_RESPONSE_FORMAT,
                 )
             except Exception as exc:
                 logger.warning(
@@ -883,40 +855,7 @@ class TestingAgent(BaseAgent):
                 content_chars=len(response.content or ""),
                 symbol=symbol.qualname,
             )
-            parsed, parse_error = self._parse_response_with_status(response.content)
-            if parse_error is None:
-                log_json_parse_outcome(
-                    agent="testing", stage="initial", success=True
-                )
-            else:
-                log_json_parse_outcome(
-                    agent="testing",
-                    stage="initial",
-                    success=False,
-                    error=parse_error,
-                )
-                repaired = self._retry_json_repair(
-                    raw_output=response.content or "",
-                    parse_error=parse_error,
-                    symbol=symbol,
-                )
-                if repaired is not None:
-                    parsed, repair_error = self._parse_response_with_status(
-                        repaired
-                    )
-                    log_json_parse_outcome(
-                        agent="testing",
-                        stage="repair",
-                        success=repair_error is None,
-                        error=repair_error or "",
-                    )
-                else:
-                    log_json_parse_outcome(
-                        agent="testing",
-                        stage="repair",
-                        success=False,
-                        error="repair call failed or returned empty",
-                    )
+            parsed = self._parse_response(response.content)
             if self._lenient() and not parsed.generated_tests:
                 salvaged = self._salvage_raw_testing(
                     response.content or "",
@@ -1216,7 +1155,6 @@ class TestingAgent(BaseAgent):
                 ],
                 max_tokens=_TEST_MAX_TOKENS,
                 temperature=0.0,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
             )
         except Exception as exc:
             logger.warning("OpenRouter testing repair call failed: %s", exc)
@@ -3245,29 +3183,14 @@ class TestingAgent(BaseAgent):
 
         Returns an empty result when parsing fails rather than raising.
         """
-        result, _error = self._parse_response_with_status(content)
-        return result
-
-    def _parse_response_with_status(
-        self, content: str
-    ) -> Tuple[TestingResult, Optional[str]]:
-        """
-        Parse model output and report whether a JSON object was recovered.
-
-        Returns:
-            ``(result, None)`` when a JSON object was parsed (tests may
-            still be empty). ``(empty, error)`` when unparseable.
-        """
         empty = self._empty_result()
         if not content or not str(content).strip():
-            return empty, "Model response was empty."
+            return empty
 
-        payload, extract_error = extract_json_object(str(content))
+        payload = self._extract_json_object(str(content))
         if payload is None:
             logger.warning("Testing model response was not valid JSON.")
-            return empty, extract_error or (
-                "Testing model response was not valid JSON."
-            )
+            return empty
 
         generated_raw = payload.get("generated_tests") or {}
         generated_tests: Dict[str, str] = {}
@@ -3284,88 +3207,11 @@ class TestingAgent(BaseAgent):
             coverage = 0.0
         coverage = min(max(coverage, 0.0), 1.0)
 
-        return (
-            TestingResult(
-                summary=str(payload.get("summary") or ""),
-                generated_tests=generated_tests,
-                coverage_estimate=coverage,
-            ),
-            None,
+        return TestingResult(
+            summary=str(payload.get("summary") or ""),
+            generated_tests=generated_tests,
+            coverage_estimate=coverage,
         )
-
-    def _retry_json_repair(
-        self,
-        *,
-        raw_output: str,
-        parse_error: str,
-        symbol: Optional["_TestableSymbol"] = None,
-    ) -> Optional[str]:
-        """
-        Perform exactly one surgical JSON-repair model call.
-
-        Distinct from pytest failure repair: this only fixes malformed
-        TestingResult JSON. Returns repaired text, or ``None`` on failure.
-        """
-        if self.model_client is None:
-            return None
-
-        raw_text = (raw_output or "").strip() or "(empty)"
-        if len(raw_text) > _MAX_JSON_REPAIR_RAW_CHARS:
-            raw_text = raw_text[:_MAX_JSON_REPAIR_RAW_CHARS] + "\n...[truncated]"
-
-        symbol_label = getattr(symbol, "qualname", "") or "(unknown)"
-        retry_prompt = (
-            "TESTING JSON REPAIR MODE\n"
-            "Return ONLY the corrected TestingResult JSON object.\n"
-            "No Markdown, no code fences, no explanation, no extra fields.\n"
-            "Preserve recoverable test source from the raw output.\n\n"
-            f"SYMBOL\n{symbol_label}\n\n"
-            f"PARSER ERROR\n{parse_error or 'unknown'}\n\n"
-            f"RAW MODEL OUTPUT\n{raw_text}\n"
-        )
-        self._trace(
-            "testing_json_repair_started",
-            parse_error=parse_error,
-            symbol=symbol_label,
-            raw_chars=len(raw_output or ""),
-        )
-        started = time.perf_counter()
-        try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(
-                        role="system", content=_JSON_REPAIR_SYSTEM_PROMPT
-                    ),
-                    ModelMessage(role="user", content=retry_prompt),
-                ],
-                max_tokens=_TEST_MAX_TOKENS,
-                temperature=0.0,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Testing JSON repair call failed for %s: %s",
-                symbol_label,
-                exc,
-            )
-            self._trace(
-                "testing_json_repair_failed",
-                success=False,
-                error=str(exc),
-                symbol=symbol_label,
-                duration_ms=(time.perf_counter() - started) * 1000.0,
-            )
-            return None
-
-        content = response.content or ""
-        self._trace(
-            "testing_json_repair_finished",
-            success=bool(content.strip()),
-            symbol=symbol_label,
-            duration_ms=(time.perf_counter() - started) * 1000.0,
-            content_chars=len(content),
-        )
-        return content if content.strip() else None
 
     def _salvage_raw_testing(
         self,
@@ -3451,8 +3297,26 @@ class TestingAgent(BaseAgent):
     @staticmethod
     def _extract_json_object(content: str) -> Optional[Dict[str, Any]]:
         """Extract the first JSON object from a model response."""
-        payload, _error = extract_json_object(content)
-        return payload
+        text = content.strip()
+        fence = _FENCE.search(text)
+        if fence:
+            text = fence.group(1).strip()
+
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+                return data if isinstance(data, dict) else None
+            except json.JSONDecodeError:
+                return None
+        return None
 
     @staticmethod
     def _empty_result() -> TestingResult:

@@ -402,7 +402,7 @@ def test_malformed_json_repaired_successfully(
     assert response.output.summary == VALID_DOC_PAYLOAD["summary"]
     assert response.output.abstention is None
     retry_messages = client.generate.call_args_list[1].args[0]
-    assert "corrected DocumentationResult JSON" in retry_messages[0].content
+    assert "ONLY valid DocumentationResult JSON" in retry_messages[0].content
     assert "PARSER / VALIDATION ERROR" in retry_messages[1].content
     assert "RAW MODEL OUTPUT" in retry_messages[1].content
     assert "ORIGINAL PROMPT" in retry_messages[1].content

@@ -32,6 +32,7 @@ hallucinations versus a single repository-wide generation call.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
@@ -52,12 +53,6 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
-from ..utils.json_output import (
-    JSON_OBJECT_RESPONSE_FORMAT,
-    extract_json_object,
-    log_json_parse_outcome,
-    strip_markdown_json_fences,
-)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -135,6 +130,8 @@ _PROJECT_FILES = (
 #: Cap on characters read from each project metadata file.
 _MAX_PROJECT_FILE_CHARS = 1200
 
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
 #: Path-like tokens ending in ``.py`` (possibly nested).
 _PATH_IN_TEXT = re.compile(
     r"(?<![\w/])((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.py|[A-Za-z0-9_.-]+\.py)\b"
@@ -179,10 +176,11 @@ _JSON_RETRY_SYSTEM_PROMPT = """\
 You are repairing malformed DocumentationResult JSON.
 
 This is a JSON repair step, not a new documentation generation.
-Return ONLY the corrected DocumentationResult JSON object.
-Do not add explanations, Markdown, or code fences.
+Return ONLY valid DocumentationResult JSON.
+Do not add explanations.
+Do not wrap the JSON in markdown fences.
 Do not add prose before or after the JSON.
-Do not add fields outside the DocumentationResult schema.
+Follow the DocumentationResult schema exactly.
 Preserve all information that can be recovered from the raw model output.
 
 Required shape:
@@ -1432,7 +1430,6 @@ class DocumentationAgent(BaseAgent):
                 ],
                 max_tokens=_DOC_MAX_TOKENS,
                 temperature=0.1,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
             )
         except Exception as exc:
             logger.warning("Documentation model call failed: %s", exc)
@@ -1460,17 +1457,7 @@ class DocumentationAgent(BaseAgent):
             default_file_path=default_file_path,
             default_function_name=default_function_name,
         )
-        if parse_error is None:
-            log_json_parse_outcome(
-                agent="documentation", stage="initial", success=True
-            )
-        else:
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="initial",
-                success=False,
-                error=parse_error,
-            )
+        if parse_error is not None:
             result = self._retry_json_repair(
                 original_prompt=prompt,
                 raw_output=response.content or "",
@@ -2270,16 +2257,9 @@ class DocumentationAgent(BaseAgent):
                 ],
                 max_tokens=_DOC_MAX_TOKENS,
                 temperature=0.0,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
             )
         except Exception as exc:
             logger.warning("Documentation JSON retry call failed: %s", exc)
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="repair",
-                success=False,
-                error=str(exc),
-            )
             self._trace(
                 "documentation_retry_failed",
                 success=False,
@@ -2304,12 +2284,6 @@ class DocumentationAgent(BaseAgent):
         if retry_error is not None or not (
             repaired.summary and repaired.summary.strip()
         ):
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="repair",
-                success=False,
-                error=retry_error or "repaired JSON produced an empty summary",
-            )
             self._trace(
                 "documentation_retry_failed",
                 success=False,
@@ -2332,9 +2306,6 @@ class DocumentationAgent(BaseAgent):
                         return salvaged
             return self._empty_result(default_file_path, default_function_name)
 
-        log_json_parse_outcome(
-            agent="documentation", stage="repair", success=True
-        )
         self._trace(
             "documentation_retry_success",
             success=True,
@@ -2364,8 +2335,9 @@ class DocumentationAgent(BaseAgent):
 
         return (
             "DOCUMENTATION JSON REPAIR MODE\n"
-            "Return ONLY the corrected DocumentationResult JSON object.\n"
-            "No Markdown, no code fences, no explanation, no extra fields.\n"
+            "Return ONLY valid DocumentationResult JSON.\n"
+            "Do not add explanations or markdown.\n"
+            "Do not wrap the JSON in code fences.\n"
             "Preserve all information that can be recovered.\n"
             "Follow the DocumentationResult schema exactly.\n\n"
             f"PARSER / VALIDATION ERROR\n{parse_error}\n\n"
@@ -3556,7 +3528,31 @@ class DocumentationAgent(BaseAgent):
         content: str,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         """Extract the first JSON object, returning a parse error on failure."""
-        return extract_json_object(content)
+        text = content.strip()
+        fence = _FENCE.search(text)
+        if fence:
+            text = fence.group(1).strip()
+
+        last_error = "No JSON object found in model response."
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data, ""
+            return None, "JSON root value was not an object."
+        except json.JSONDecodeError as exc:
+            last_error = f"JSON decode error: {exc}"
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+                if isinstance(data, dict):
+                    return data, ""
+                return None, "JSON root value was not an object."
+            except json.JSONDecodeError as exc:
+                return None, f"JSON decode error: {exc}"
+        return None, last_error
 
     @staticmethod
     def _empty_result(
@@ -3590,9 +3586,9 @@ class DocumentationAgent(BaseAgent):
             return DocumentationAgent._empty_result(
                 default_file_path, default_function_name
             )
-        stripped = strip_markdown_json_fences(text)
-        if stripped:
-            text = stripped
+        fence = _FENCE.search(text)
+        if fence:
+            text = fence.group(1).strip() or text
         # Prefer a nested summary string if the model almost returned JSON.
         summary_match = re.search(
             r'"summary"\s*:\s*"(.*)"\s*(?:,|\})',

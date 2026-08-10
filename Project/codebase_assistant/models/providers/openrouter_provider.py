@@ -54,8 +54,7 @@ _FALLBACK_MODELS = (
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-3-27b-it",
     "meta-llama/llama-3.1-8b-instruct",
-    # OpenRouter currently publishes only the :free slug for this model.
-    "nvidia/nemotron-nano-9b-v2:free",
+    "nvidia/nemotron-nano-9b-v2",
 )
 
 #: Status codes that permanently rule this model out for the request, so
@@ -142,9 +141,7 @@ class OpenRouterProvider(BaseProvider):
         Args:
             messages: Conversation history to send (system/user/assistant).
             **kwargs: Generation options. Recognized keys:
-                ``temperature``, ``max_tokens``, ``model``,
-                ``response_format`` (OpenAI-compatible structured JSON /
-                JSON-schema object when the routed provider supports it).
+                ``temperature``, ``max_tokens``, ``model``.
 
         Returns:
             A ModelResponse with content, raw payload, and usage metadata.
@@ -169,7 +166,6 @@ class OpenRouterProvider(BaseProvider):
 
         max_tokens = int(kwargs.get("max_tokens", self.max_tokens))
         temperature = kwargs.get("temperature", 0.0)
-        response_format = kwargs.get("response_format")
         chain = self._model_chain(kwargs.get("model", self.model))
 
         last_error: Optional[Exception] = None
@@ -181,7 +177,6 @@ class OpenRouterProvider(BaseProvider):
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    response_format=response_format,
                 )
             except _ModelUnavailable as signal:
                 last_error = signal.error
@@ -221,7 +216,6 @@ class OpenRouterProvider(BaseProvider):
         messages: List[ModelMessage],
         max_tokens: int,
         temperature: Any,
-        response_format: Optional[Dict[str, Any]] = None,
     ) -> ModelResponse:
         """
         Run one chat completion against a single model.
@@ -235,11 +229,6 @@ class OpenRouterProvider(BaseProvider):
             messages: Conversation history to send.
             max_tokens: Token ceiling for the completion.
             temperature: Sampling temperature.
-            response_format: Optional structured-output constraint
-                (``json_object`` or ``json_schema``). When the provider
-                rejects it with HTTP 400, the request is retried once
-                without ``response_format`` (API compatibility only —
-                not an LLM content repair).
 
         Returns:
             A ModelResponse from this model.
@@ -259,32 +248,24 @@ class OpenRouterProvider(BaseProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        active_format = response_format
-        if active_format is not None:
-            payload["response_format"] = active_format
 
         url = f"{self.base_url}/chat/completions"
         headers = self._headers()
 
         logger.info(
-            "OpenRouter request start: model=%s messages=%d max_tokens=%d "
-            "response_format=%s",
+            "OpenRouter request start: model=%s messages=%d max_tokens=%d",
             model,
             len(messages),
             max_tokens,
-            bool(active_format),
         )
 
         last_error: Optional[Exception] = None
-        format_stripped = False
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                # Copy so later retries (e.g. stripping response_format) do
-                # not mutate the body already observed by callers/tests.
                 response = requests.post(
                     url,
                     headers=headers,
-                    json=dict(payload),
+                    json=payload,
                     timeout=self.timeout,
                 )
             except requests.Timeout as exc:
@@ -355,20 +336,6 @@ class OpenRouterProvider(BaseProvider):
                 )
 
             if status >= 400:
-                if (
-                    status == 400
-                    and active_format is not None
-                    and not format_stripped
-                ):
-                    logger.warning(
-                        "OpenRouter rejected response_format on %s "
-                        "(HTTP 400); retrying without structured output.",
-                        model,
-                    )
-                    payload.pop("response_format", None)
-                    active_format = None
-                    format_stripped = True
-                    continue
                 self._raise_for_client_error(response)
 
             model_response = self._parse_response(response, model)
