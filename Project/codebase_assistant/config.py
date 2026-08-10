@@ -278,6 +278,10 @@ class Config:
             openrouter_base_url=_env_str(
                 "OPENROUTER_BASE_URL", defaults.openrouter_base_url
             ),
+            openrouter_model=_env_str(
+                "OPENROUTER_MODEL", defaults.openrouter_model
+            ),
+            max_tokens=_env_int("CA_MAX_TOKENS", defaults.max_tokens),
             ollama_base_url=_env_str("OLLAMA_BASE_URL", defaults.ollama_base_url),
             github_token=_env_optional_str("GITHUB_TOKEN"),
             workspace_root=_env_str("WORKSPACE_ROOT", defaults.workspace_root),
