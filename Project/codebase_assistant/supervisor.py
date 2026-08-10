@@ -343,13 +343,78 @@ class Supervisor:
             )
         return provider
 
+    def _make_agent_client(self, model: str) -> LLMClient:
+        """
+        Build a dedicated LLMClient for one agent backed by its own
+        OpenRouterProvider pinned to ``model``.
+
+        If provider construction fails (e.g. bad key), falls back to the
+        shared ``self.provider_manager`` so the agent still works.
+
+        Args:
+            model: The OpenRouter model slug the agent should use.
+
+        Returns:
+            An LLMClient whose primary model is ``model``.
+        """
+        try:
+            dedicated_provider = OpenRouterProvider(
+                model=model,
+                api_key=self.config.openrouter_api_key,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.openrouter_base_url,
+                config=self.config,
+            )
+            dedicated_manager = ProviderManager(
+                preferred=dedicated_provider,
+                fallback=self.ollama_provider,
+                preferred_name=self.config.preferred_provider,
+                fallback_name=self.config.fallback_provider,
+                cache_seconds=self.config.provider_cache_seconds,
+                tracer=self.tracer,
+            )
+            return LLMClient(
+                model_name=model,
+                max_tokens=self.config.max_tokens,
+                provider=dedicated_manager,
+                config=self.config,
+                hook_manager=self.hook_manager,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not build dedicated client for model %s; falling back "
+                "to shared provider: %s",
+                model,
+                exc,
+            )
+            return self.model_client
+
     def _init_agents(self) -> Dict[AgentType, BaseAgent]:
         """
         Construct and wire up the specialized agents.
 
+        Each agent receives a dedicated LLMClient backed by a model
+        optimised for its specific task:
+          - CodeAnalysisAgent  → config.analysis_model      (deep reasoning)
+          - DocumentationAgent → config.documentation_model (prose / markdown)
+          - TestingAgent       → config.testing_model       (fast code output)
+
         Returns:
             A mapping from AgentType to the corresponding agent instance.
         """
+        # Build one dedicated client per agent so each uses its own
+        # specialist free model while sharing the Ollama failover.
+        analysis_client = self._make_agent_client(self.config.analysis_model)
+        docs_client = self._make_agent_client(self.config.documentation_model)
+        testing_client = self._make_agent_client(self.config.testing_model)
+
+        logger.info(
+            "Agent model routing — analysis=%s | docs=%s | testing=%s",
+            self.config.analysis_model,
+            self.config.documentation_model,
+            self.config.testing_model,
+        )
+
         # CodeAnalysisAgent builds a per-repository Indexer under
         # chroma/<repo-hash>/. Injecting the Supervisor's default
         # Retriever would point retrieval at a different store than the
@@ -360,13 +425,8 @@ class Supervisor:
         # Retriever but rebind it in _ensure_index to the same
         # chroma/<repo-hash>/ path Analysis uses, so incremental
         # manifests are shared across agents on the warm worker.
-        #
-        # DocumentationAgent uses the OpenRouter-backed client: repository
-        # documentation needs longer, better-structured prose than the
-        # local model produced. `ollama_model_client` stays available on
-        # the Supervisor for local-model experiments.
         documentation_agent = DocumentationAgent(
-            model_client=self.model_client,
+            model_client=docs_client,
             tool_registry=self.tool_registry,
             retriever=self.retriever,
             memory_store=self.memory_store,
@@ -374,14 +434,13 @@ class Supervisor:
             hook_manager=self.hook_manager,
         )
         logger.info(
-            "DocumentationAgent received an OpenRouter-backed LLMClient "
-            "(provider=%s).",
-            type(self.provider).__name__ if self.provider is not None else None,
+            "DocumentationAgent using dedicated client (model=%s).",
+            self.config.documentation_model,
         )
 
         return {
             AgentType.CODE_ANALYSIS: CodeAnalysisAgent(
-                model_client=self.model_client,
+                model_client=analysis_client,
                 tool_registry=self.tool_registry,
                 memory_store=self.memory_store,
                 tracer=self.tracer,
@@ -389,7 +448,7 @@ class Supervisor:
             ),
             AgentType.DOCUMENTATION: documentation_agent,
             AgentType.TESTING: TestingAgent(
-                model_client=self.model_client,
+                model_client=testing_client,
                 tool_registry=self.tool_registry,
                 retriever=self.retriever,
                 memory_store=self.memory_store,

@@ -198,6 +198,12 @@ class Config:
     preferred_provider: str = "openrouter"
     fallback_provider: str = "ollama"
     provider_cache_seconds: int = 60
+    # Per-agent model routing: each agent uses a specialist free model
+    # optimised for its specific task. Falls back to openrouter_model when
+    # the env var is absent, keeping single-model setups unchanged.
+    analysis_model: str = "google/gemma-4-31b-it:free"
+    testing_model: str = "cohere/north-mini-code:free"
+    documentation_model: str = "openai/gpt-oss-20b:free"
     # When True, DocumentationAgent keeps imperfect LLM text (invalid JSON
     # salvage / soft grounding) with warnings instead of emptying results.
     # Best for demos; set DOCUMENTATION_LENIENT=false for strict abstention.
@@ -322,5 +328,14 @@ class Config:
             grounding_enabled=_env_bool(
                 "GROUNDING_ENABLED",
                 defaults.grounding_enabled,
+            ),
+            analysis_model=_env_str(
+                "ANALYSIS_MODEL", defaults.analysis_model
+            ),
+            testing_model=_env_str(
+                "TESTING_MODEL", defaults.testing_model
+            ),
+            documentation_model=_env_str(
+                "DOCUMENTATION_MODEL", defaults.documentation_model
             ),
         )
