@@ -82,30 +82,76 @@ _STAGE_MESSAGES: Dict[str, str] = {
 class ProgressWriter:
     """Append NDJSON progress lines for the Streamlit UI to tail."""
 
+    #: Coalesce token deltas so the progress file is not one line per token.
+    _STREAM_BATCH_SECONDS = 0.075
+
     def __init__(self, path: Optional[str]) -> None:
         self.path = (path or "").strip() or None
         self._last_message = ""
+        self._stream_buf = ""
+        self._stream_opened_at = 0.0
 
     def emit(self, stage: str, message: str = "", **extra: Any) -> None:
         """Write one progress event; never raises into the worker."""
         if not self.path:
             return
         stage_key = str(stage or "progress")
+        # Flush any pending documentation tokens before a normal stage line
+        # so the UI never sees stages arrive ahead of earlier text.
+        if stage_key != "documentation_stream_delta":
+            self.flush_stream()
         text = (message or _STAGE_MESSAGES.get(stage_key) or "").strip()
         if not text:
             text = stage_key.replace("_", " ").strip().capitalize() or "Working..."
-        # Avoid flooding the UI with identical consecutive lines.
+        # Avoid flooding the UI with identical consecutive stage lines.
+        # Stream deltas intentionally repeat the same message while the
+        # growing text lives in ``extra["text"]``.
         if text == self._last_message and stage_key not in {
             "job_started",
             "job_finished",
             "job_failed",
+            "documentation_stream_delta",
         }:
             return
         self._last_message = text
-        payload = {
+        self._write_event(stage_key, text, extra)
+
+    def emit_stream_delta(self, chunk: str) -> None:
+        """Buffer a documentation token; flush on a short timer."""
+        text = str(chunk or "")
+        if not text or not self.path:
+            return
+        now = time.monotonic()
+        if not self._stream_buf:
+            self._stream_opened_at = now
+        self._stream_buf += text
+        if (now - self._stream_opened_at) >= self._STREAM_BATCH_SECONDS:
+            self.flush_stream()
+
+    def flush_stream(self) -> None:
+        """Write any buffered documentation stream text immediately."""
+        if not self.path or not self._stream_buf:
+            return
+        chunk = self._stream_buf
+        self._stream_buf = ""
+        self._stream_opened_at = 0.0
+        self._last_message = "Streaming documentation…"
+        self._write_event(
+            "documentation_stream_delta",
+            "Streaming documentation…",
+            {"text": chunk},
+        )
+
+    def _write_event(
+        self,
+        stage_key: str,
+        message: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
             "ts": time.time(),
             "stage": stage_key,
-            "message": text,
+            "message": message,
         }
         if extra:
             payload["extra"] = {
@@ -139,6 +185,11 @@ def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> Callab
         stage = str(name or "")
         if not stage:
             return
+        if stage == "documentation_stream_delta":
+            chunk = str(metadata.get("text") or "")
+            if chunk:
+                progress.emit_stream_delta(chunk)
+            return
         message = _STAGE_MESSAGES.get(stage)
         if message is None:
             interesting = (
@@ -158,6 +209,7 @@ def _attach_tracer_progress(supervisor: Any, progress: ProgressWriter) -> Callab
     tracer.record = record  # type: ignore[method-assign]
 
     def restore() -> None:
+        progress.flush_stream()
         tracer.record = original_record  # type: ignore[method-assign]
 
     return restore

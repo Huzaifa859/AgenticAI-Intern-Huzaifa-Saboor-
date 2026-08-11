@@ -183,6 +183,87 @@ class ModelClient:
         )
         return response
 
+    def generate_stream(
+        self,
+        messages: Sequence[ModelMessage],
+        *,
+        on_chunk: Optional[Any] = None,
+        **options: Any,
+    ) -> ModelResponse:
+        """
+        Generate a completion and optionally forward text chunks.
+
+        Providers without native streaming emit the full content once via
+        ``on_chunk``.
+        """
+        self._validate_messages(messages)
+
+        if self._provider is None:
+            raise ProviderUnavailableError(
+                "No provider configured on this ModelClient. "
+                "Pass one to the constructor or call set_provider()."
+            )
+
+        model_name = getattr(self._provider, "model", "") or ""
+        self._trigger_hook(
+            HookEvent.BEFORE_MODEL_CALL,
+            {
+                "component": "ModelClient",
+                "model": model_name,
+                "message_count": len(messages),
+                "stream": True,
+            },
+        )
+        started = time.perf_counter()
+        try:
+            generate_stream = getattr(self._provider, "generate_stream", None)
+            if callable(generate_stream):
+                response = generate_stream(
+                    list(messages), on_chunk=on_chunk, **options
+                )
+            else:
+                response = self._provider.generate(list(messages), **options)
+                if on_chunk is not None:
+                    content = getattr(response, "content", "") or ""
+                    if content:
+                        on_chunk(content)
+            self._validate_response(response)
+        except Exception as exc:
+            self._trigger_hook(
+                HookEvent.AFTER_MODEL_CALL,
+                {
+                    "component": "ModelClient",
+                    "model": model_name,
+                    "success": False,
+                    "error": str(exc),
+                    "duration_ms": (time.perf_counter() - started) * 1000.0,
+                    "stream": True,
+                },
+            )
+            self._trigger_hook(
+                HookEvent.ON_ERROR,
+                {
+                    "component": "ModelClient",
+                    "model": model_name,
+                    "error": str(exc),
+                    "success": False,
+                },
+            )
+            raise
+
+        self._trigger_hook(
+            HookEvent.AFTER_MODEL_CALL,
+            {
+                "component": "ModelClient",
+                "model": getattr(self._provider, "model", model_name),
+                "success": True,
+                "duration_ms": (time.perf_counter() - started) * 1000.0,
+                "content_chars": len(getattr(response, "content", "") or ""),
+                "stream": True,
+            },
+        )
+        return response
+
     def _trigger_hook(self, event: HookEvent, context: dict) -> None:
         """Fire a lifecycle hook when a manager is configured."""
         if self.hook_manager is None:

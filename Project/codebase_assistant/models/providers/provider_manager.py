@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ...exceptions.model_exceptions import (
     ModelResponseError,
@@ -231,6 +231,75 @@ class ProviderManager(BaseProvider):
                 reason="preferred_unavailable",
                 **kwargs,
             )
+
+        raise ProviderUnavailableError(
+            "No LLM provider is available. Configure OPENROUTER_API_KEY "
+            "or start Ollama."
+        )
+
+    def generate_stream(
+        self,
+        messages: List[ModelMessage],
+        *,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """
+        Stream via preferred provider, with one failover to fallback.
+
+        Uses each provider's ``generate_stream`` (BaseProvider falls back
+        to a single non-streaming ``generate`` when unsupported).
+        """
+        if self.preferred is not None and self.preferred_is_available():
+            started = time.perf_counter()
+            try:
+                response = self.preferred.generate_stream(
+                    messages, on_chunk=on_chunk, **kwargs
+                )
+            except _FAILOVER_EXCEPTIONS as exc:
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                self._trace(
+                    "provider_failed",
+                    provider=self.preferred_name,
+                    model=getattr(self.preferred, "model", ""),
+                    reason=str(exc),
+                    latency_ms=latency_ms,
+                    success=False,
+                )
+                self.mark_preferred_unavailable(str(exc))
+                if self.fallback is None or not self._fallback_is_available():
+                    raise
+                self._trace(
+                    "provider_fallback",
+                    provider=self.fallback_name,
+                    model=getattr(self.fallback, "model", ""),
+                    reason=str(exc),
+                    from_provider=self.preferred_name,
+                    success=True,
+                )
+                response = self.fallback.generate_stream(
+                    messages, on_chunk=on_chunk, **kwargs
+                )
+                self.model = getattr(self.fallback, "model", self.model)
+                return response
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            self._trace(
+                "provider_selected",
+                provider=self.preferred_name,
+                model=getattr(self.preferred, "model", ""),
+                reason="preferred_healthy",
+                latency_ms=latency_ms,
+                success=True,
+            )
+            self.model = getattr(self.preferred, "model", self.model)
+            return response
+
+        if self.fallback is not None and self._fallback_is_available():
+            response = self.fallback.generate_stream(
+                messages, on_chunk=on_chunk, **kwargs
+            )
+            self.model = getattr(self.fallback, "model", self.model)
+            return response
 
         raise ProviderUnavailableError(
             "No LLM provider is available. Configure OPENROUTER_API_KEY "

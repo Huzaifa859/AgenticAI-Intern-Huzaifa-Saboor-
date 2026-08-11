@@ -13,7 +13,7 @@ model name.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from ...schemas.schemas import ModelMessage, ModelResponse
 
@@ -55,6 +55,29 @@ class BaseProvider(ABC):
         TODO: Implement in each concrete subclass.
         """
         raise NotImplementedError
+
+    def generate_stream(
+        self,
+        messages: List[ModelMessage],
+        *,
+        on_chunk: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """
+        Generate a completion, optionally notifying ``on_chunk`` as text arrives.
+
+        Default implementation falls back to a single ``generate`` call and
+        emits the full content once. Providers that support token streaming
+        should override this.
+        """
+        # Drop stream-only kwargs so non-streaming generate() stays clean.
+        kwargs.pop("on_chunk", None)
+        response = self.generate(messages, **kwargs)
+        if on_chunk is not None:
+            content = getattr(response, "content", "") or ""
+            if content:
+                on_chunk(content)
+        return response
 
     @abstractmethod
     def is_available(self) -> bool:

@@ -5,16 +5,18 @@ documentation_agent.py
 Defines DocumentationAgent, responsible for generating and updating
 documentation (docstrings, README sections, API docs) for a codebase.
 
-Uses the injected Ollama-backed LLMClient, Retriever for RAG context,
-and ToolRegistry-resolved FilesystemTools for reading repository source.
+Uses the injected LLMClient, Retriever for RAG context, and
+ToolRegistry-resolved FilesystemTools for reading repository source.
 
-When the model returns malformed or unparseable JSON, the agent performs
-exactly one JSON-repair retry before falling back to the existing
-abstention path.
+Experimental freeform mode: the model returns markdown prose (no JSON
+envelope). Tokens are streamed into the UI via tracer progress events
+when the provider supports streaming; otherwise the full reply is
+emitted as one chunk. The prose is stored in DocumentationResult.summary
+so the existing UI / write-back / merge paths keep working.
 
 Documentation grounding (inventory claim scrubbing) is disabled: the
-parsed DocumentationResult is returned as generated so demos keep model
-text instead of empty grounded stubs.
+model text is returned as generated so demos keep the prose instead of
+empty grounded stubs.
 
 Optional write-back (``write_to_disk=False`` by default) can persist a
 generated README.md or insert missing docstrings through FilesystemTools
@@ -24,9 +26,9 @@ Optional targeting via ``file_path`` / ``function_name`` / ``class_name``
 scopes retrieval and prompting to a single file or symbol. When those
 fields are absent, repository-wide README behaviour is unchanged.
 
-Public symbols are documented incrementally (one LLM call per symbol)
-and merged into a single DocumentationResult, reducing context size and
-hallucinations versus a single repository-wide generation call.
+README / repository-wide requests use one freeform model call. Targeted
+file, function, or class requests still document public symbols
+incrementally and merge into a single DocumentationResult.
 """
 
 from __future__ import annotations
@@ -53,12 +55,6 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
-from ..utils.json_output import (
-    JSON_OBJECT_RESPONSE_FORMAT,
-    extract_json_object,
-    log_json_parse_outcome,
-    strip_markdown_json_fences,
-)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -78,21 +74,13 @@ _MAX_CONTEXT_CHUNKS = 8
 #: Cap on characters per retrieved chunk in the prompt.
 _MAX_CHUNK_CHARS = 1200
 
-#: Generation ceiling for documentation calls. Raised from 2048 so
-#: README-mode and multi-method class documentation is less likely to
-#: be truncated mid-JSON and trigger the JSON-repair retry path.
+#: Generation ceiling for documentation calls.
 _DOC_MAX_TOKENS = 3072
 
 #: Bump this whenever the documentation prompt template or the shape of
-#: `DocumentationResult` changes, so previously cached LLM outputs are
+#: the expected model prose changes, so previously cached LLM outputs are
 #: invalidated instead of being replayed against a stale format.
-_PROMPT_VERSION = "doc-v1"
-
-#: Soft ceiling for text embedded in a JSON-repair retry prompt.
-_MAX_RETRY_PROMPT_CHARS = 8_000
-
-#: Cap on raw model output embedded in a JSON-repair retry prompt.
-_MAX_RETRY_RAW_CHARS = 4_000
+_PROMPT_VERSION = "doc-v4-readme-single"
 
 #: Cap on file paths listed in the repository inventory section.
 _MAX_INVENTORY_FILES = 150
@@ -183,75 +171,38 @@ _UNGROUNDED_PLACEHOLDER = (
     "Not documented in the provided repository evidence."
 )
 
-_JSON_RETRY_SYSTEM_PROMPT = """\
-You are repairing malformed DocumentationResult JSON.
-
-This is a JSON repair step, not a new documentation generation.
-Return ONLY the corrected DocumentationResult JSON object.
-Do not add explanations, Markdown, or code fences.
-Do not add prose before or after the JSON.
-Do not add fields outside the DocumentationResult schema.
-Preserve all information that can be recovered from the raw model output.
-
-Required shape:
-
-{
-  "file_path": "path/to/file.py",
-  "function_name": "name_or_README_or_module",
-  "summary": "Markdown documentation body.",
-  "parameters": [
-    {"name": "param_or_module", "type": "str_or_kind", "description": "What it is."}
-  ],
-  "returns": "Return value description, or empty string if N/A.",
-  "example_usage": "Realistic usage or run commands, or empty string."
-}
-"""
-
 _SYSTEM_PROMPT = """\
-You are a senior technical writer producing developer documentation for
-Python codebases. You write structured, markdown-formatted documentation
-that is grounded strictly in the evidence you are given.
+You are an experienced technical writer for Python codebases.
 
-Grounding rules (follow exactly):
-1. Use only the provided RETRIEVED CONTEXT, REPOSITORY INVENTORY,
-   PROJECT FILES, and REPOSITORY CONTENTS as evidence.
-2. Never invent functions, classes, parameters, files, commands,
-   dependencies, or APIs. Every name you write must appear in the
-   evidence.
-3. Prefer RETRIEVED CONTEXT when it is present; use REPOSITORY CONTENTS
-   only to fill gaps.
-4. When evidence for a section is missing, write
-   "Not documented in the provided repository evidence." for that
-   section instead of guessing, or omit the section entirely.
-5. Explain purpose before implementation details. Keep wording precise
-   and technical - no marketing language.
+Write freeform markdown documentation grounded only in the evidence
+you are given (retrieved context, inventory, project files, source).
 
-Formatting rules:
-- The "summary" field holds markdown. Use `##` headings, bullet lists,
-  and fenced code blocks. Do not produce a single paragraph.
-- Because the output is JSON, escape newlines inside strings as \\n and
-  quotes as \\".
-- Do not wrap the JSON itself in markdown fences.
-
-Return ONE JSON object only (no prose outside JSON):
-
-{
-  "file_path": "path/to/file.py",
-  "function_name": "name_or_README_or_module",
-  "summary": "Markdown documentation body.",
-  "parameters": [
-    {"name": "param_or_module", "type": "str_or_kind", "description": "What it is."}
-  ],
-  "returns": "Return value description, or empty string if N/A.",
-  "example_usage": "Realistic usage or run commands, or empty string."
-}
-
-Mode guidance:
-- docstring: document one function; summary = purpose; fill parameters/returns.
-- module: summarize the module's role; parameters may list public symbols.
-- readme: full repository documentation; function_name=README.
-- api_reference: public API summary; parameters list public callables/classes.
+Rules:
+1. Never invent files, symbols, APIs, dependencies, or commands that
+   are not present in the evidence.
+2. Prefer retrieved context when available; use repository contents to
+   fill gaps.
+3. If something is unknown from the evidence, say so briefly or omit it.
+4. Do NOT return JSON, YAML, or any machine envelope.
+5. Do NOT wrap the entire reply in a markdown fence.
+6. Choose your own structure. Write whatever README / documentation
+   layout you think is clearest for this target — headings, sections,
+   lists, and examples are up to you.
 """
+
+#: Soft guidance only — the model picks its own README-style layout.
+_FREEFORM_GUIDANCE = (
+    "Write freeform markdown documentation for the target. "
+    "Invent your own README-style structure based on what the evidence "
+    "supports. Do not follow a fixed section template. Do not return JSON."
+)
+
+_MODE_GUIDANCE = {
+    "docstring": _FREEFORM_GUIDANCE,
+    "module": _FREEFORM_GUIDANCE,
+    "readme": _FREEFORM_GUIDANCE,
+    "api_reference": _FREEFORM_GUIDANCE,
+}
 
 
 @dataclass
@@ -375,77 +326,6 @@ class _DocumentableSymbol:
             return f"{self.parent_class}.{self.name}"
         return self.qualname or self.name
 
-
-_README_GUIDANCE = """\
-Write complete repository documentation suitable for a README overview.
-Put the whole document in "summary" as markdown, using these sections in
-order and only when the repository evidence supports them:
-
-## Project Overview
-## Purpose
-## Main Functionality
-## Architecture Overview
-## Directory and Module Summary
-## Important Classes, Functions, and Modules
-## Technologies and Frameworks
-## Installation Requirements
-## How to Run
-## Key Workflows
-## Limitations
-## Suggested Future Improvements
-
-Section rules:
-- Directory and Module Summary: describe only paths present in the
-  REPOSITORY INVENTORY.
-- Technologies and Frameworks: name only libraries that appear in
-  imports or in PROJECT FILES.
-- Installation Requirements and How to Run: derive strictly from
-  PROJECT FILES (requirements.txt, pyproject.toml, Makefile, Dockerfile,
-  entry-point modules). If nothing is discoverable, state that plainly
-  instead of inventing commands.
-- Key Workflows: describe end-to-end flows visible in the code, naming
-  the real modules or functions that implement each step.
-- Limitations: only gaps visible in the evidence, such as missing tests,
-  TODO markers, or unimplemented branches.
-- Suggested Future Improvements: only items justified by a limitation
-  you just documented. Omit the section otherwise.
-
-Field rules for this mode:
-- function_name: "README".
-- file_path: the repository path given in TARGET.
-- parameters: the main modules or packages, one entry each, with
-  name = path, type = "module" or "package", description = its role.
-- returns: one sentence naming the primary entry point, or "".
-- example_usage: real run commands taken from the evidence, or "".
-"""
-
-_MODE_GUIDANCE = {
-    "docstring": (
-        "Write a function docstring-style DocumentationResult. "
-        "Start the summary with what the function is for, then note "
-        "important behavior or caveats visible in the code. "
-        "Use markdown with a short purpose paragraph followed by "
-        "bullet points for behavior and caveats. "
-        "List only parameters that appear in the signature."
-    ),
-    "module": (
-        "Write a module summary in markdown with '## Purpose', "
-        "'## Public Surface', and '## Notes' sections. Explain the "
-        "module's role first, then the public symbols it exposes and "
-        "how they fit into the wider system. "
-        "Do not invent symbols that are not in the code."
-    ),
-    "readme": _README_GUIDANCE,
-    "api_reference": (
-        "Write a public API reference in markdown, grouping symbols "
-        "under '## Classes' and '## Functions' headings with a short "
-        "grounded description and signature for each. List the same "
-        "real public functions/classes in parameters "
-        "(name/type/description). "
-        "Omit private helpers (names starting with underscore) unless "
-        "they are the only content."
-    ),
-}
 
 
 class DocumentationAgent(BaseAgent):
@@ -780,10 +660,10 @@ class DocumentationAgent(BaseAgent):
         """
         Run the documentation pipeline for one request.
 
-        Stages: resolve target → AST inventory → per-symbol generation
-        (retrieve → prompt → generate → JSON repair → ground) → merge →
-        optional write-back. Falls back to a single repository-wide call
-        when no public symbols exist but project metadata is available.
+        README / repository-wide requests use a single model call over the
+        repo evidence. Targeted file/function/class requests still document
+        public symbols (retrieve → prompt → generate → ground → merge) with
+        a repository-wide fallback when no symbols are found.
         """
         empty = self._empty_result(
             file_path=target_path,
@@ -869,6 +749,33 @@ class DocumentationAgent(BaseAgent):
         )
 
         inventory = self._repository_inventory(filesystem)
+
+        # Whole-repo README must be one document, not one LLM call per
+        # public symbol merged under "## name" headings.
+        if mode == "readme" or doc_target.scope == "repository":
+            self._trace(
+                "documentation_ast_scan_finished",
+                scope=doc_target.scope,
+                symbols_discovered=0,
+                symbols_selected=0,
+                inventory=len(inventory),
+                single_repository_call=True,
+            )
+            return self._run_repository_fallback(
+                mode=mode,
+                workspace=workspace,
+                target_path=target_path,
+                instruction=instruction,
+                function_name=function_name or "README",
+                class_name=class_name,
+                doc_target=doc_target,
+                filesystem=filesystem,
+                inventory=inventory,
+                empty=empty,
+                write_to_disk=write_to_disk,
+                replace_existing=replace_existing,
+            )
+
         symbols = self._discover_documentable_symbols(filesystem, doc_target)
         selected = symbols[:_MAX_SYMBOLS_TO_DOCUMENT]
         self._trace(
@@ -880,22 +787,6 @@ class DocumentationAgent(BaseAgent):
         )
 
         if not selected:
-            # Preserve README-style generation when only project metadata exists.
-            if doc_target.scope == "repository":
-                return self._run_repository_fallback(
-                    mode=mode,
-                    workspace=workspace,
-                    target_path=target_path,
-                    instruction=instruction,
-                    function_name=function_name,
-                    class_name=class_name,
-                    doc_target=doc_target,
-                    filesystem=filesystem,
-                    inventory=inventory,
-                    empty=empty,
-                    write_to_disk=write_to_disk,
-                    replace_existing=replace_existing,
-                )
             abstained = self._abstain_result(
                 empty,
                 reason="No public symbols were found to document.",
@@ -927,7 +818,9 @@ class DocumentationAgent(BaseAgent):
         # requiring any changes to the synchronous provider.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        _MAX_DOC_WORKERS = 20
+        # Freeform streaming: keep one symbol at a time so the live UI box
+        # does not interleave tokens from concurrent model calls.
+        _MAX_DOC_WORKERS = 1
 
         def _run_one(symbol):  # type: ignore[no-untyped-def]
             self._trace(
@@ -1007,7 +900,7 @@ class DocumentationAgent(BaseAgent):
                     reason = (
                         symbol_result.abstention.reason
                         if symbol_result.abstention is not None
-                        else "imperfect grounding or JSON shape"
+                        else "imperfect grounding or empty model text"
                     )
                     warnings.append(
                         f"{symbol.qualname}: kept model output despite {reason}"
@@ -1070,7 +963,7 @@ class DocumentationAgent(BaseAgent):
                 ],
                 recommended_next_steps=[
                     "Retry with a narrower documentation target.",
-                    "Confirm the model returned valid DocumentationResult JSON.",
+                    "Confirm the model returned usable markdown documentation.",
                 ],
             )
             self._trace(
@@ -1161,7 +1054,7 @@ class DocumentationAgent(BaseAgent):
         write_to_disk: bool,
         replace_existing: bool,
     ) -> DocumentationResult:
-        """Single-call README path when no public symbols are available."""
+        """Single-call repository documentation path (README / whole-repo)."""
         project_files = self._read_project_files(filesystem)
         source_excerpts = self._read_repository_sources(
             filesystem,
@@ -1225,7 +1118,7 @@ class DocumentationAgent(BaseAgent):
                 evidence_available=[f"{len(inventory)} inventoried path(s)"],
                 recommended_next_steps=[
                     "Retry with a narrower documentation target.",
-                    "Confirm the model returned valid DocumentationResult JSON.",
+                    "Confirm the model returned usable markdown documentation.",
                 ],
             )
             self._trace(
@@ -1453,7 +1346,7 @@ class DocumentationAgent(BaseAgent):
                     evidence_available=[f"symbol={symbol.qualname}"],
                     recommended_next_steps=[
                         "Retry with a narrower documentation target.",
-                        "Confirm the model returned valid DocumentationResult JSON.",
+                        "Confirm the model returned usable markdown documentation.",
                     ],
                 ),
                 False,
@@ -1524,22 +1417,44 @@ class DocumentationAgent(BaseAgent):
         default_file_path: str,
         default_function_name: str,
     ) -> DocumentationResult:
-        """Call the model once (plus optional JSON repair) for a prompt."""
+        """Call the model once and keep the freeform markdown reply."""
         self._trace(
             "model_request",
             event_type=TraceEventType.MODEL_CALL,
         )
         model_started = time.perf_counter()
-        try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(role="system", content=_SYSTEM_PROMPT),
-                    ModelMessage(role="user", content=prompt),
-                ],
-                max_tokens=_DOC_MAX_TOKENS,
-                temperature=0.1,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+
+        def _on_chunk(text: str) -> None:
+            chunk = str(text or "")
+            if not chunk:
+                return
+            self._trace(
+                "documentation_stream_delta",
+                text=chunk,
             )
+
+        try:
+            generate_stream = getattr(self.model_client, "generate_stream", None)
+            if callable(generate_stream):
+                response = generate_stream(
+                    [
+                        ModelMessage(role="system", content=_SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=prompt),
+                    ],
+                    max_tokens=_DOC_MAX_TOKENS,
+                    temperature=0.1,
+                    on_chunk=_on_chunk,
+                )
+            else:
+                response = self.model_client.generate(
+                    [
+                        ModelMessage(role="system", content=_SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=prompt),
+                    ],
+                    max_tokens=_DOC_MAX_TOKENS,
+                    temperature=0.1,
+                )
+                _on_chunk(getattr(response, "content", "") or "")
         except Exception as exc:
             logger.warning("Documentation model call failed: %s", exc)
             self._trace(
@@ -1554,56 +1469,28 @@ class DocumentationAgent(BaseAgent):
                 function_name=default_function_name,
             )
 
+        content = str(getattr(response, "content", "") or "").strip()
         self._trace(
             "model_response",
             event_type=TraceEventType.MODEL_CALL,
             success=True,
             duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            content_chars=len(response.content or ""),
+            content_chars=len(content),
         )
-        result, parse_error = self._parse_response_with_status(
-            response.content,
-            default_file_path=default_file_path,
-            default_function_name=default_function_name,
+        if not content:
+            return self._empty_result(
+                file_path=default_file_path,
+                function_name=default_function_name,
+            )
+        return DocumentationResult(
+            file_path=default_file_path or "",
+            function_name=default_function_name or "",
+            summary=content,
+            parameters=[],
+            returns="",
+            example_usage="",
+            abstention=None,
         )
-        if parse_error is None:
-            log_json_parse_outcome(
-                agent="documentation", stage="initial", success=True
-            )
-        else:
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="initial",
-                success=False,
-                error=parse_error,
-            )
-            # Try lenient salvage first — no extra LLM call, immediate result.
-            if (
-                self._lenient()
-                and not (result.summary and result.summary.strip())
-                and (response.content or "").strip()
-            ):
-                salvaged = self._salvage_raw_documentation(
-                    response.content or "",
-                    default_file_path=default_file_path,
-                    default_function_name=default_function_name,
-                )
-                if salvaged.summary.strip():
-                    self._trace(
-                        "documentation_json_salvaged",
-                        success=True,
-                        summary_chars=len(salvaged.summary),
-                    )
-                    return salvaged
-            # Salvage failed or lenient mode is off — try one JSON repair call.
-            result = self._retry_json_repair(
-                original_prompt=prompt,
-                raw_output=response.content or "",
-                parse_error=parse_error,
-                default_file_path=default_file_path,
-                default_function_name=default_function_name,
-            )
-        return result
 
     def _discover_documentable_symbols(
         self,
@@ -2341,147 +2228,6 @@ class DocumentationAgent(BaseAgent):
                 rendered.append("\n")
         rendered.append(f"{indent}{quote}\n")
         return "".join(rendered)
-
-    def _retry_json_repair(
-        self,
-        *,
-        original_prompt: str,
-        raw_output: str,
-        parse_error: str,
-        default_file_path: str,
-        default_function_name: str,
-    ) -> DocumentationResult:
-        """
-        Perform exactly one JSON-repair model call.
-
-        Never regenerates documentation from scratch: the retry prompt
-        asks the model only to repair formatting / JSON validity while
-        preserving recoverable content from the raw output.
-        """
-        self._trace(
-            "documentation_retry_started",
-            parse_error=parse_error,
-            raw_chars=len(raw_output or ""),
-        )
-
-        retry_prompt = self._build_json_retry_prompt(
-            original_prompt=original_prompt,
-            raw_output=raw_output,
-            parse_error=parse_error,
-        )
-        model_started = time.perf_counter()
-        try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(role="system", content=_JSON_RETRY_SYSTEM_PROMPT),
-                    ModelMessage(role="user", content=retry_prompt),
-                ],
-                max_tokens=_DOC_MAX_TOKENS,
-                temperature=0.0,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
-            )
-        except Exception as exc:
-            logger.warning("Documentation JSON retry call failed: %s", exc)
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="repair",
-                success=False,
-                error=str(exc),
-            )
-            self._trace(
-                "documentation_retry_failed",
-                success=False,
-                error=str(exc),
-                duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            )
-            if self._lenient():
-                salvaged = self._salvage_raw_documentation(
-                    raw_output,
-                    default_file_path=default_file_path,
-                    default_function_name=default_function_name,
-                )
-                if salvaged.summary.strip():
-                    return salvaged
-            return self._empty_result(default_file_path, default_function_name)
-
-        repaired, retry_error = self._parse_response_with_status(
-            response.content,
-            default_file_path=default_file_path,
-            default_function_name=default_function_name,
-        )
-        if retry_error is not None or not (
-            repaired.summary and repaired.summary.strip()
-        ):
-            log_json_parse_outcome(
-                agent="documentation",
-                stage="repair",
-                success=False,
-                error=retry_error or "repaired JSON produced an empty summary",
-            )
-            self._trace(
-                "documentation_retry_failed",
-                success=False,
-                error=retry_error or "repaired JSON produced an empty summary",
-                duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            )
-            if self._lenient():
-                for candidate in (response.content or "", raw_output):
-                    salvaged = self._salvage_raw_documentation(
-                        candidate,
-                        default_file_path=default_file_path,
-                        default_function_name=default_function_name,
-                    )
-                    if salvaged.summary.strip():
-                        self._trace(
-                            "documentation_json_salvaged",
-                            success=True,
-                            summary_chars=len(salvaged.summary),
-                        )
-                        return salvaged
-            return self._empty_result(default_file_path, default_function_name)
-
-        log_json_parse_outcome(
-            agent="documentation", stage="repair", success=True
-        )
-        self._trace(
-            "documentation_retry_success",
-            success=True,
-            duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            summary_chars=len(repaired.summary or ""),
-        )
-        return repaired
-
-    def _build_json_retry_prompt(
-        self,
-        *,
-        original_prompt: str,
-        raw_output: str,
-        parse_error: str,
-    ) -> str:
-        """Build the user prompt for a single DocumentationResult JSON repair."""
-        prompt_text = (original_prompt or "").strip() or "(none)"
-        if len(prompt_text) > _MAX_RETRY_PROMPT_CHARS:
-            prompt_text = (
-                prompt_text[:_MAX_RETRY_PROMPT_CHARS]
-                + "\n...[truncated original prompt]"
-            )
-
-        raw_text = (raw_output or "").strip() or "(empty)"
-        if len(raw_text) > _MAX_RETRY_RAW_CHARS:
-            raw_text = raw_text[:_MAX_RETRY_RAW_CHARS] + "\n...[truncated raw output]"
-
-        return (
-            "DOCUMENTATION JSON REPAIR MODE\n"
-            "Return ONLY the corrected DocumentationResult JSON object.\n"
-            "No Markdown, no code fences, no explanation, no extra fields.\n"
-            "Preserve all information that can be recovered.\n"
-            "Follow the DocumentationResult schema exactly.\n\n"
-            f"PARSER / VALIDATION ERROR\n{parse_error}\n\n"
-            f"RAW MODEL OUTPUT\n{raw_text}\n\n"
-            f"ORIGINAL PROMPT\n{prompt_text}\n\n"
-            "OUTPUT CONTRACT\n"
-            "Return only the repaired DocumentationResult JSON object."
-        )
 
     # ------------------------------------------------------------------
     # Documentation grounding (mechanical; no model call)
@@ -3528,7 +3274,7 @@ class DocumentationAgent(BaseAgent):
         Repository excerpts are secondary fillers. Inventory and project
         files ground layout, dependency, and run-instruction claims.
         """
-        guidance = _MODE_GUIDANCE.get(mode, _MODE_GUIDANCE["docstring"])
+        guidance = _MODE_GUIDANCE.get(mode, _FREEFORM_GUIDANCE)
         sections = [
             f"DOCUMENTATION MODE\n{mode}",
             f"WRITING INSTRUCTIONS\n{guidance}",
@@ -3592,93 +3338,10 @@ class DocumentationAgent(BaseAgent):
             sections.append("REPOSITORY CONTENTS\n(none)")
 
         sections.append(
-            "Return only the DocumentationResult JSON object."
+            "Write freeform markdown only. Choose your own README-style "
+            "structure. Do not return JSON."
         )
         return "\n\n".join(sections)
-
-    def _parse_response(
-        self,
-        content: str,
-        default_file_path: str,
-        default_function_name: str,
-    ) -> DocumentationResult:
-        """
-        Parse model output into DocumentationResult.
-
-        Returns an empty result when parsing fails rather than raising.
-        """
-        result, _error = self._parse_response_with_status(
-            content,
-            default_file_path=default_file_path,
-            default_function_name=default_function_name,
-        )
-        return result
-
-    def _parse_response_with_status(
-        self,
-        content: str,
-        default_file_path: str,
-        default_function_name: str,
-    ) -> Tuple[DocumentationResult, Optional[str]]:
-        """
-        Parse model output and report whether a JSON object was recovered.
-
-        Returns:
-            ``(result, None)`` when a JSON object was parsed (summary may
-            still be empty). ``(empty, error)`` when the response is
-            malformed / unparseable.
-        """
-        empty = self._empty_result(default_file_path, default_function_name)
-        if not content or not str(content).strip():
-            return empty, "Model response was empty."
-
-        payload, extract_error = self._extract_json_object_with_error(str(content))
-        if payload is None:
-            logger.warning("Documentation model response was not valid JSON.")
-            return empty, extract_error or (
-                "Documentation model response was not valid JSON."
-            )
-
-        parameters = payload.get("parameters") or []
-        if not isinstance(parameters, list):
-            parameters = []
-        cleaned_params: List[Dict[str, Any]] = []
-        for item in parameters:
-            if isinstance(item, dict):
-                cleaned_params.append(
-                    {
-                        "name": str(item.get("name", "")),
-                        "type": str(item.get("type", "")),
-                        "description": str(item.get("description", "")),
-                    }
-                )
-
-        return (
-            DocumentationResult(
-                file_path=str(payload.get("file_path") or default_file_path or ""),
-                function_name=str(
-                    payload.get("function_name") or default_function_name or ""
-                ),
-                summary=str(payload.get("summary") or ""),
-                parameters=cleaned_params,
-                returns=str(payload.get("returns") or ""),
-                example_usage=str(payload.get("example_usage") or ""),
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _extract_json_object(content: str) -> Optional[Dict[str, Any]]:
-        """Extract the first JSON object from a model response."""
-        payload, _error = DocumentationAgent._extract_json_object_with_error(content)
-        return payload
-
-    @staticmethod
-    def _extract_json_object_with_error(
-        content: str,
-    ) -> Tuple[Optional[Dict[str, Any]], str]:
-        """Extract the first JSON object, returning a parse error on failure."""
-        return extract_json_object(content)
 
     @staticmethod
     def _empty_result(
@@ -3689,65 +3352,6 @@ class DocumentationAgent(BaseAgent):
             file_path=file_path or "",
             function_name=function_name or "",
             summary="",
-            parameters=[],
-            returns="",
-            example_usage="",
-            abstention=None,
-        )
-
-    @staticmethod
-    def _salvage_raw_documentation(
-        raw_output: str,
-        *,
-        default_file_path: str,
-        default_function_name: str,
-    ) -> DocumentationResult:
-        """
-        Keep usable model prose when JSON parsing fails (lenient mode).
-
-        Strips markdown fences and ignores trivial refusal/error stubs.
-        """
-        text = (raw_output or "").strip()
-        if not text:
-            return DocumentationAgent._empty_result(
-                default_file_path, default_function_name
-            )
-        stripped = strip_markdown_json_fences(text)
-        if stripped:
-            text = stripped
-        # Prefer a nested summary string if the model almost returned JSON.
-        summary_match = re.search(
-            r'"summary"\s*:\s*"(.*)"\s*(?:,|\})',
-            text,
-            flags=re.DOTALL,
-        )
-        if summary_match:
-            candidate = summary_match.group(1).strip()
-            if len(candidate) >= 40:
-                text = candidate
-        lowered = text.lower()
-        if len(text) < 40 or lowered in {"not-json", "not-json-at-all"}:
-            return DocumentationAgent._empty_result(
-                default_file_path, default_function_name
-            )
-        if "sorry" in lowered and "json" in lowered and len(text) < 120:
-            return DocumentationAgent._empty_result(
-                default_file_path, default_function_name
-            )
-        # Unescape literal \n/\"/\\ unconditionally, regardless of whether
-        # `text` came from the regex-extracted summary or the plain
-        # fence-stripped fallback — both can contain JSON-style escape
-        # sequences that must not reach markdown/code-block rendering as-is.
-        text = (
-            text.replace("\\n", "\n")
-            .replace('\\"', '"')
-            .replace("\\\\", "\\")
-            .strip()
-        )
-        return DocumentationResult(
-            file_path=default_file_path or "",
-            function_name=default_function_name or "",
-            summary=text,
             parameters=[],
             returns="",
             example_usage="",

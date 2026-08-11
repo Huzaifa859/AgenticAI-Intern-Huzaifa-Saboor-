@@ -19,10 +19,11 @@ never trigger a fallback: another model would fail identically.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -222,6 +223,60 @@ class OpenRouterProvider(BaseProvider):
         )
         raise last_error  # type: ignore[misc]
 
+    def generate_stream(
+        self,
+        messages: List[ModelMessage],
+        *,
+        on_chunk: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """
+        Stream a completion via OpenRouter, falling back across models.
+
+        Calls ``on_chunk(text)`` for each content delta when provided.
+        """
+        if not self.api_key:
+            raise ProviderUnavailableError(
+                "OpenRouter API key is not configured. "
+                "Set OPENROUTER_API_KEY in the environment."
+            )
+        if not messages:
+            raise ModelResponseError(
+                "OpenRouter generate_stream() requires a non-empty messages list."
+            )
+
+        max_tokens = int(kwargs.get("max_tokens", self.max_tokens))
+        temperature = kwargs.get("temperature", 0.0)
+        # Freeform docs path: never force JSON mode while streaming.
+        kwargs.pop("response_format", None)
+        chain = self._model_chain(kwargs.get("model", self.model))
+
+        last_error: Optional[Exception] = None
+        for position, model in enumerate(chain):
+            logger.info("Attempting streamed model: %s", model)
+            try:
+                return self._generate_with_model_stream(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    on_chunk=on_chunk,
+                )
+            except _ModelUnavailable as signal:
+                last_error = signal.error
+                logger.warning(
+                    "Streamed model unavailable: %s (%s).", model, signal.reason
+                )
+                remaining = chain[position + 1 :]
+                if remaining:
+                    logger.info("Switching stream to: %s", remaining[0])
+
+        logger.error(
+            "All OpenRouter streamed models failed (%s).",
+            ", ".join(chain),
+        )
+        raise last_error  # type: ignore[misc]
+
     def _model_chain(self, primary: str) -> List[str]:
         """
         Build the ordered list of models to try for one request.
@@ -417,6 +472,153 @@ class OpenRouterProvider(BaseProvider):
         )
         raise ProviderUnavailableError(
             f"OpenRouter request failed after {_MAX_ATTEMPTS} attempts: "
+            f"{last_error}"
+        ) from last_error
+
+    def _generate_with_model_stream(
+        self,
+        model: str,
+        messages: List[ModelMessage],
+        max_tokens: int,
+        temperature: Any,
+        on_chunk: Optional[Callable[[str], None]] = None,
+    ) -> ModelResponse:
+        """
+        Stream one chat completion against a single model.
+
+        Raises ``_ModelUnavailable`` for model-level failures so the
+        caller can walk the fallback chain.
+        """
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in messages
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        url = f"{self.base_url}/chat/completions"
+        headers = self._headers()
+        logger.info(
+            "OpenRouter stream start: model=%s messages=%d max_tokens=%d",
+            model,
+            len(messages),
+            max_tokens,
+        )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=dict(payload),
+                    timeout=self.timeout,
+                    stream=True,
+                )
+            except requests.Timeout as exc:
+                last_error = exc
+                if attempt >= _MAX_ATTEMPTS:
+                    break
+                delay = self._backoff_seconds(attempt)
+                time.sleep(delay)
+                continue
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= _MAX_ATTEMPTS:
+                    break
+                delay = self._backoff_seconds(attempt)
+                time.sleep(delay)
+                continue
+
+            status = response.status_code
+            if self._is_retryable(status):
+                if attempt >= _MAX_ATTEMPTS:
+                    if status == 429:
+                        error: Exception = RateLimitError(
+                            f"OpenRouter rate limit exceeded (HTTP 429) on "
+                            f"{model} after {_MAX_ATTEMPTS} attempts."
+                        )
+                    else:
+                        error = ProviderUnavailableError(
+                            f"OpenRouter unavailable (HTTP {status}) on "
+                            f"{model} after {_MAX_ATTEMPTS} attempts."
+                        )
+                    raise _ModelUnavailable(error, f"HTTP {status}")
+                delay = self._backoff_seconds(attempt)
+                time.sleep(delay)
+                continue
+
+            if status in _FALLBACK_STATUS_CODES:
+                raise _ModelUnavailable(
+                    self._model_level_error(status, model, response),
+                    f"HTTP {status}",
+                )
+
+            if status >= 400:
+                self._raise_for_client_error(response)
+
+            pieces: List[str] = []
+            try:
+                # Small chunk_size so SSE deltas flush promptly instead of
+                # buffering until the response completes.
+                for raw_line in response.iter_lines(
+                    decode_unicode=True,
+                    chunk_size=64,
+                ):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = event.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if not piece:
+                        continue
+                    text = str(piece)
+                    pieces.append(text)
+                    if on_chunk is not None:
+                        try:
+                            on_chunk(text)
+                        except Exception:
+                            logger.debug(
+                                "OpenRouter stream on_chunk failed",
+                                exc_info=True,
+                            )
+            finally:
+                response.close()
+
+            content = "".join(pieces)
+            if not content.strip():
+                raise ModelResponseError(
+                    "OpenRouter stream completed with empty assistant content."
+                )
+            logger.info(
+                "OpenRouter stream succeeded: model=%s content_chars=%d",
+                model,
+                len(content),
+            )
+            logger.info("Model used: %s", model)
+            return ModelResponse(
+                content=content,
+                raw={"model_used": model, "streamed": True},
+                usage={},
+            )
+
+        raise ProviderUnavailableError(
+            f"OpenRouter stream failed after {_MAX_ATTEMPTS} attempts: "
             f"{last_error}"
         ) from last_error
 

@@ -88,6 +88,7 @@ from ui_memory import (  # noqa: E402
 from ui_paths import chroma_persist_dir, memory_store_path  # noqa: E402
 from ui_reports import (  # noqa: E402
     render_analysis_report,
+    render_documentation_message,
     render_documentation_result,
     render_testing_result,
 )
@@ -513,6 +514,7 @@ def _init_state() -> None:
         "active_job": None,
         "job_log": [],
         "job_show_stages": True,
+        "doc_stream_text": "",
         "conversation_memory": None,
         "memory_bootstrapped": False,
     }
@@ -690,7 +692,7 @@ def _record_job_memory(
 
 def _tail_progress(
     path: str, offset: int
-) -> Tuple[List[Dict[str, str]], int]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """Read new NDJSON progress events from ``offset``."""
     if not path or not os.path.isfile(path):
         return [], offset
@@ -702,7 +704,7 @@ def _tail_progress(
     except OSError:
         return [], offset
 
-    events: List[Dict[str, str]] = []
+    events: List[Dict[str, Any]] = []
     for line in chunk.splitlines():
         text = line.strip()
         if not text:
@@ -714,8 +716,15 @@ def _tail_progress(
             continue
         stage = str(payload.get("stage") or "progress").strip()
         message = str(payload.get("message") or stage or "").strip()
-        if message:
-            events.append({"stage": stage, "message": message})
+        if not message:
+            continue
+        event: Dict[str, Any] = {"stage": stage, "message": message}
+        # Stream deltas carry token text in ``extra`` — keep it so the
+        # live documentation box can grow while the job is still running.
+        extra = payload.get("extra")
+        if isinstance(extra, dict) and extra:
+            event["extra"] = extra
+        events.append(event)
     return events, new_offset
 
 
@@ -1011,6 +1020,7 @@ def _start_worker(
     st.session_state.job_log = [log_line]
     # Reset stages visibility for each new run; user can hide during the run.
     st.session_state.job_show_stages = True
+    st.session_state.doc_stream_text = ""
     st.session_state.active_job = {
         "transport": transport,
         "job_id": job_id,
@@ -1180,9 +1190,26 @@ def _poll_active_job() -> None:
     events, offset = _tail_progress(progress_path, int(job_state.get("offset") or 0))
     job_state["offset"] = offset
     log = list(st.session_state.job_log or [])
+    stream_buf = str(st.session_state.get("doc_stream_text") or "")
     for event in events:
         message = event.get("message") or ""
         stage = event.get("stage") or "progress"
+        if stage == "documentation_stream_delta":
+            extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
+            chunk = str((extra or {}).get("text") or "")
+            if chunk:
+                stream_buf += chunk
+            # Keep a single stage line; don't spam the timeline per token.
+            if message and message != job_state.get("last_message"):
+                log.append(f"→ {message}")
+                job_state["last_message"] = message
+                job_state["stage_message"] = message
+            job_state["fraction"] = _stage_progress(
+                str(job_state.get("job") or ""),
+                "model_request",
+                float(job_state.get("fraction") or 0.02),
+            )
+            continue
         if stage in {"job_finished", "job_failed"}:
             job_state["terminal_stage"] = True
         if message and message != job_state.get("last_message"):
@@ -1194,6 +1221,7 @@ def _poll_active_job() -> None:
             stage,
             float(job_state.get("fraction") or 0.02),
         )
+    st.session_state.doc_stream_text = stream_buf
     st.session_state.job_log = log[-40:]
 
     now = time.monotonic()
@@ -1217,7 +1245,7 @@ def _poll_active_job() -> None:
         _finalize_active_job(cancelled=warm_status == "cancelled")
 
 
-@st.fragment(run_every=timedelta(seconds=1.5))
+@st.fragment(run_every=timedelta(milliseconds=80))
 def _render_job_monitor_live() -> None:
     """Live progress panel + Stop control while a worker is running."""
     _poll_active_job()
@@ -1256,6 +1284,14 @@ def _render_job_monitor_live() -> None:
         _render_stage_timeline(
             list(st.session_state.job_log or [])[-12:],
             elapsed=elapsed,
+        )
+
+    if job == "documentation":
+        streamed = str(st.session_state.get("doc_stream_text") or "")
+        render_documentation_message(
+            streamed,
+            live=True,
+            title="Documentation",
         )
 
 
@@ -1719,8 +1755,16 @@ def _render_main() -> None:
             st.session_state.last_testing,
         ]
     )
+    active = st.session_state.get("active_job")
+    if isinstance(active, dict) and str(active.get("job") or "") == "documentation":
+        st.caption(
+            "Documentation is streaming above — the finished answer uses the "
+            "same message layout."
+        )
+        return
+
     if st.session_state.get("active_job") and not has_any:
-        st.caption("Job in progress — results will appear here when finished.")
+        st.caption("Job in progress — watch the live output above.")
         return
 
     if not has_any:

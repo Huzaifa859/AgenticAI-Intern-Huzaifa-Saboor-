@@ -19,6 +19,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import streamlit as st
+import html
 
 _REPORT_CSS = """
 <style>
@@ -69,12 +70,299 @@ _REPORT_CSS = """
   background: #dbeafe;
   border-color: rgba(30, 58, 138, 0.16);
 }
+/* Chat-style documentation message — shared by live stream + final result. */
+.ca-doc-msg {
+  margin: 0.65rem 0 0.35rem;
+  padding: 0.8rem 0.95rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  background: #ffffff;
+}
+.ca-doc-msg-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.55rem;
+}
+.ca-doc-msg-title {
+  color: #0f172a;
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+.ca-doc-msg-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #64748b;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.ca-doc-msg-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: #2563eb;
+  box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.45);
+  animation: ca-doc-dot-pulse 1.4s ease-out infinite;
+}
+@keyframes ca-doc-dot-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.4); }
+  70% { box-shadow: 0 0 0 0.45rem rgba(37, 99, 235, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+}
+.ca-doc-msg-body {
+  color: #334155;
+  font-size: 0.95rem;
+  line-height: 1.62;
+  min-height: 3.2rem;
+  max-height: 36rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ca-doc-msg-body > :first-child { margin-top: 0; }
+.ca-doc-msg-body > :last-child { margin-bottom: 0; }
+.ca-doc-msg-body p {
+  margin: 0 0 0.7rem;
+}
+.ca-doc-msg-body h1,
+.ca-doc-msg-body h2,
+.ca-doc-msg-body h3,
+.ca-doc-msg-body h4 {
+  color: #0f172a;
+  font-weight: 650;
+  line-height: 1.3;
+  margin: 1rem 0 0.45rem;
+}
+.ca-doc-msg-body h1 { font-size: 1.2rem; }
+.ca-doc-msg-body h2 { font-size: 1.08rem; }
+.ca-doc-msg-body h3 { font-size: 1rem; }
+.ca-doc-msg-body ul,
+.ca-doc-msg-body ol {
+  margin: 0 0 0.7rem;
+  padding-left: 1.25rem;
+}
+.ca-doc-msg-body li { margin: 0.15rem 0; }
+.ca-doc-msg-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: #f1f5f9;
+  color: #0f172a;
+  border-radius: 5px;
+  padding: 0.08rem 0.32rem;
+}
+.ca-doc-msg-body pre {
+  margin: 0 0 0.75rem;
+  padding: 0.7rem 0.8rem;
+  border-radius: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: #f8fafc;
+  overflow-x: auto;
+}
+.ca-doc-msg-body pre code {
+  background: transparent;
+  padding: 0;
+  color: #1e293b;
+  font-size: 0.84rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.ca-doc-msg-body strong { color: #0f172a; font-weight: 650; }
+.ca-doc-placeholder {
+  color: #94a3b8;
+  font-style: italic;
+  margin: 0;
+}
+.ca-doc-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 2px;
+  border-radius: 1px;
+  background: #2563eb;
+  vertical-align: -0.12em;
+  animation: ca-doc-caret 1.05s ease-in-out infinite;
+}
+@keyframes ca-doc-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.18; }
+}
 </style>
 """
 
 def _ensure_report_styles() -> None:
-    """Inject chip styles for the current page render."""
+    """Inject chip / documentation message styles for the current page render."""
     st.markdown(_REPORT_CSS, unsafe_allow_html=True)
+
+
+def _render_inline_markdown(text: str) -> str:
+    """Escape text and apply a small inline markdown subset."""
+    raw = text or ""
+    if not raw:
+        return ""
+    pieces: List[str] = []
+    cursor = 0
+    pattern = re.compile(
+        r"(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*]+\*|_[^_]+_)"
+    )
+    for match in pattern.finditer(raw):
+        if match.start() > cursor:
+            pieces.append(html.escape(raw[cursor : match.start()]))
+        token = match.group(0)
+        if token.startswith("`"):
+            pieces.append(f"<code>{html.escape(token[1:-1])}</code>")
+        elif token.startswith("**") or token.startswith("__"):
+            pieces.append(f"<strong>{html.escape(token[2:-2])}</strong>")
+        else:
+            pieces.append(f"<em>{html.escape(token[1:-1])}</em>")
+        cursor = match.end()
+    if cursor < len(raw):
+        pieces.append(html.escape(raw[cursor:]))
+    return "".join(pieces)
+
+
+def documentation_body_html(text: str, *, live: bool = False) -> str:
+    """
+    Convert documentation markdown into safe HTML for the shared message UI.
+
+    Supports headings, lists, fenced code, paragraphs, and light inline marks.
+    """
+    source = text or ""
+    if not source.strip():
+        caret = (
+            '<span class="ca-doc-caret" aria-hidden="true"></span>' if live else ""
+        )
+        return (
+            f'<p class="ca-doc-placeholder">Waiting for first token…{caret}</p>'
+        )
+
+    blocks: List[str] = []
+    lines = source.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    paragraph: List[str] = []
+    list_kind = ""
+    list_items: List[str] = []
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph
+        if not paragraph:
+            return
+        body = " ".join(paragraph).strip()
+        if body:
+            blocks.append(f"<p>{_render_inline_markdown(body)}</p>")
+        paragraph = []
+
+    def flush_list() -> None:
+        nonlocal list_kind, list_items
+        if not list_items:
+            list_kind = ""
+            return
+        tag = "ol" if list_kind == "ol" else "ul"
+        items = "".join(f"<li>{item}</li>" for item in list_items)
+        blocks.append(f"<{tag}>{items}</{tag}>")
+        list_kind = ""
+        list_items = []
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            flush_paragraph()
+            flush_list()
+            lang = stripped[3:].strip()
+            index += 1
+            code_lines: List[str] = []
+            while index < len(lines) and not lines[index].strip().startswith("```"):
+                code_lines.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            code = html.escape("\n".join(code_lines))
+            lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
+            blocks.append(f"<pre><code{lang_attr}>{code}</code></pre>")
+            continue
+
+        heading = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+        if heading:
+            flush_paragraph()
+            flush_list()
+            level = len(heading.group(1))
+            blocks.append(
+                f"<h{level}>{_render_inline_markdown(heading.group(2))}</h{level}>"
+            )
+            index += 1
+            continue
+
+        bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
+        numbered = re.match(r"^\d+[.)]\s+(.+)$", stripped)
+        if bullet or numbered:
+            flush_paragraph()
+            kind = "ol" if numbered else "ul"
+            if list_kind and list_kind != kind:
+                flush_list()
+            list_kind = kind
+            item_text = (numbered or bullet).group(1)  # type: ignore[union-attr]
+            list_items.append(_render_inline_markdown(item_text))
+            index += 1
+            continue
+
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+            index += 1
+            continue
+
+        flush_list()
+        paragraph.append(stripped)
+        index += 1
+
+    flush_paragraph()
+    flush_list()
+
+    body = "".join(blocks) if blocks else f"<p>{_render_inline_markdown(source)}</p>"
+    if live:
+        # Attach caret to the last text-bearing block without nesting invalid HTML.
+        caret = '<span class="ca-doc-caret" aria-hidden="true"></span>'
+        for tag in ("</p>", "</li>", "</h4>", "</h3>", "</h2>", "</h1>", "</code></pre>"):
+            if body.endswith(tag):
+                if tag == "</code></pre>":
+                    return body[: -len(tag)] + caret + tag
+                return body[: -len(tag)] + caret + tag
+        return body + caret
+    return body
+
+
+def render_documentation_message(
+    text: str,
+    *,
+    live: bool = False,
+    title: str = "Documentation",
+) -> None:
+    """Render live or final documentation with the same chat-style chrome."""
+    _ensure_report_styles()
+    status = (
+        '<span class="ca-doc-msg-status">'
+        '<span class="ca-doc-msg-dot" aria-hidden="true"></span>'
+        "Generating"
+        "</span>"
+        if live
+        else '<span class="ca-doc-msg-status">Complete</span>'
+    )
+    body = documentation_body_html(text, live=live)
+    st.markdown(
+        f"""
+<div class="ca-doc-msg">
+  <div class="ca-doc-msg-meta">
+    <div class="ca-doc-msg-title">{html.escape(title)}</div>
+    {status}
+  </div>
+  <div class="ca-doc-msg-body">{body}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def _parse_execution_counts(summary: str) -> Dict[str, int]:
@@ -489,25 +777,13 @@ def render_documentation_result(
         body = body.replace(write_note, "").rstrip()
 
     if body:
-        st.markdown("### Documentation")
-        st.markdown(body)
-        st.caption("Use the copy icon on the block below to copy the full text.")
-        st.code(body, language="markdown")
+        render_documentation_message(
+            body,
+            live=False,
+            title="Documentation",
+        )
     else:
         st.info("Empty documentation summary.")
-
-    parameters = list(data.get("parameters") or [])
-    if parameters:
-        st.markdown("### Parameters")
-        st.dataframe(parameters, width="stretch", hide_index=True)
-
-    if data.get("returns"):
-        st.markdown("### Returns")
-        st.markdown(str(data.get("returns")))
-
-    if data.get("example_usage"):
-        st.markdown("### Example")
-        st.code(str(data.get("example_usage")), language="python")
 
 
 def render_testing_result(result: Any) -> None:
