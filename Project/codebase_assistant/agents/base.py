@@ -12,12 +12,21 @@ when the Supervisor has already registered them.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
+
+#: How long one agent's index update is trusted by another agent
+#: sharing the same `index_reuse_cache`, before a fresh
+#: `Indexer.update_index` walk-and-hash pass is required again. Sized
+#: to comfortably cover one `--agent all` pipeline run (code analysis
+#: -> documentation -> testing against the same workspace), not to
+#: mask genuine staleness across separate runs.
+_INDEX_REUSE_WINDOW_SECONDS = 30.0
 
 from ..hooks.events import HookEvent
 from ..memory.memory_store import MemoryStore
@@ -29,6 +38,7 @@ from ..tracing.events import TraceEventType
 from ..tracing.tracer import Tracer
 
 if TYPE_CHECKING:
+    from ..cache.output_cache import OutputCache
     from ..config import Config
     from ..hooks.manager import HookManager
     from ..tools.filesystem_tools import FilesystemTools
@@ -56,6 +66,8 @@ class BaseAgent(ABC):
         memory_store: Optional[MemoryStore] = None,
         tracer: Optional[Tracer] = None,
         hook_manager: Optional["HookManager"] = None,
+        index_reuse_cache: Optional[Dict[str, float]] = None,
+        ast_cache: Optional[Dict[Tuple[str, float], ast.Module]] = None,
     ) -> None:
         """
         Initialize the BaseAgent with its shared dependencies.
@@ -67,6 +79,25 @@ class BaseAgent(ABC):
             memory_store: Long-term memory store.
             tracer: Optional shared Tracer for lifecycle events.
             hook_manager: Optional HookManager for lifecycle hooks.
+            index_reuse_cache: Optional dict shared across the agents
+                built by one Supervisor, mapping an absolute workspace
+                path to the monotonic time it was last indexed. When
+                given, `_recently_indexed`/`_mark_indexed` let one
+                agent's `Indexer.update_index` call cover the others
+                for `_INDEX_REUSE_WINDOW_SECONDS`, instead of code
+                analysis, documentation, and testing each re-walking
+                and re-hashing the same repository moments apart in a
+                `--agent all` run. Omitted (None) by default, which
+                disables the skip entirely and preserves the previous
+                per-agent behavior.
+            ast_cache: Optional dict shared across the agents built by
+                one Supervisor, mapping `(absolute_file_path, mtime)` to
+                its parsed `ast.Module`. When given, `_parse_module_ast`
+                lets Documentation and Testing reuse each other's parse
+                of the same file version instead of each running
+                `ast.parse` on it independently during their AST
+                inventory scans. Omitted (None) by default, which
+                disables sharing and parses directly, as before.
         """
         self.model_client = model_client
         self.tool_registry = tool_registry
@@ -74,6 +105,130 @@ class BaseAgent(ABC):
         self.memory_store = memory_store
         self.tracer = tracer
         self.hook_manager = hook_manager
+        self.index_reuse_cache = index_reuse_cache
+        self.ast_cache = ast_cache
+
+    def _recently_indexed(self, workspace: str) -> bool:
+        """
+        True if some agent sharing `index_reuse_cache` indexed this
+        workspace within `_INDEX_REUSE_WINDOW_SECONDS`.
+
+        Args:
+            workspace: Repository root the caller is about to index.
+
+        Returns:
+            True when a fresh `Indexer.update_index` call can safely be
+            skipped because another agent already did the equivalent
+            work moments ago in this same process.
+        """
+        if self.index_reuse_cache is None:
+            return False
+        checked_at = self.index_reuse_cache.get(self._index_cache_key(workspace))
+        if checked_at is None:
+            return False
+        return (time.monotonic() - checked_at) < _INDEX_REUSE_WINDOW_SECONDS
+
+    def _mark_indexed(self, workspace: str) -> None:
+        """
+        Record that `workspace` was just indexed.
+
+        No-op when no `index_reuse_cache` was injected, so agents built
+        without one behave exactly as before.
+
+        Args:
+            workspace: Repository root that was just indexed.
+        """
+        if self.index_reuse_cache is None:
+            return
+        self.index_reuse_cache[self._index_cache_key(workspace)] = time.monotonic()
+
+    @staticmethod
+    def _index_cache_key(workspace: str) -> str:
+        """Normalize a workspace path so different callers agree on its key."""
+        return os.path.abspath(os.path.expanduser(workspace or "."))
+
+    def _parse_module_ast(
+        self,
+        filesystem: "FilesystemTools",
+        module_path: str,
+        source: str,
+    ) -> ast.Module:
+        """
+        Parse a module's source into an AST, reusing a shared parse when
+        possible.
+
+        When `ast_cache` was injected (e.g. by the Supervisor, shared
+        between DocumentationAgent and TestingAgent), the parsed tree
+        for a given `(absolute_path, mtime)` is cached so the second
+        agent to scan a file in one pipeline run reuses the first
+        agent's parse instead of running `ast.parse` on it again. Safe
+        because both agents only read from the tree during their AST
+        inventory scans (iterating `tree.body`, slicing by line
+        numbers, reading docstrings) and never mutate it.
+
+        Args:
+            filesystem: FilesystemTools used to resolve `module_path` to
+                an absolute path for the cache key.
+            module_path: Workspace-relative path; used as `ast.parse`'s
+                `filename` for readable error messages.
+            source: The file's already-read source text.
+
+        Returns:
+            The parsed module.
+
+        Raises:
+            SyntaxError: If `source` is not valid Python -- same as
+                calling `ast.parse` directly; existing callers already
+                handle this.
+        """
+        if self.ast_cache is None:
+            return ast.parse(source or "", filename=module_path)
+
+        try:
+            abs_path = str(filesystem.resolve_path(module_path))
+            mtime = os.path.getmtime(abs_path)
+        except (OSError, ValueError):
+            return ast.parse(source or "", filename=module_path)
+
+        key = (abs_path, mtime)
+        cached = self.ast_cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = ast.parse(source or "", filename=module_path)
+        self.ast_cache[key] = tree
+        return tree
+
+    def _build_output_cache(
+        self, workspace: str, namespace: str
+    ) -> Optional["OutputCache"]:
+        """
+        Build the persistent LLM-output cache for one repository, if
+        enabled.
+
+        Args:
+            workspace: Repository root the cache is scoped to.
+            namespace: Call-site name (e.g. "documentation", "testing",
+                "analysis").
+
+        Returns:
+            An OutputCache, or None when caching is disabled
+            (`Config.output_cache_enabled` is False) or no Config is
+            reachable from `self.model_client` (e.g. a mock client in
+            tests), in which case callers should behave exactly as if
+            caching did not exist.
+        """
+        from ..cache.output_cache import OutputCache
+        from ..config import Config
+
+        cfg = getattr(self.model_client, "config", None)
+        if not isinstance(cfg, Config) or not cfg.output_cache_enabled:
+            return None
+        try:
+            return OutputCache.for_repository(cfg, workspace, namespace)
+        except Exception as exc:
+            logger.warning("Could not open output cache for %s: %s", namespace, exc)
+            return None
 
     def _hook(self, event: HookEvent, **context: Any) -> None:
         """Fire a lifecycle hook; never raises into agent logic."""

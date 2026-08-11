@@ -20,7 +20,7 @@ import inspect
 import logging
 import re
 import uuid
-from typing import Callable, Dict, List, Optional, Pattern, Tuple
+from typing import Any, Callable, Dict, List, Optional, Pattern, Tuple
 
 from .agents.base import BaseAgent
 from .agents.code_analysis_agent import CodeAnalysisAgent
@@ -114,6 +114,12 @@ class Supervisor:
         # never abort startup; static-only mode still works.
         self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
         self.ollama_provider: Optional[BaseProvider] = self._init_ollama_provider()
+        # Shared across this ProviderManager and every dedicated one built
+        # in _make_agent_client, keyed by endpoint base URL. Without this,
+        # each of the 3 agents (+ this shared client) probes OpenRouter's
+        # /models endpoint independently even though they all resolve to
+        # the same base URL and answer the same question.
+        self._provider_availability_cache: Dict[str, Tuple[bool, float]] = {}
         # Transparent OpenRouter → Ollama failover behind one client.
         self.provider_manager = ProviderManager(
             preferred=self.provider,
@@ -122,6 +128,7 @@ class Supervisor:
             fallback_name=self.config.fallback_provider,
             cache_seconds=self.config.provider_cache_seconds,
             tracer=self.tracer,
+            availability_cache=self._provider_availability_cache,
         )
         self.model_client = LLMClient(
             model_name=self.config.model_name,
@@ -372,6 +379,7 @@ class Supervisor:
                 fallback_name=self.config.fallback_provider,
                 cache_seconds=self.config.provider_cache_seconds,
                 tracer=self.tracer,
+                availability_cache=self._provider_availability_cache,
             )
             return LLMClient(
                 model_name=model,
@@ -402,6 +410,16 @@ class Supervisor:
         Returns:
             A mapping from AgentType to the corresponding agent instance.
         """
+        # Shared across the 3 agents below so that whichever one indexes
+        # a workspace first in a `--agent all` run, the others reuse
+        # that result for a short window instead of each re-walking and
+        # re-hashing the same repository moments apart.
+        index_reuse_cache: Dict[str, float] = {}
+        # Shared between Documentation and Testing so the second of the
+        # two to scan a given file in one pipeline run reuses the
+        # first's parsed AST instead of re-parsing the same source.
+        ast_cache: Dict[Tuple[str, float], Any] = {}
+
         # Build one dedicated client per agent so each uses its own
         # specialist free model while sharing the Ollama failover.
         analysis_client = self._make_agent_client(self.config.analysis_model)
@@ -432,6 +450,8 @@ class Supervisor:
             memory_store=self.memory_store,
             tracer=self.tracer,
             hook_manager=self.hook_manager,
+            index_reuse_cache=index_reuse_cache,
+            ast_cache=ast_cache,
         )
         logger.info(
             "DocumentationAgent using dedicated client (model=%s).",
@@ -445,6 +465,7 @@ class Supervisor:
                 memory_store=self.memory_store,
                 tracer=self.tracer,
                 hook_manager=self.hook_manager,
+                index_reuse_cache=index_reuse_cache,
             ),
             AgentType.DOCUMENTATION: documentation_agent,
             AgentType.TESTING: TestingAgent(
@@ -454,6 +475,8 @@ class Supervisor:
                 memory_store=self.memory_store,
                 tracer=self.tracer,
                 hook_manager=self.hook_manager,
+                index_reuse_cache=index_reuse_cache,
+                ast_cache=ast_cache,
             ),
         }
 

@@ -1939,3 +1939,59 @@ def test_per_symbol_writeback_still_works(
     assert response.success is True
     assert "Return the arithmetic sum." in source
     assert "def subtract" in source
+
+
+def _mock_client_with_output_cache(tmp_path: Path, content: str) -> MagicMock:
+    """
+    Build a mock LLMClient carrying a real `Config` with the persistent
+    output cache enabled and pointed at an isolated temp directory, so
+    `BaseAgent._build_output_cache` treats it as a real, cache-eligible
+    client instead of skipping caching for a plain MagicMock.
+    """
+    client = _mock_client(content=content)
+    client.config = Config(output_cache_directory=str(tmp_path / "output_cache"))
+    client.model_name = "test-model"
+    return client
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_output_cache_skips_second_generate_call(
+    _mock_index: Any, sample_repo: Path, tmp_path: Path
+) -> None:
+    """An unchanged symbol should reuse the cached documentation output."""
+    client = _mock_client_with_output_cache(tmp_path, json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    first = agent.handle(_docstring_request(sample_repo))
+    second = agent.handle(_docstring_request(sample_repo))
+
+    assert first.success is True
+    assert second.success is True
+    assert second.output.summary == first.output.summary
+    client.generate.assert_called_once()
+
+
+@patch.object(DocumentationAgent, "_ensure_index", autospec=True)
+def test_output_cache_miss_on_changed_instruction(
+    _mock_index: Any, sample_repo: Path, tmp_path: Path
+) -> None:
+    """A different instruction should invalidate the cache key and re-call."""
+    client = _mock_client_with_output_cache(tmp_path, json.dumps(VALID_DOC_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    agent.handle(_docstring_request(sample_repo))
+
+    other_request = AgentRequest(
+        task_id="doc-cache-miss",
+        agent_type=AgentType.DOCUMENTATION,
+        instruction="Document the add function with extra rigor.",
+        context={
+            "repo_path": str(sample_repo),
+            "file_path": str(sample_repo / "math_utils.py"),
+            "function_name": "add",
+            "doc_type": "docstring",
+        },
+    )
+    agent.handle(other_request)
+
+    assert client.generate.call_count == 2

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..analysis.report_builder import ReportBuilder
+from ..cache.output_cache import OutputCache
 from ..rag.indexer import Indexer
 from ..schemas.schemas import (
     AbstentionResult,
@@ -77,8 +78,15 @@ _MAX_CONTEXT_CHUNKS = 8
 #: Cap on characters per retrieved chunk in the prompt.
 _MAX_CHUNK_CHARS = 1200
 
-#: Generation ceiling for documentation calls.
-_DOC_MAX_TOKENS = 2048
+#: Generation ceiling for documentation calls. Raised from 2048 so
+#: README-mode and multi-method class documentation is less likely to
+#: be truncated mid-JSON and trigger the JSON-repair retry path.
+_DOC_MAX_TOKENS = 3072
+
+#: Bump this whenever the documentation prompt template or the shape of
+#: `DocumentationResult` changes, so previously cached LLM outputs are
+#: invalidated instead of being replayed against a stale format.
+_PROMPT_VERSION = "doc-v1"
 
 #: Soft ceiling for text embedded in a JSON-repair retry prompt.
 _MAX_RETRY_PROMPT_CHARS = 8_000
@@ -927,6 +935,7 @@ class DocumentationAgent(BaseAgent):
                     filesystem=filesystem,
                     inventory=inventory,
                     target_path=target_path,
+                    workspace=workspace,
                 )
                 return symbol, result, grounded_ok, v_count, r_count, None, t0
             except Exception as exc:
@@ -1305,12 +1314,49 @@ class DocumentationAgent(BaseAgent):
         filesystem: FilesystemTools,
         inventory: Sequence[str],
         target_path: str,
+        workspace: str = "",
     ) -> Tuple[DocumentationResult, bool, int, int]:
         """
         Generate, repair, and ground documentation for one symbol.
 
         Returns ``(result, grounded_ok, verified_count, removed_count)``.
         """
+        cache = self._build_output_cache(workspace, "documentation") if workspace else None
+        cache_key = (
+            OutputCache.make_key(
+                symbol.source,
+                mode,
+                instruction,
+                getattr(self.model_client, "model_name", ""),
+                _PROMPT_VERSION,
+            )
+            if cache is not None
+            else ""
+        )
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                try:
+                    result = DocumentationResult.model_validate(cached)
+                    self._trace(
+                        "documentation_output_cache_hit",
+                        symbol=symbol.qualname,
+                    )
+                    return self._ground_and_finalize(
+                        result,
+                        symbol=symbol,
+                        filesystem=filesystem,
+                        inventory=inventory,
+                        mode=mode,
+                        target_path=target_path,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Discarding invalid cached documentation for %s: %s",
+                        symbol.qualname,
+                        exc,
+                    )
+
         query = " ".join(
             part
             for part in (
@@ -1352,6 +1398,39 @@ class DocumentationAgent(BaseAgent):
             default_file_path=symbol.module_path,
             default_function_name=symbol.result_name,
         )
+        if result.summary and result.summary.strip() and cache is not None:
+            try:
+                cache.set(cache_key, result.model_dump())
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist documentation output cache entry for %s: %s",
+                    symbol.qualname,
+                    exc,
+                )
+
+        return self._ground_and_finalize(
+            result,
+            symbol=symbol,
+            filesystem=filesystem,
+            inventory=inventory,
+            mode=mode,
+            target_path=target_path,
+        )
+
+    def _ground_and_finalize(
+        self,
+        result: DocumentationResult,
+        *,
+        symbol: _DocumentableSymbol,
+        filesystem: FilesystemTools,
+        inventory: Sequence[str],
+        mode: str,
+        target_path: str,
+    ) -> Tuple[DocumentationResult, bool, int, int]:
+        """
+        Ground a (fresh or cached) generation result against the repo and
+        shape it into the `_document_one_symbol` return contract.
+        """
         if not (result.summary and result.summary.strip()):
             empty = self._empty_result(
                 file_path=symbol.module_path,
@@ -1645,7 +1724,7 @@ class DocumentationAgent(BaseAgent):
             logger.warning("AST scan skipped %s: %s", module_path, exc)
             return []
         try:
-            tree = ast.parse(source or "", filename=module_path)
+            tree = self._parse_module_ast(filesystem, module_path, source)
         except SyntaxError:
             return []
 
@@ -2878,18 +2957,31 @@ class DocumentationAgent(BaseAgent):
         from ..hooks.events import HookEvent
         from ..rag.store_paths import vector_store_for_repository
 
+        config = self.retriever.config
+        store_path = vector_store_for_repository(
+            config.chroma_persist_directory, workspace
+        )
+        # Keep Retriever pointed at the same per-repo store Analysis uses.
+        if self.retriever.vector_store_path != store_path:
+            self.retriever.vector_store_path = store_path
+            self.retriever._vector_db = None
+
+        if self._recently_indexed(workspace):
+            # Another agent sharing this Supervisor's index_reuse_cache
+            # already brought this exact workspace's index up to date
+            # moments ago (e.g. code analysis just before documentation
+            # in a `--agent all` run). Skip the redundant walk-and-hash
+            # pass; the persistent store already has the latest data.
+            logger.info(
+                "Documentation index: reusing recent index for %s "
+                "(indexed moments ago by another agent in this run).",
+                workspace,
+            )
+            return
+
         self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
         started = time.perf_counter()
         try:
-            config = self.retriever.config
-            store_path = vector_store_for_repository(
-                config.chroma_persist_directory, workspace
-            )
-            # Keep Retriever pointed at the same per-repo store Analysis uses.
-            if self.retriever.vector_store_path != store_path:
-                self.retriever.vector_store_path = store_path
-                self.retriever._vector_db = None
-
             indexer = Indexer(
                 vector_store_path=store_path,
                 config=config,
@@ -2898,6 +2990,7 @@ class DocumentationAgent(BaseAgent):
             )
             update = indexer.update_index(".")
             self.retriever._vector_db = indexer.vector_db
+            self._mark_indexed(workspace)
             logger.info("Documentation index: %s", update.summary())
             self._hook(
                 HookEvent.AFTER_INGEST,

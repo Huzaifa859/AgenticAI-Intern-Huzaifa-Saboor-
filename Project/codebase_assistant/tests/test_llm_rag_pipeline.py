@@ -146,13 +146,23 @@ def chroma_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture
-def pipeline_config(chroma_root: Path) -> Config:
-    """Config isolated from local .env keys and with a temp vector store."""
+def pipeline_config(chroma_root: Path, tmp_path: Path) -> Config:
+    """
+    Config isolated from local .env keys and with a temp vector store.
+
+    `chroma_root` is module-scoped (shared across this module's tests to
+    avoid re-indexing cost), but the output cache is deliberately keyed
+    off the function-scoped `tmp_path` instead: several tests in this
+    module point at the same module-scoped `analysis_repo` while mocking
+    different LLM responses, and a cache shared across them would let
+    one test's cached output leak into another.
+    """
     return Config(
         openrouter_api_key="sk-test-integration",
         chroma_persist_directory=str(chroma_root),
         retrieval_top_k=4,
         max_tokens=512,
+        output_cache_directory=str(tmp_path / "output_cache"),
     )
 
 
@@ -386,3 +396,60 @@ def test_static_and_llm_findings_merge_without_dropping_either(
     assert "missing_validation" in llm_types
     assert len(report.findings) >= 2
     assert report.duplicates_removed == 0
+
+
+def test_analysis_output_cache_skips_second_llm_call(
+    analysis_agent: CodeAnalysisAgent,
+    analysis_repo: Path,
+) -> None:
+    """A second run with unchanged inputs should reuse the cached LLM output."""
+    evidence = _source_slice(analysis_repo, WALLET_RELATIVE, 8, 8)
+    content = _finding_payload(
+        file_path=WALLET_RELATIVE,
+        line_start=8,
+        line_end=8,
+        evidence=evidence,
+    )
+
+    first_report, first_mock_post = _run_with_llm_content(
+        analysis_agent, analysis_repo, content
+    )
+    assert first_mock_post.call_count >= 1
+    assert first_report.model_used is True
+    assert first_report.llm_findings
+
+    second_report, second_mock_post = _run_with_llm_content(
+        analysis_agent, analysis_repo, content
+    )
+    assert second_mock_post.call_count == 0
+    assert second_report.model_used is True
+    assert len(second_report.llm_findings) == len(first_report.llm_findings)
+    assert second_report.llm_findings[0].evidence == first_report.llm_findings[0].evidence
+
+
+def test_analysis_output_cache_miss_on_changed_question(
+    analysis_agent: CodeAnalysisAgent,
+    analysis_repo: Path,
+) -> None:
+    """A different question should invalidate the cache key and re-call."""
+    evidence = _source_slice(analysis_repo, WALLET_RELATIVE, 8, 8)
+    content = _finding_payload(
+        file_path=WALLET_RELATIVE,
+        line_start=8,
+        line_end=8,
+        evidence=evidence,
+    )
+
+    _, first_mock_post = _run_with_llm_content(analysis_agent, analysis_repo, content)
+    assert first_mock_post.call_count >= 1
+
+    get_patch, post_patch, sleep_patch, body = _patch_openrouter_success(content)
+    with get_patch, sleep_patch, post_patch as mock_post:
+        mock_post.return_value = _http_response(200, _chat_payload(body))
+        analysis_agent.analyze_repository(
+            repository_path=str(analysis_repo.resolve()),
+            question="A completely different question about a different bug.",
+            use_rag=True,
+        )
+
+    assert mock_post.call_count >= 1

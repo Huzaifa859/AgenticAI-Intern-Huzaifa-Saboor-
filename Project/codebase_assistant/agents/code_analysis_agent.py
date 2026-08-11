@@ -43,6 +43,7 @@ from ..analysis.grounding_checker import GroundingChecker, GroundingResult
 from ..analysis.report_builder import ReportBuilder
 from ..analysis.static_analyzer import AnalysisReport as StaticAnalysisReport
 from ..analysis.static_analyzer import StaticAnalyzer
+from ..cache.output_cache import OutputCache
 from ..config import Config
 from ..exceptions.base import CodebaseAssistantError
 from ..hooks.events import HookEvent
@@ -97,6 +98,12 @@ _GUTTER = re.compile(r"^\s*\d+\s*\|\s?")
 
 #: Cap on raw output embedded in a single JSON-repair prompt.
 _MAX_JSON_REPAIR_RAW_CHARS = 6_000
+
+#: Bump this whenever the analysis prompt template or the cached
+#: (answer, proposed findings) shape changes, so previously cached LLM
+#: outputs are invalidated instead of being replayed against a stale
+#: format.
+_PROMPT_VERSION = "analysis-v1"
 
 _JSON_REPAIR_SYSTEM_PROMPT = """\
 You are repairing malformed code-analysis JSON.
@@ -316,6 +323,7 @@ class CodeAnalysisAgent(BaseAgent):
         filesystem: Optional[FilesystemTools] = None,
         tracer: Optional[Tracer] = None,
         hook_manager: Optional[HookManager] = None,
+        index_reuse_cache: Optional[Dict[str, float]] = None,
     ) -> None:
         """
         Initialize the agent and record its collaborators.
@@ -346,6 +354,11 @@ class CodeAnalysisAgent(BaseAgent):
                 omitted.
             tracer: Optional shared Tracer for lifecycle events.
             hook_manager: Optional HookManager for lifecycle hooks.
+            index_reuse_cache: Optional dict shared with the other
+                agents built by the same Supervisor, letting a fresh
+                index built by one agent be reused by the others for a
+                short window within one `--agent all` run. See
+                `BaseAgent.__init__`.
         """
         super().__init__(
             model_client=model_client,
@@ -354,6 +367,7 @@ class CodeAnalysisAgent(BaseAgent):
             memory_store=memory_store,
             tracer=tracer,
             hook_manager=hook_manager,
+            index_reuse_cache=index_reuse_cache,
         )
         self.config = config or Config.load()
         self._indexer = indexer
@@ -877,6 +891,21 @@ class CodeAnalysisAgent(BaseAgent):
         if pipeline.indexer is None:
             return None
 
+        if self._recently_indexed(pipeline.root):
+            # Another agent sharing this Supervisor's index_reuse_cache
+            # already brought this exact workspace's index up to date
+            # moments ago (e.g. code analysis just before documentation
+            # in a `--agent all` run). The vector store is persistent and
+            # this pipeline already points at the same path, so a fresh
+            # walk-and-hash pass here would just re-confirm nothing
+            # changed -- skip it and retrieve from what is already there.
+            logger.info(
+                "Index: reusing recent index for %s (indexed moments ago "
+                "by another agent in this run).",
+                pipeline.root,
+            )
+            return None
+
         self._trace(
             "indexing_started",
             event_type=TraceEventType.INGESTION,
@@ -924,6 +953,7 @@ class CodeAnalysisAgent(BaseAgent):
             return None
 
         logger.info("Index: %s", update.summary())
+        self._mark_indexed(pipeline.root)
         duration_ms = (time.perf_counter() - index_started) * 1000.0
         self._trace(
             "indexing_finished",
@@ -1134,87 +1164,136 @@ class CodeAnalysisAgent(BaseAgent):
 
         prompt = self.build_prompt(question, context, static_findings)
 
-        self._trace(
-            "model_request",
-            event_type=TraceEventType.MODEL_CALL,
-            chunks=len(context),
-            static_findings=len(static_findings),
-        )
-        model_started = time.perf_counter()
-        try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(role="system", content=SYSTEM_PROMPT),
-                    ModelMessage(role="user", content=prompt),
-                ],
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        output_cache = self._build_output_cache(pipeline.root, "analysis")
+        cache_key = (
+            OutputCache.make_key(
+                question,
+                sorted(
+                    f"{c.source}:{c.content}" for c in context
+                ),
+                sorted(
+                    f"{f.file_path}:{f.line_start}-{f.line_end}:{f.bug_type}"
+                    for f in static_findings
+                ),
+                getattr(self.model_client, "model_name", ""),
+                _PROMPT_VERSION,
             )
-        except Exception as exc:
-            # Deliberately broad. A provider talks to the network and can
-            # raise anything its transport raises, and no failure out
-            # there is worth discarding verified static findings over.
-            note = f"Model call failed, keeping static findings only: {exc}"
-            logger.warning(note)
-            report.notes.append(note)
+            if output_cache is not None
+            else ""
+        )
+        cached = output_cache.get(cache_key) if output_cache is not None else None
+        if cached is not None:
+            try:
+                answer = str(cached.get("answer") or "")
+                proposed = [
+                    BugReport.model_validate(item)
+                    for item in cached.get("proposed") or []
+                ]
+                self._trace("analysis_output_cache_hit", proposed=len(proposed))
+                report.model_used = True
+                report.llm_parse_failed = False
+                report.answer = answer
+                report.llm_proposed_count = len(proposed)
+            except Exception as exc:
+                logger.warning("Discarding invalid cached analysis output: %s", exc)
+                cached = None
+
+        if cached is None:
+            self._trace(
+                "model_request",
+                event_type=TraceEventType.MODEL_CALL,
+                chunks=len(context),
+                static_findings=len(static_findings),
+            )
+            model_started = time.perf_counter()
+            try:
+                response = self.model_client.generate(
+                    [
+                        ModelMessage(role="system", content=SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=prompt),
+                    ],
+                    response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                )
+            except Exception as exc:
+                # Deliberately broad. A provider talks to the network and can
+                # raise anything its transport raises, and no failure out
+                # there is worth discarding verified static findings over.
+                note = f"Model call failed, keeping static findings only: {exc}"
+                logger.warning(note)
+                report.notes.append(note)
+                self._trace(
+                    "model_response",
+                    event_type=TraceEventType.MODEL_CALL,
+                    success=False,
+                    error=str(exc),
+                    duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                )
+                return []
+
             self._trace(
                 "model_response",
                 event_type=TraceEventType.MODEL_CALL,
-                success=False,
-                error=str(exc),
+                success=True,
                 duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                content_chars=len(response.content or ""),
             )
-            return []
 
-        self._trace(
-            "model_response",
-            event_type=TraceEventType.MODEL_CALL,
-            success=True,
-            duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            content_chars=len(response.content or ""),
-        )
-
-        report.model_used = True
-        raw_content = response.content or ""
-        payload, extract_error = extract_json_value(raw_content)
-        if payload is None and raw_content.strip():
-            log_json_parse_outcome(
-                agent="code_analysis",
-                stage="initial",
-                success=False,
-                error=extract_error,
-            )
-            repaired = self._retry_json_repair(
-                raw_output=raw_content,
-                parse_error=extract_error,
-            )
-            if repaired is not None:
-                raw_content = repaired
-                payload, extract_error = extract_json_value(raw_content)
+            report.model_used = True
+            raw_content = response.content or ""
+            payload, extract_error = extract_json_value(raw_content)
+            if payload is None and raw_content.strip():
                 log_json_parse_outcome(
                     agent="code_analysis",
-                    stage="repair",
-                    success=payload is not None,
+                    stage="initial",
+                    success=False,
                     error=extract_error,
                 )
+                repaired = self._retry_json_repair(
+                    raw_output=raw_content,
+                    parse_error=extract_error,
+                )
+                if repaired is not None:
+                    raw_content = repaired
+                    payload, extract_error = extract_json_value(raw_content)
+                    log_json_parse_outcome(
+                        agent="code_analysis",
+                        stage="repair",
+                        success=payload is not None,
+                        error=extract_error,
+                    )
+                else:
+                    log_json_parse_outcome(
+                        agent="code_analysis",
+                        stage="repair",
+                        success=False,
+                        error="repair call failed or returned empty",
+                    )
             else:
                 log_json_parse_outcome(
                     agent="code_analysis",
-                    stage="repair",
-                    success=False,
-                    error="repair call failed or returned empty",
+                    stage="initial",
+                    success=payload is not None,
+                    error=extract_error,
                 )
-        else:
-            log_json_parse_outcome(
-                agent="code_analysis",
-                stage="initial",
-                success=payload is not None,
-                error=extract_error,
-            )
 
-        report.llm_parse_failed = payload is None
-        answer, proposed = self.parse_response(raw_content)
-        report.answer = answer
-        report.llm_proposed_count = len(proposed)
+            report.llm_parse_failed = payload is None
+            answer, proposed = self.parse_response(raw_content)
+            report.answer = answer
+            report.llm_proposed_count = len(proposed)
+
+            if proposed and output_cache is not None:
+                try:
+                    output_cache.set(
+                        cache_key,
+                        {
+                            "answer": answer,
+                            "proposed": [p.model_dump() for p in proposed],
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist analysis output cache entry: %s", exc
+                    )
 
         if not proposed:
             report.llm_grounded_count = 0

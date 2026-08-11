@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..analysis.report_builder import ReportBuilder
+from ..cache.output_cache import OutputCache
 from ..rag.indexer import Indexer
 from ..schemas.schemas import (
     AbstentionResult,
@@ -97,8 +98,15 @@ _MAX_PYTEST_OUTPUT_CHARS = 4_000
 #: Cap on generated-test source embedded in a repair prompt.
 _MAX_REPAIR_TEST_CHARS = 6_000
 
-#: Generation ceiling for test-generation calls.
-_TEST_MAX_TOKENS = 1536
+#: Generation ceiling for test-generation calls. Raised from 1536 so
+#: JSON output for classes with several methods is less likely to be
+#: cut off mid-object and trigger the JSON-repair retry path.
+_TEST_MAX_TOKENS = 2560
+
+#: Bump this whenever the test-generation prompt template or the
+#: normalized-result shape changes, so previously cached LLM outputs
+#: are invalidated instead of being replayed against a stale format.
+_PROMPT_VERSION = "test-v1"
 
 #: Soft cap on public symbols prompted in one pipeline run.
 _MAX_SYMBOLS_TO_TEST = 20
@@ -788,6 +796,7 @@ class TestingAgent(BaseAgent):
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         _MAX_TEST_WORKERS = 20
+        output_cache = self._build_output_cache(workspace, "testing")
 
         def _run_one_symbol(symbol):  # type: ignore[no-untyped-def]
             """Generate tests for one symbol; returns all data needed by caller."""
@@ -798,6 +807,58 @@ class TestingAgent(BaseAgent):
                 module_path=symbol.module_path,
             )
             t0 = time.perf_counter()
+            cache_key = (
+                OutputCache.make_key(
+                    symbol.source,
+                    instruction,
+                    getattr(self.model_client, "model_name", ""),
+                    _PROMPT_VERSION,
+                )
+                if output_cache is not None
+                else ""
+            )
+            if output_cache is not None:
+                cached = output_cache.get(cache_key)
+                if cached is not None:
+                    try:
+                        normalized = TestingResult.model_validate(cached)
+                        self._trace(
+                            "testing_output_cache_hit",
+                            symbol=symbol.qualname,
+                        )
+                        self._trace(
+                            "testing_symbol_generation_finished",
+                            success=bool(normalized.generated_tests),
+                            symbol=symbol.qualname,
+                            files=len(normalized.generated_tests),
+                            duration_ms=(time.perf_counter() - t0) * 1000.0,
+                            cache_hit=True,
+                        )
+                        module_excerpt = None
+                        try:
+                            if filesystem.file_exists(symbol.module_path):
+                                module_text = filesystem.read_file(symbol.module_path)
+                                module_excerpt = (
+                                    symbol.module_path,
+                                    self._format_file_excerpt(
+                                        symbol.module_path,
+                                        module_text,
+                                        _MAX_FILE_CHARS_WITH_RETRIEVAL,
+                                    ),
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not read module %s for repair context: %s",
+                                symbol.module_path,
+                                exc,
+                            )
+                        return normalized, [], module_excerpt
+                    except Exception as exc:
+                        logger.warning(
+                            "Discarding invalid cached test output for %s: %s",
+                            symbol.qualname,
+                            exc,
+                        )
             query = " ".join(
                 part
                 for part in (
@@ -943,6 +1004,15 @@ class TestingAgent(BaseAgent):
                             error="repair call failed or returned empty",
                         )
             normalized = self._normalize_symbol_result(parsed, symbol)
+            if normalized.generated_tests and output_cache is not None:
+                try:
+                    output_cache.set(cache_key, normalized.model_dump())
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist testing output cache entry for %s: %s",
+                        symbol.qualname,
+                        exc,
+                    )
             self._trace(
                 "testing_symbol_generation_finished",
                 success=bool(normalized.generated_tests),
@@ -1165,7 +1235,12 @@ class TestingAgent(BaseAgent):
 
             self._trace("pytest_execution_started", files=len(written))
             pytest_started = time.perf_counter()
-            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            stats, coverage = self._run_pytest_and_measure_coverage(
+                pytest_api,
+                workspace=workspace,
+                temp_dir=temp_dir,
+                target_path=target_path,
+            )
             summary = self._format_execution_summary(stats)
             self._trace(
                 "pytest_execution_finished",
@@ -1178,9 +1253,6 @@ class TestingAgent(BaseAgent):
                 exit_code=stats.exit_code,
             )
 
-            coverage = self._measure_coverage(
-                pytest_api, workspace=workspace, temp_dir=temp_dir, target_path=target_path
-            )
             if coverage.summary:
                 summary = self._merge_summaries(summary, coverage.summary)
 
@@ -1427,6 +1499,9 @@ class TestingAgent(BaseAgent):
         pytest_api: Any,
         workspace: str,
         temp_dir: str,
+        *,
+        extra_args: Optional[List[str]] = None,
+        coverage_file: Optional[str] = None,
     ) -> "_PytestExecutionStats":
         """
         Execute pytest against ``temp_dir`` using the Python API.
@@ -1435,6 +1510,13 @@ class TestingAgent(BaseAgent):
             pytest_api: The imported ``pytest`` module.
             workspace: Repository root to put on ``sys.path``.
             temp_dir: Directory containing the written test modules.
+            extra_args: Additional CLI args appended to the pytest
+                invocation. Used to fold ``--cov``/``--cov-report`` into
+                this same run instead of paying for a second, separate
+                pytest invocation just to measure coverage.
+            coverage_file: When set, ``COVERAGE_FILE`` is pointed at this
+                path for the duration of the call and restored afterward,
+                matching what a dedicated coverage run would do.
 
         Returns:
             Collected pass/fail/skip/error counts and duration.
@@ -1443,10 +1525,15 @@ class TestingAgent(BaseAgent):
         path_inserted = False
         workspace_abs = os.path.abspath(workspace)
         previous_cwd = os.getcwd()
+        previous_cov_file = (
+            os.environ.get("COVERAGE_FILE") if coverage_file else None
+        )
         started = time.perf_counter()
         loaded_modules = self._test_module_names(temp_dir)
 
         try:
+            if coverage_file:
+                os.environ["COVERAGE_FILE"] = coverage_file
             if workspace_abs not in sys.path:
                 sys.path.insert(0, workspace_abs)
                 path_inserted = True
@@ -1472,6 +1559,8 @@ class TestingAgent(BaseAgent):
                 "-o",
                 "addopts=",
             ]
+            if extra_args:
+                args.extend(extra_args)
             sink = io.StringIO()
             try:
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
@@ -1518,6 +1607,11 @@ class TestingAgent(BaseAgent):
                     sys.path.remove(workspace_abs)
                 except ValueError:
                     pass
+            if coverage_file:
+                if previous_cov_file is None:
+                    os.environ.pop("COVERAGE_FILE", None)
+                else:
+                    os.environ["COVERAGE_FILE"] = previous_cov_file
 
     @staticmethod
     def _test_module_names(temp_dir: str) -> List[str]:
@@ -1549,6 +1643,133 @@ class TestingAgent(BaseAgent):
             return f"{line} Detail: {detail}"
         return line
 
+    def _run_pytest_and_measure_coverage(
+        self,
+        pytest_api: Any,
+        *,
+        workspace: str,
+        temp_dir: str,
+        target_path: str = "",
+    ) -> Tuple["_PytestExecutionStats", _CoverageMeasurement]:
+        """
+        Run the generated tests once, folding coverage instrumentation
+        into that same pytest invocation whenever pytest-cov is
+        available.
+
+        This used to be two full pytest invocations per generation: one
+        plain run for pass/fail stats, then a second, separate run just
+        to measure coverage via ``--cov``. The stats plugin's counts come
+        from pytest hooks (not stdout parsing), so adding ``--cov``/
+        ``--cov-report`` args to the same run does not affect them --
+        both results can come out of one invocation in the common case.
+
+        Falls back to one dedicated coverage-only run (the previous
+        behavior) only if the merged run does not yield a usable
+        coverage report, so correctness never regresses for that edge
+        case -- only the common case gets faster.
+
+        Never raises; an unavailable/failed coverage measurement is
+        returned as a structured result alongside the execution stats.
+        """
+        self._trace("testing_coverage_started", temp_dir=temp_dir)
+        cov_started = time.perf_counter()
+
+        try:
+            import pytest_cov as _pytest_cov  # noqa: F401
+        except ImportError:
+            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            coverage = _CoverageMeasurement(
+                available=False,
+                summary="Coverage: unavailable (pytest-cov not installed).",
+                error="pytest-cov not installed",
+            )
+            self._trace(
+                "testing_coverage_failed",
+                success=False,
+                error=coverage.error,
+                duration_ms=(time.perf_counter() - cov_started) * 1000.0,
+            )
+            return stats, coverage
+
+        report_path = os.path.join(temp_dir, "coverage.json")
+        cov_data_file = os.path.join(temp_dir, ".coverage")
+        targets = self._coverage_targets(workspace, target_path=target_path)
+        cov_args = [f"--cov-report=json:{report_path}", "--cov-report=term"]
+        for target in targets:
+            cov_args.extend(["--cov", target])
+
+        try:
+            stats = self._run_pytest(
+                pytest_api,
+                workspace,
+                temp_dir,
+                extra_args=cov_args,
+                coverage_file=cov_data_file,
+            )
+        except Exception as exc:
+            # The stats run itself must still be usable even if attaching
+            # --cov somehow blew up; fall back to a plain run so callers
+            # always get pass/fail results.
+            logger.warning(
+                "pytest run with --cov attached failed (%s); retrying "
+                "without coverage instrumentation.",
+                exc,
+            )
+            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            coverage = _CoverageMeasurement(
+                available=True,
+                measured=False,
+                summary="Coverage: unavailable (coverage execution failed).",
+                error=str(exc),
+            )
+            self._trace(
+                "testing_coverage_failed",
+                success=False,
+                error=coverage.error,
+                duration_ms=(time.perf_counter() - cov_started) * 1000.0,
+            )
+            return stats, coverage
+
+        coverage = self._parse_coverage_report(
+            report_path, fallback_text=stats.output or ""
+        )
+        duration_ms = (time.perf_counter() - cov_started) * 1000.0
+
+        if coverage.measured:
+            self._trace(
+                "testing_coverage_finished",
+                success=True,
+                duration_ms=duration_ms,
+                coverage_percent=coverage.percent,
+                files_measured=coverage.files_measured,
+                statements=coverage.statements,
+                missing=coverage.missing,
+            )
+            return stats, coverage
+
+        # Merged run did not produce a usable report (e.g. the cov plugin
+        # failed to write JSON without affecting test collection itself).
+        # Retry coverage measurement alone rather than silently reporting
+        # no coverage -- this is the only case that still pays for a
+        # second pytest invocation.
+        logger.info(
+            "Merged pytest+coverage run produced no usable report; "
+            "retrying coverage measurement separately."
+        )
+        self._trace(
+            "testing_coverage_failed",
+            success=False,
+            error=coverage.error or "coverage report missing",
+            duration_ms=duration_ms,
+        )
+        fallback_coverage = self._measure_coverage(
+            pytest_api,
+            workspace=workspace,
+            temp_dir=temp_dir,
+            target_path=target_path,
+        )
+        return stats, fallback_coverage
+
     def _measure_coverage(
         self,
         pytest_api: Any,
@@ -1562,6 +1783,11 @@ class TestingAgent(BaseAgent):
 
         Prefers the JSON coverage report. Never raises; unavailable tooling
         or parse failures return a structured unavailable measurement.
+
+        Kept as the fallback path for `_run_pytest_and_measure_coverage`
+        when the merged single-run attempt does not produce a usable
+        report -- most callers now go through the merged method instead
+        of calling this directly.
         """
         self._trace("testing_coverage_started", temp_dir=temp_dir)
         started = time.perf_counter()
@@ -2530,7 +2756,7 @@ class TestingAgent(BaseAgent):
                 logger.warning("AST scan skipped %s: %s", module_path, exc)
                 continue
             try:
-                tree = ast.parse(source or "", filename=module_path)
+                tree = self._parse_module_ast(filesystem, module_path, source)
             except SyntaxError:
                 skipped.append(f"{module_path}:syntax_error")
                 continue
@@ -2935,17 +3161,31 @@ class TestingAgent(BaseAgent):
         from ..hooks.events import HookEvent
         from ..rag.store_paths import vector_store_for_repository
 
+        config = self.retriever.config
+        store_path = vector_store_for_repository(
+            config.chroma_persist_directory, workspace
+        )
+        if self.retriever.vector_store_path != store_path:
+            self.retriever.vector_store_path = store_path
+            self.retriever._vector_db = None
+
+        if self._recently_indexed(workspace):
+            # Another agent sharing this Supervisor's index_reuse_cache
+            # already brought this exact workspace's index up to date
+            # moments ago (e.g. code analysis or documentation just
+            # before testing in a `--agent all` run). Skip the redundant
+            # walk-and-hash pass; the persistent store already has the
+            # latest data.
+            logger.info(
+                "Testing index: reusing recent index for %s (indexed "
+                "moments ago by another agent in this run).",
+                workspace,
+            )
+            return
+
         self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
         started = time.perf_counter()
         try:
-            config = self.retriever.config
-            store_path = vector_store_for_repository(
-                config.chroma_persist_directory, workspace
-            )
-            if self.retriever.vector_store_path != store_path:
-                self.retriever.vector_store_path = store_path
-                self.retriever._vector_db = None
-
             indexer = Indexer(
                 vector_store_path=store_path,
                 config=config,
@@ -2954,6 +3194,7 @@ class TestingAgent(BaseAgent):
             )
             update = indexer.update_index(".")
             self.retriever._vector_db = indexer.vector_db
+            self._mark_indexed(workspace)
             logger.info("Testing index: %s", update.summary())
             self._hook(
                 HookEvent.AFTER_INGEST,

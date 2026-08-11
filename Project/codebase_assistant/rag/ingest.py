@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..config import Config
 from ..exceptions.base import CodebaseAssistantError
@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 
 #: Signature of a progress callback.
 ProgressCallback = Callable[[str], None]
+
+#: Ceiling on how many files' chunks accumulate in one embedding batch
+#: during a full repository ingest, regardless of how many chunks that
+#: is. Bounds how stale the Scope & Limits ceiling check in
+#: `ingest_repository` can get between flushes (counts only update once
+#: a batch is embedded and stored), and keeps one flush from holding an
+#: unbounded number of files in memory on a very large repository.
+_MAX_FILES_PER_EMBEDDING_BATCH = 20
 
 
 @dataclass
@@ -253,18 +261,49 @@ class Ingestor:
 
         supported = self._partition_supported(candidates, result)
 
+        # Chunks from several files are embedded together in one batch
+        # instead of one file at a time. EmbeddingGenerator already
+        # batches internally via model.encode(), but a repository with
+        # many small files previously paid for one model.encode() call
+        # per file; accumulating several files' chunks first cuts that
+        # down to roughly one call per _MAX_FILES_PER_EMBEDDING_BATCH
+        # files (or per embed_batch_size chunks, whichever comes first).
+        embed_batch_size = max(1, self.embedder.batch_size)
+        pending: List[Tuple[str, List[CodeChunk], str]] = []
+        pending_chunk_count = 0
+
+        def flush_pending() -> None:
+            nonlocal pending, pending_chunk_count
+            if pending:
+                self._flush_batch(pending, result, replace=not clear)
+                pending = []
+                pending_chunk_count = 0
+
         for position, file_path in enumerate(supported, start=1):
-            limit = self._limit_reached(result)
+            limit = self._limit_reached(result, extra_pending_files=len(pending))
+            if limit is not None:
+                flush_pending()
+                limit = self._limit_reached(result)
             if limit is not None:
                 result.limit_reached = limit
                 remaining = supported[position - 1 :]
-                for pending in remaining:
-                    result.skipped.append(FileOutcome(pending, f"limit: {limit}"))
+                for pending_path in remaining:
+                    result.skipped.append(FileOutcome(pending_path, f"limit: {limit}"))
                 self._report(f"Stopping early -- {limit}.")
                 break
 
             self._report(f"[{position}/{len(supported)}] {file_path}")
-            self._ingest_one(file_path, result, replace=not clear)
+            prepared = self._read_and_chunk(file_path, result)
+            if prepared is not None:
+                pending.append(prepared)
+                pending_chunk_count += len(prepared[1])
+                if (
+                    pending_chunk_count >= embed_batch_size
+                    or len(pending) >= _MAX_FILES_PER_EMBEDDING_BATCH
+                ):
+                    flush_pending()
+
+        flush_pending()
 
         if prune and not clear:
             self._prune_missing(result)
@@ -427,6 +466,12 @@ class Ingestor:
         ProviderUnavailableError, which is re-raised: it means the model
         or the store is down, not that this file is bad.
 
+        A thin wrapper around `_read_and_chunk` + `_flush_batch` (a
+        batch of one) so single-file callers (`ingest_file`,
+        `reindex_file`, and the incremental per-file update loop in
+        `Indexer.update_index`) keep the exact same behavior while
+        `ingest_repository` batches several files together instead.
+
         Args:
             file_path: File to ingest, relative to the workspace root.
             result: Run summary to update in place.
@@ -436,47 +481,143 @@ class Ingestor:
             ProviderUnavailableError: If the pipeline itself is
                 unusable.
         """
+        prepared = self._read_and_chunk(file_path, result)
+        if prepared is None:
+            return
+        self._flush_batch([prepared], result, replace)
+
+    def _read_and_chunk(
+        self, file_path: str, result: IngestionResult
+    ) -> Optional[Tuple[str, List[CodeChunk], str]]:
+        """
+        Read and chunk one file, recording skips/failures on `result`.
+
+        Split out of `_ingest_one` so `ingest_repository` can accumulate
+        several files' chunks before embedding any of them, instead of
+        embedding one small batch per file.
+
+        Args:
+            file_path: File to read and chunk, relative to the
+                workspace root.
+            result: Run summary to update in place with any skip or
+                failure.
+
+        Returns:
+            `(file_path, chunks, content)` when the file produced
+            chunks to embed, or None when it was skipped or failed
+            (already recorded on `result`).
+        """
         try:
             content = self.filesystem.read_file(file_path)
 
             if not content.strip():
                 result.skipped.append(FileOutcome(file_path, "file is empty"))
-                return
+                return None
 
             chunks = self.chunker.chunk(content, file_path)
             if not chunks:
                 result.skipped.append(
                     FileOutcome(file_path, "produced no chunks")
                 )
-                return
-
-            if replace:
-                result.chunks_removed += self.vector_db.delete_by_metadata(
-                    {"file_path": file_path}
-                )
-
-            self._store(chunks)
-
-        except ProviderUnavailableError:
-            # Not this file's fault, and every remaining file would hit
-            # the same wall.
-            raise
+                return None
         except CodebaseAssistantError as exc:
             # Oversized files, binaries, and unreadable paths land here;
             # FilesystemTools has already classified them.
             result.skipped.append(FileOutcome(file_path, str(exc)))
             logger.info("Skipped %s: %s", file_path, exc)
-            return
+            return None
         except Exception as exc:
             result.failed.append(
                 FileOutcome(file_path, f"{type(exc).__name__}: {exc}")
             )
             logger.warning("Failed to index %s: %s", file_path, exc)
+            return None
+
+        return file_path, chunks, content
+
+    def _flush_batch(
+        self,
+        prepared: Sequence[Tuple[str, List[CodeChunk], str]],
+        result: IngestionResult,
+        replace: bool,
+    ) -> None:
+        """
+        Embed and store the chunks for one or more already-chunked files.
+
+        Embedding several files' chunks together in one `model.encode()`
+        call is where the batching win comes from -- `EmbeddingGenerator`
+        already splits large inputs into sub-batches internally, but
+        each call still pays fixed per-call overhead, so fewer, larger
+        calls beat many small ones on a repository with lots of files.
+
+        On success, updates `result` for every file in `prepared`. On a
+        non-fatal embedding failure, falls back to embedding each file
+        individually so one bad file cannot take the rest of the batch
+        down with it -- matching the previous per-file behavior for
+        that (rare) case.
+
+        Args:
+            prepared: `(file_path, chunks, content)` tuples already
+                produced by `_read_and_chunk`.
+            result: Run summary to update in place.
+            replace: When True, delete each file's existing chunks
+                before storing the new ones.
+
+        Raises:
+            ProviderUnavailableError: If the model or store is
+                unusable -- the whole run is unusable, not just this
+                batch.
+        """
+        if not prepared:
             return
 
-        result.files_indexed += 1
-        result.chunks_indexed += len(chunks)
-        result.lines_indexed += content.count("\n") + 1
+        if replace:
+            for file_path, _chunks, _content in prepared:
+                result.chunks_removed += self.vector_db.delete_by_metadata(
+                    {"file_path": file_path}
+                )
+
+        all_chunks: List[CodeChunk] = []
+        for _file_path, chunks, _content in prepared:
+            all_chunks.extend(chunks)
+
+        try:
+            self._store(all_chunks)
+        except ProviderUnavailableError:
+            # Not any one file's fault, and every remaining file would
+            # hit the same wall.
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Batched embedding failed for %d file(s) (%s); retrying "
+                "one file at a time so unaffected files still index.",
+                len(prepared),
+                exc,
+            )
+            for file_path, chunks, content in prepared:
+                try:
+                    self._store(chunks)
+                except ProviderUnavailableError:
+                    raise
+                except Exception as file_exc:
+                    result.failed.append(
+                        FileOutcome(
+                            file_path, f"{type(file_exc).__name__}: {file_exc}"
+                        )
+                    )
+                    logger.warning(
+                        "Failed to index %s: %s", file_path, file_exc
+                    )
+                    continue
+                result.files_indexed += 1
+                result.chunks_indexed += len(chunks)
+                result.lines_indexed += content.count("\n") + 1
+            return
+
+        for file_path, chunks, content in prepared:
+            result.files_indexed += 1
+            result.chunks_indexed += len(chunks)
+            result.lines_indexed += content.count("\n") + 1
 
     def _store(self, chunks: Sequence[CodeChunk]) -> None:
         """
@@ -524,18 +665,27 @@ class Ingestor:
                 )
         return supported
 
-    def _limit_reached(self, result: IngestionResult) -> Optional[str]:
+    def _limit_reached(
+        self, result: IngestionResult, extra_pending_files: int = 0
+    ) -> Optional[str]:
         """
         Check the run against the proposal's Scope & Limits ceilings.
 
         Args:
-            result: The run so far.
+            result: The run so far. `files_indexed`/`lines_indexed`
+                only update when a batch is flushed, so this can lag
+                behind files that have been read and chunked but not
+                yet embedded.
+            extra_pending_files: Files already accumulated in an
+                unflushed batch, counted toward the file ceiling so a
+                large pending batch cannot let the run overshoot it by
+                much before the next flush updates the real count.
 
         Returns:
             A description of the ceiling that has been hit, or None if
             there is room to continue.
         """
-        if result.files_indexed >= self.config.max_repository_files:
+        if result.files_indexed + extra_pending_files >= self.config.max_repository_files:
             return (
                 f"reached max_repository_files "
                 f"({self.config.max_repository_files})"

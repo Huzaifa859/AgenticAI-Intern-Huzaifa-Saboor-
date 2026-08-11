@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ...exceptions.model_exceptions import (
     ModelResponseError,
@@ -69,6 +69,7 @@ class ProviderManager(BaseProvider):
         fallback_name: str = "ollama",
         cache_seconds: int = 60,
         tracer: Optional[Tracer] = None,
+        availability_cache: Optional[Dict[str, Tuple[bool, float]]] = None,
     ) -> None:
         """
         Initialize the manager.
@@ -81,6 +82,16 @@ class ProviderManager(BaseProvider):
             cache_seconds: How long a preferred availability result is
                 reused before re-probing.
             tracer: Optional shared Tracer for provider events.
+            availability_cache: Optional dict shared across multiple
+                ProviderManager instances that point at the same
+                underlying endpoint (e.g. one dedicated manager per
+                agent, all hitting the same OpenRouter base URL). When
+                provided, the preferred-availability probe result is
+                cached under a key derived from the preferred
+                provider's base URL, so only the first manager to check
+                pays the network round trip within `cache_seconds`; the
+                others reuse that result. When omitted, each instance
+                caches privately, preserving the previous behavior.
         """
         model = ""
         max_tokens = 0
@@ -99,9 +110,16 @@ class ProviderManager(BaseProvider):
         self.cache_seconds = max(0, int(cache_seconds))
         self.tracer = tracer
 
+        self._shared_availability_cache = availability_cache
+        # Used only when no shared cache is supplied.
         self._preferred_available: Optional[bool] = None
         self._preferred_checked_at: float = 0.0
         self._status_message: Optional[str] = None
+
+    def _availability_cache_key(self) -> str:
+        """Identify the network endpoint the preferred provider probes."""
+        base_url = getattr(self.preferred, "base_url", "") or ""
+        return f"{self.preferred_name}:{base_url}"
 
     # ------------------------------------------------------------------
     # Public status helpers
@@ -129,14 +147,17 @@ class ProviderManager(BaseProvider):
         Return whether the preferred provider is considered healthy.
 
         Uses a short TTL cache so startup and repeated generate() calls
-        do not probe the network every time.
+        do not probe the network every time. When a shared
+        `availability_cache` was supplied, other ProviderManager
+        instances pointed at the same endpoint (e.g. one per agent)
+        reuse this result too, instead of each probing independently.
         """
-        if self._cache_valid() and self._preferred_available is not None:
-            return self._preferred_available
+        cached_available, is_valid = self._read_cached_availability()
+        if is_valid and cached_available is not None:
+            return cached_available
 
         available = self._probe_preferred()
-        self._preferred_available = available
-        self._preferred_checked_at = time.monotonic()
+        self._write_cached_availability(available)
         return available
 
     def mark_preferred_unavailable(self, reason: str = "") -> None:
@@ -146,8 +167,7 @@ class ProviderManager(BaseProvider):
         Args:
             reason: Optional failure reason for logging/tracing.
         """
-        self._preferred_available = False
-        self._preferred_checked_at = time.monotonic()
+        self._write_cached_availability(False)
         if reason:
             logger.warning(
                 "Preferred provider %s marked unavailable for %ss: %s",
@@ -155,6 +175,35 @@ class ProviderManager(BaseProvider):
                 self.cache_seconds,
                 reason,
             )
+
+    def _read_cached_availability(self) -> Tuple[Optional[bool], bool]:
+        """Return (cached_value, is_still_valid) from whichever cache is active."""
+        if self._shared_availability_cache is not None:
+            entry = self._shared_availability_cache.get(self._availability_cache_key())
+            if entry is None:
+                return None, False
+            value, checked_at = entry
+            return value, self._within_ttl(checked_at)
+
+        if self._preferred_available is None:
+            return None, False
+        return self._preferred_available, self._within_ttl(self._preferred_checked_at)
+
+    def _write_cached_availability(self, available: bool) -> None:
+        """Write a fresh probe result into whichever cache is active."""
+        now = time.monotonic()
+        if self._shared_availability_cache is not None:
+            self._shared_availability_cache[self._availability_cache_key()] = (
+                available,
+                now,
+            )
+        self._preferred_available = available
+        self._preferred_checked_at = now
+
+    def _within_ttl(self, checked_at: float) -> bool:
+        if self.cache_seconds <= 0:
+            return False
+        return (time.monotonic() - checked_at) < self.cache_seconds
 
     def is_available(self) -> bool:
         """True if preferred or fallback can serve requests."""
@@ -311,13 +360,6 @@ class ProviderManager(BaseProvider):
                 type(exc).__name__,
             )
             return False
-
-    def _cache_valid(self) -> bool:
-        if self.cache_seconds <= 0:
-            return False
-        if self._preferred_available is None:
-            return False
-        return (time.monotonic() - self._preferred_checked_at) < self.cache_seconds
 
     def _trace(self, name: str, **metadata: Any) -> None:
         if self.tracer is None:

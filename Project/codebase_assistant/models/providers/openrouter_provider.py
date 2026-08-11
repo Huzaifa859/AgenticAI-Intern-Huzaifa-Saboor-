@@ -41,21 +41,27 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 #: Default request timeout in seconds when Config/env do not specify one.
-_DEFAULT_TIMEOUT_SECONDS = 60.0
+#: Trimmed from 60s so a stalled model fails fast enough that the
+#: fallback chain below has a bounded worst case.
+_DEFAULT_TIMEOUT_SECONDS = 30.0
 
 #: Maximum attempts for a single generate() call (1 initial + retries).
-_MAX_ATTEMPTS = 4
+#: Trimmed from 4 to 2: with a 5-model chain, 4 attempts per model made
+#: the worst case (all models failing) take ~20 minutes of pure waiting;
+#: 2 attempts still absorbs one transient blip per model without that
+#: multiplying out so badly.
+_MAX_ATTEMPTS = 2
 
 #: Initial backoff delay in seconds; doubles after each retryable failure.
 _INITIAL_BACKOFF_SECONDS = 1.0
 
 #: Models tried in order when the configured model is not usable.
+#: Trimmed from 4 fallbacks to 2: each additional fallback multiplies
+#: the worst-case latency by another `_MAX_ATTEMPTS * timeout`, and the
+#: two kept here are the most reliable free-tier options observed.
 _FALLBACK_MODELS = (
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "google/gemma-3-27b-it",
-    "meta-llama/llama-3.1-8b-instruct",
-    # OpenRouter currently publishes only the :free slug for this model.
-    "nvidia/nemotron-nano-9b-v2:free",
 )
 
 #: Status codes that permanently rule this model out for the request, so

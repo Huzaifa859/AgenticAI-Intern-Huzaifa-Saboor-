@@ -34,10 +34,12 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = frozenset({500, 502, 503})
 
 #: Default request timeout in seconds when unset.
-_DEFAULT_TIMEOUT_SECONDS = 60.0
+_DEFAULT_TIMEOUT_SECONDS = 30.0
 
 #: Maximum attempts for a single generate() call (1 initial + retries).
-_MAX_ATTEMPTS = 4
+#: Trimmed from 4 to 2 so a stalled local model fails fast instead of
+#: compounding with the OpenRouter fallback chain above it.
+_MAX_ATTEMPTS = 2
 
 #: Initial backoff delay in seconds; doubles after each retryable failure.
 _INITIAL_BACKOFF_SECONDS = 1.0

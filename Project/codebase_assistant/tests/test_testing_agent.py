@@ -1704,3 +1704,60 @@ def test_import_validation_does_not_break_existing_success_path(
     assert "from math_utils import add" in response.output.generated_tests[
         "test_math_utils.py"
     ]
+
+
+def _mock_client_with_output_cache(tmp_path: Path, content: str) -> MagicMock:
+    """
+    Build a mock LLMClient carrying a real `Config` with the persistent
+    output cache enabled and pointed at an isolated temp directory, so
+    `BaseAgent._build_output_cache` treats it as a real, cache-eligible
+    client instead of skipping caching for a plain MagicMock.
+    """
+    client = _mock_client(content=content)
+    client.config = Config(output_cache_directory=str(tmp_path / "output_cache"))
+    client.model_name = "test-model"
+    return client
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_output_cache_skips_second_generate_call(
+    _mock_index: Any, sample_repo: Path, tmp_path: Path
+) -> None:
+    """An unchanged symbol should reuse the cached test-generation output."""
+    client = _mock_client_with_output_cache(tmp_path, json.dumps(VALID_TEST_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    first = agent.handle(_request(sample_repo))
+    second = agent.handle(_request(sample_repo))
+
+    assert first.success is True
+    assert second.success is True
+    assert (
+        second.output.generated_tests["test_math_utils.py"]
+        == first.output.generated_tests["test_math_utils.py"]
+    )
+    client.generate.assert_called_once()
+
+
+@patch.object(TestingAgent, "_ensure_index", autospec=True)
+def test_output_cache_miss_on_changed_instruction(
+    _mock_index: Any, sample_repo: Path, tmp_path: Path
+) -> None:
+    """A different instruction should invalidate the cache key and re-call."""
+    client = _mock_client_with_output_cache(tmp_path, json.dumps(VALID_TEST_PAYLOAD))
+    agent = _agent(client, _mock_retriever())
+
+    agent.handle(_request(sample_repo))
+
+    other_request = AgentRequest(
+        task_id="test-cache-miss",
+        agent_type=AgentType.TESTING,
+        instruction="Generate pytest unit tests covering edge cases thoroughly.",
+        context={
+            "repo_path": str(sample_repo),
+            "file_path": str(sample_repo / "math_utils.py"),
+        },
+    )
+    agent.handle(other_request)
+
+    assert client.generate.call_count == 2

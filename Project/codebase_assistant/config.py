@@ -152,6 +152,11 @@ class Config:
         fallback_provider: Secondary LLM backend name (default ollama).
         provider_cache_seconds: TTL for preferred-provider availability
             caching before re-probing.
+        output_cache_enabled: When True, Documentation/Testing/Analysis
+            reuse a persistent cross-run cache of LLM output instead of
+            recalling the model for inputs already seen.
+        output_cache_directory: Directory the output cache is persisted
+            under, one JSON file per repository.
 
         github_token: Optional GitHub token. Not required for the MVP,
             which clones public repositories only.
@@ -218,6 +223,13 @@ class Config:
     # analysis findings and documentation claims are not scrubbed against
     # source/inventory. Set GROUNDING_ENABLED=true to restore verification.
     grounding_enabled: bool = False
+    # When True (default), Documentation/Testing/Analysis reuse a
+    # persistent cross-run cache of LLM output keyed by a hash of the
+    # inputs, skipping the model call entirely on a hit. Set
+    # OUTPUT_CACHE_ENABLED=false (or pass --no-cache on the CLI) to force
+    # regeneration.
+    output_cache_enabled: bool = True
+    output_cache_directory: str = "./.codebase_assistant/output_cache"
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -328,6 +340,13 @@ class Config:
             grounding_enabled=_env_bool(
                 "GROUNDING_ENABLED",
                 defaults.grounding_enabled,
+            ),
+            output_cache_enabled=_env_bool(
+                "OUTPUT_CACHE_ENABLED",
+                defaults.output_cache_enabled,
+            ),
+            output_cache_directory=_env_str(
+                "OUTPUT_CACHE_DIR", defaults.output_cache_directory
             ),
             analysis_model=_env_str(
                 "ANALYSIS_MODEL", defaults.analysis_model
