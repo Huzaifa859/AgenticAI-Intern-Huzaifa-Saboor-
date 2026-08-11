@@ -579,35 +579,45 @@ class DocumentationAgent(BaseAgent):
             else:
                 target = file_path or repo_path
                 workspace = self._workspace_for(repo_path or target)
+                # Only the class branch may forward a non-empty class_name to
+                # _run_pipeline. A stray class_name received alongside an
+                # explicit function_name/file_path (e.g. a leftover value
+                # from a previous request) must never be forwarded here, or
+                # _resolve_documentation_target lets it silently override the
+                # actually-requested scope.
                 if class_name and not function_name:
                     doc_instruction = instruction or (
                         f"Generate documentation only for class {class_name} "
                         f"inside {target}."
                     )
                     result_name = class_name
+                    result_class_name = class_name
                 elif function_name:
                     doc_instruction = instruction or (
                         f"Generate documentation only for function "
                         f"{function_name} inside {target}."
                     )
                     result_name = function_name
+                    result_class_name = ""
                 elif file_path:
                     doc_instruction = instruction or (
                         f"Generate documentation only for {target}."
                     )
                     result_name = os.path.basename(target) or "module"
+                    result_class_name = ""
                 else:
                     doc_instruction = instruction or (
                         f"Document the primary public function in {target}."
                     )
                     result_name = function_name
+                    result_class_name = ""
                 result = self._run_pipeline(
                     mode="docstring",
                     workspace=workspace,
                     target_path=target,
                     instruction=doc_instruction,
                     function_name=result_name,
-                    class_name=class_name,
+                    class_name=result_class_name,
                     write_to_disk=write_to_disk,
                     replace_existing=replace_existing,
                 )
@@ -3712,13 +3722,7 @@ class DocumentationAgent(BaseAgent):
             flags=re.DOTALL,
         )
         if summary_match:
-            candidate = summary_match.group(1)
-            candidate = (
-                candidate.replace("\\n", "\n")
-                .replace('\\"', '"')
-                .replace("\\\\", "\\")
-                .strip()
-            )
+            candidate = summary_match.group(1).strip()
             if len(candidate) >= 40:
                 text = candidate
         lowered = text.lower()
@@ -3730,6 +3734,16 @@ class DocumentationAgent(BaseAgent):
             return DocumentationAgent._empty_result(
                 default_file_path, default_function_name
             )
+        # Unescape literal \n/\"/\\ unconditionally, regardless of whether
+        # `text` came from the regex-extracted summary or the plain
+        # fence-stripped fallback — both can contain JSON-style escape
+        # sequences that must not reach markdown/code-block rendering as-is.
+        text = (
+            text.replace("\\n", "\n")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+            .strip()
+        )
         return DocumentationResult(
             file_path=default_file_path or "",
             function_name=default_function_name or "",

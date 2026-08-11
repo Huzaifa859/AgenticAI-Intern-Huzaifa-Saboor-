@@ -1287,6 +1287,24 @@ def _run_selected_agent(
         st.session_state.last_error = "Load a repository first."
         return
 
+    if agent == "Documentation":
+        if doc_mode == "function" and not function_name.strip():
+            st.session_state.last_error = "Enter a function name for function mode."
+            return
+        if doc_mode == "class" and not class_name.strip():
+            st.session_state.last_error = "Enter a class name for class mode."
+            return
+        if doc_mode == "file" and not file_path.strip():
+            st.session_state.last_error = "Enter a file path for file mode."
+            return
+    elif agent == "Testing":
+        if test_mode == "function" and not function_name.strip():
+            st.session_state.last_error = "Enter a function name for function mode."
+            return
+        if test_mode == "file" and not file_path.strip():
+            st.session_state.last_error = "Enter a file path for file mode."
+            return
+
     try:
         if agent == "Analysis":
             target = question[:80] or "analysis"
@@ -1486,14 +1504,22 @@ def _render_sidebar() -> None:
             or "examples/demo_repo"
         )
 
-    reference = st.sidebar.text_input(
-        "Repository path or GitHub URL",
-        key="repo_input",
-        help="Local path relative to Project/, absolute path, or HTTPS GitHub URL.",
-    )
-
     busy = bool(st.session_state.get("active_job"))
-    if st.sidebar.button("Load repository", width="stretch", disabled=busy):
+
+    # A form batches the text input and the submit click into one atomic
+    # rerun, so a value typed just before clicking can never be dropped
+    # (Streamlit otherwise only commits a bare text_input on blur/Enter,
+    # which races with a fast click on the button next to it).
+    with st.sidebar.form("repo_load_form", clear_on_submit=False):
+        reference = st.text_input(
+            "Repository path or GitHub URL",
+            key="repo_input",
+            help="Local path relative to Project/, absolute path, or HTTPS GitHub URL.",
+        )
+        load_clicked = st.form_submit_button(
+            "Load repository", width="stretch", disabled=busy
+        )
+    if load_clicked:
         with st.spinner("Preparing repository..."):
             _load_repository(reference)
 
@@ -1508,38 +1534,20 @@ def _render_sidebar() -> None:
     st.sidebar.divider()
     agent = st.sidebar.radio("Agent", AGENTS, index=0, disabled=busy)
 
-    question = "Find bugs and potential issues"
     doc_mode = "readme"
     test_mode = "function"
-    file_path = ""
-    function_name = ""
-    class_name = ""
     write_to_disk = False
     replace_existing = False
 
-    if agent == "Analysis":
-        question = st.sidebar.text_area(
-            "Question",
-            value="Find bugs and potential issues",
-            height=80,
-            disabled=busy,
-        )
-    elif agent == "Documentation":
+    # Mode selectors and the write-to-disk toggle must live outside the
+    # form below: they conditionally reveal other widgets (e.g. picking
+    # "class" mode reveals the Class name box), and forms only apply
+    # widget changes on submit, which would make that reveal lag a
+    # submission behind.
+    if agent == "Documentation":
         doc_mode = st.sidebar.selectbox(
             "Documentation mode", DOC_MODES, index=2, disabled=busy
         )
-        if doc_mode in {"file", "function", "class"}:
-            file_path = st.sidebar.text_input(
-                "File path", key="sidebar_file_path", disabled=busy
-            )
-        if doc_mode == "function":
-            function_name = st.sidebar.text_input(
-                "Function name", key="sidebar_function_name", disabled=busy
-            )
-        if doc_mode == "class":
-            class_name = st.sidebar.text_input(
-                "Class name", key="sidebar_class_name", disabled=busy
-            )
         write_to_disk = st.sidebar.checkbox(
             "Write documentation to disk", value=False, disabled=busy
         )
@@ -1548,33 +1556,83 @@ def _render_sidebar() -> None:
             replace_existing = st.sidebar.checkbox(
                 "Replace existing documentation", value=False, disabled=busy
             )
-    else:
+    elif agent == "Testing":
         test_mode = st.sidebar.selectbox(
             "Testing mode", TEST_MODES, index=2, disabled=busy
         )
-        if test_mode in {"file", "function"}:
-            file_path = st.sidebar.text_input(
-                "File path", key="sidebar_file_path", disabled=busy
-            )
-        if test_mode == "function":
-            function_name = st.sidebar.text_input(
-                "Function name", key="sidebar_function_name", disabled=busy
-            )
 
-    # Keys may be unbound when the active mode hides those widgets.
-    file_path = str(st.session_state.get("sidebar_file_path") or file_path or "")
-    function_name = str(
-        st.session_state.get("sidebar_function_name") or function_name or ""
-    )
-    class_name = str(st.session_state.get("sidebar_class_name") or class_name or "")
+    # Widgets for a target field that isn't shown in the current agent/mode
+    # must not leak a stale value from a previous agent/mode into this
+    # request: Streamlit keeps a widget's session_state entry forever once
+    # set, even after the widget stops being rendered. Drop any key whose
+    # widget is not part of the current agent/mode before it can be read.
+    active_target_keys: set[str] = set()
+    if agent == "Documentation":
+        if doc_mode in {"file", "function", "class"}:
+            active_target_keys.add("sidebar_file_path")
+        if doc_mode == "function":
+            active_target_keys.add("sidebar_function_name")
+        if doc_mode == "class":
+            active_target_keys.add("sidebar_class_name")
+    elif agent == "Testing":
+        if test_mode in {"file", "function"}:
+            active_target_keys.add("sidebar_file_path")
+        if test_mode == "function":
+            active_target_keys.add("sidebar_function_name")
+    for key in _SIDEBAR_TARGET_KEYS:
+        if key not in active_target_keys:
+            st.session_state.pop(key, None)
 
     run_disabled = (not bool(st.session_state.repo_path)) or busy
-    if st.sidebar.button(
-        "Run",
-        type="primary",
-        width="stretch",
-        disabled=run_disabled,
-    ):
+
+    # A form batches every free-text field with the Run click into one
+    # atomic rerun, removing the widget-value race where a fast click could
+    # otherwise submit a stale/blank value typed just before it.
+    with st.sidebar.form("run_request_form", clear_on_submit=False):
+        question = "Find bugs and potential issues"
+        if agent == "Analysis":
+            question = st.text_area(
+                "Question",
+                value="Find bugs and potential issues",
+                height=80,
+                disabled=busy,
+            )
+        elif agent == "Documentation":
+            if doc_mode in {"file", "function", "class"}:
+                st.text_input(
+                    "File path", key="sidebar_file_path", disabled=busy
+                )
+            if doc_mode == "function":
+                st.text_input(
+                    "Function name", key="sidebar_function_name", disabled=busy
+                )
+            if doc_mode == "class":
+                st.text_input(
+                    "Class name", key="sidebar_class_name", disabled=busy
+                )
+        else:
+            if test_mode in {"file", "function"}:
+                st.text_input(
+                    "File path", key="sidebar_file_path", disabled=busy
+                )
+            if test_mode == "function":
+                st.text_input(
+                    "Function name", key="sidebar_function_name", disabled=busy
+                )
+
+        run_clicked = st.form_submit_button(
+            "Run",
+            type="primary",
+            width="stretch",
+            disabled=run_disabled,
+        )
+
+    # Keys may be unbound when the active mode hides those widgets.
+    file_path = str(st.session_state.get("sidebar_file_path") or "")
+    function_name = str(st.session_state.get("sidebar_function_name") or "")
+    class_name = str(st.session_state.get("sidebar_class_name") or "")
+
+    if run_clicked:
         _run_selected_agent(
             agent,
             question=question,

@@ -455,17 +455,22 @@ def render_documentation_result(
     data = _as_dict(result)
     st.subheader("Documentation result")
 
-    target = (
-        requested_target
-        or data.get("file_path")
-        or data.get("function_name")
-        or "(repository)"
+    # Show what was requested alongside what the backend actually returned
+    # instead of only the pre-run guess: they can legitimately differ (e.g.
+    # a targeted request that falls back to a broader scope), and hiding
+    # that mismatch made incorrect scoping invisible in the UI.
+    requested_display = requested_target or "(repository)"
+    returned_target = (
+        data.get("function_name") or data.get("file_path") or "repository"
     )
     write_note = _detect_writeback_note(str(data.get("summary") or ""))
     write_path = _extract_write_path(write_note)
     grounded = "No" if data.get("abstention") else "Yes"
 
-    st.markdown(f"**Target:** `{target}` · **Grounded:** {grounded}")
+    st.markdown(
+        f"**Requested:** `{requested_display}` · **Returned:** `{returned_target}` · "
+        f"**Grounded:** {grounded}"
+    )
 
     if write_note:
         if write_path:
