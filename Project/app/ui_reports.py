@@ -70,123 +70,105 @@ _REPORT_CSS = """
   background: #dbeafe;
   border-color: rgba(30, 58, 138, 0.16);
 }
-/* Chat-style documentation message — shared by live stream + final result. */
-.ca-doc-msg {
-  margin: 0.65rem 0 0.35rem;
-  padding: 0.8rem 0.95rem 0.9rem;
-  border-radius: 14px;
-  border: 1px solid rgba(15, 23, 42, 0.10);
-  background: #ffffff;
+/* ChatGPT-style assistant prose — theme-aware so dark mode stays readable. */
+.ca-doc-fallback {
+  margin: 0.35rem 0 0.5rem;
+  padding: 0.15rem 0.05rem;
+  color: var(--text-color, #e8eaed);
+  font-size: 0.98rem;
+  line-height: 1.7;
+  max-width: 52rem;
 }
-.ca-doc-msg-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.55rem;
-}
-.ca-doc-msg-title {
-  color: #0f172a;
-  font-size: 0.84rem;
-  font-weight: 600;
-}
-.ca-doc-msg-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  color: #64748b;
-  font-size: 0.78rem;
-  font-weight: 500;
-}
-.ca-doc-msg-dot {
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: 999px;
-  background: #2563eb;
-  box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.45);
-  animation: ca-doc-dot-pulse 1.4s ease-out infinite;
-}
-@keyframes ca-doc-dot-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.4); }
-  70% { box-shadow: 0 0 0 0.45rem rgba(37, 99, 235, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
-}
-.ca-doc-msg-body {
-  color: #334155;
-  font-size: 0.95rem;
-  line-height: 1.62;
-  min-height: 3.2rem;
-  max-height: 36rem;
-  overflow-y: auto;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+.ca-doc-fallback .ca-doc-msg-body {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  min-height: 1.5rem;
+  /* Let the page grow so the viewport can follow streaming text.
+     An inner max-height + overflow trap keeps new tokens off-screen. */
+  overflow: visible;
 }
 .ca-doc-msg-body > :first-child { margin-top: 0; }
 .ca-doc-msg-body > :last-child { margin-bottom: 0; }
-.ca-doc-msg-body p {
-  margin: 0 0 0.7rem;
-}
+.ca-doc-msg-body p { margin: 0 0 0.85rem; }
 .ca-doc-msg-body h1,
 .ca-doc-msg-body h2,
 .ca-doc-msg-body h3,
 .ca-doc-msg-body h4 {
-  color: #0f172a;
+  color: var(--text-color, #f3f4f6);
   font-weight: 650;
   line-height: 1.3;
-  margin: 1rem 0 0.45rem;
+  margin: 1.15rem 0 0.5rem;
 }
-.ca-doc-msg-body h1 { font-size: 1.2rem; }
-.ca-doc-msg-body h2 { font-size: 1.08rem; }
-.ca-doc-msg-body h3 { font-size: 1rem; }
+.ca-doc-msg-body h1 { font-size: 1.35rem; }
+.ca-doc-msg-body h2 { font-size: 1.18rem; }
+.ca-doc-msg-body h3 { font-size: 1.05rem; }
 .ca-doc-msg-body ul,
 .ca-doc-msg-body ol {
-  margin: 0 0 0.7rem;
-  padding-left: 1.25rem;
+  margin: 0 0 0.85rem;
+  padding-left: 1.35rem;
 }
-.ca-doc-msg-body li { margin: 0.15rem 0; }
+.ca-doc-msg-body li { margin: 0.2rem 0; }
 .ca-doc-msg-body code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.86em;
-  background: #f1f5f9;
-  color: #0f172a;
+  background: var(--secondary-background-color, #1f2937);
+  color: var(--text-color, #e5e7eb);
   border-radius: 5px;
-  padding: 0.08rem 0.32rem;
+  padding: 0.1rem 0.35rem;
 }
 .ca-doc-msg-body pre {
-  margin: 0 0 0.75rem;
-  padding: 0.7rem 0.8rem;
+  margin: 0 0 0.95rem;
+  padding: 0.85rem 0.95rem;
   border-radius: 10px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: var(--secondary-background-color, #111827);
   overflow-x: auto;
 }
 .ca-doc-msg-body pre code {
   background: transparent;
   padding: 0;
-  color: #1e293b;
+  color: inherit;
   font-size: 0.84rem;
-  line-height: 1.5;
+  line-height: 1.55;
   white-space: pre-wrap;
 }
-.ca-doc-msg-body strong { color: #0f172a; font-weight: 650; }
+.ca-doc-msg-body strong { color: inherit; font-weight: 650; }
+.ca-doc-msg-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 0.95rem;
+  font-size: 0.92rem;
+}
+.ca-doc-msg-body th,
+.ca-doc-msg-body td {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+.ca-doc-msg-body th {
+  background: var(--secondary-background-color, #1f2937);
+  font-weight: 650;
+}
 .ca-doc-placeholder {
-  color: #94a3b8;
-  font-style: italic;
+  color: var(--text-color, #9ca3af);
+  opacity: 0.75;
   margin: 0;
 }
 .ca-doc-caret {
   display: inline-block;
-  width: 2px;
+  width: 0.45rem;
   height: 1.05em;
-  margin-left: 2px;
+  margin-left: 1px;
   border-radius: 1px;
-  background: #2563eb;
-  vertical-align: -0.12em;
-  animation: ca-doc-caret 1.05s ease-in-out infinite;
+  background: var(--text-color, #e5e7eb);
+  vertical-align: -0.15em;
+  animation: ca-doc-caret 1s steps(1, end) infinite;
 }
 @keyframes ca-doc-caret {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.18; }
+  50% { opacity: 0; }
 }
 </style>
 """
@@ -227,8 +209,11 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
     Convert documentation markdown into safe HTML for the shared message UI.
 
     Supports headings, lists, fenced code, paragraphs, and light inline marks.
+    Unclosed fences mid-stream are closed so partial replies still render.
     """
     source = text or ""
+    if source.count("```") % 2 == 1:
+        source = source + "\n```"
     if not source.strip():
         caret = (
             '<span class="ca-doc-caret" aria-hidden="true"></span>' if live else ""
@@ -334,35 +319,80 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
     return body
 
 
+def _follow_streaming_viewport(*, tick: int = 0) -> None:
+    """Keep the newest streamed text visible in Streamlit's main scroll pane.
+
+    Streamlit scrolls ``[data-testid=\"stMain\"]``, not ``window``. ``st.html``
+    injects into the parent document (unlike ``components.html`` iframes). A
+    single interval watches for ``#ca-doc-stream-end`` and scrolls while it
+    exists so fragment remounts / delayed paints still follow the stream.
+    """
+    # tick changes force Streamlit to accept a new HTML payload periodically.
+    st.html(
+        f"""
+<div id="ca-scroll-tick" data-tick="{int(tick)}" style="display:none" aria-hidden="true"></div>
+<script>
+(function () {{
+  function scrollRoot() {{
+    var end = document.getElementById("ca-doc-stream-end");
+    if (!end) return false;
+    var root =
+      document.querySelector('[data-testid="stMain"]') ||
+      document.querySelector('[data-testid="stAppViewContainer"]') ||
+      document.querySelector("section.main");
+    if (root) {{
+      root.scrollTop = root.scrollHeight;
+      return true;
+    }}
+    if (typeof end.scrollIntoView === "function") {{
+      end.scrollIntoView({{ behavior: "auto", block: "end", inline: "nearest" }});
+    }}
+    return true;
+  }}
+  scrollRoot();
+  if (!window.__caDocFollowTimer) {{
+    window.__caDocFollowTimer = setInterval(function () {{
+      if (!scrollRoot()) {{
+        clearInterval(window.__caDocFollowTimer);
+        window.__caDocFollowTimer = null;
+      }}
+    }}, 120);
+  }}
+}})();
+</script>
+""",
+        unsafe_allow_javascript=True,
+    )
+
+
 def render_documentation_message(
     text: str,
     *,
     live: bool = False,
     title: str = "Documentation",
+    key: Optional[str] = None,
 ) -> None:
-    """Render live or final documentation with the same chat-style chrome."""
+    """
+    Render live or final documentation as one ChatGPT-style assistant message.
+
+    Always paints one accumulated markdown body via ``st.markdown`` (stable
+    Streamlit path). Optional HTML component is skipped — path-based custom
+    components were mounting blank/zero-height frames in this app.
+    """
+    del title, key  # Call-site compatibility; chrome stays intentionally minimal.
     _ensure_report_styles()
-    status = (
-        '<span class="ca-doc-msg-status">'
-        '<span class="ca-doc-msg-dot" aria-hidden="true"></span>'
-        "Generating"
-        "</span>"
-        if live
-        else '<span class="ca-doc-msg-status">Complete</span>'
-    )
     body = documentation_body_html(text, live=live)
+    # Sentinel sits after the message so scroll helpers can find the bottom.
+    sentinel = (
+        '<div id="ca-doc-stream-end" aria-hidden="true"></div>' if live else ""
+    )
     st.markdown(
-        f"""
-<div class="ca-doc-msg">
-  <div class="ca-doc-msg-meta">
-    <div class="ca-doc-msg-title">{html.escape(title)}</div>
-    {status}
-  </div>
-  <div class="ca-doc-msg-body">{body}</div>
-</div>
-""",
+        f'<div class="ca-doc-fallback"><div class="ca-doc-msg-body">{body}</div></div>'
+        f"{sentinel}",
         unsafe_allow_html=True,
     )
+    if live:
+        _follow_streaming_viewport(tick=len(text or ""))
 
 
 def _parse_execution_counts(summary: str) -> Dict[str, int]:
@@ -781,6 +811,7 @@ def render_documentation_result(
             body,
             live=False,
             title="Documentation",
+            key="doc_stream_assistant",
         )
     else:
         st.info("Empty documentation summary.")

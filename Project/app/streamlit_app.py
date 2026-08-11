@@ -1245,7 +1245,7 @@ def _poll_active_job() -> None:
         _finalize_active_job(cancelled=warm_status == "cancelled")
 
 
-@st.fragment(run_every=timedelta(milliseconds=80))
+@st.fragment(run_every=timedelta(milliseconds=100))
 def _render_job_monitor_live() -> None:
     """Live progress panel + Stop control while a worker is running."""
     _poll_active_job()
@@ -1291,7 +1291,7 @@ def _render_job_monitor_live() -> None:
         render_documentation_message(
             streamed,
             live=True,
-            title="Documentation",
+            key="doc_stream_assistant",
         )
 
 
@@ -1758,8 +1758,8 @@ def _render_main() -> None:
     active = st.session_state.get("active_job")
     if isinstance(active, dict) and str(active.get("job") or "") == "documentation":
         st.caption(
-            "Documentation is streaming above — the finished answer uses the "
-            "same message layout."
+            "Assistant reply is streaming above — the finished answer keeps "
+            "the same message layout."
         )
         return
 
