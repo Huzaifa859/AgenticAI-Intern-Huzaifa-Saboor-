@@ -97,6 +97,29 @@ MAX_LLM_CONFIDENCE = 0.80
 #: Used when a caller asks for analysis without asking a question.
 DEFAULT_QUESTION = "Find likely bugs and correctness problems in this code."
 
+#: Appended only to the *retrieval* query (not the LLM prompt) so
+#: embedding search ranks executable bug-relevant code above overview
+#: docs that literally restate the user's bug-hunt wording.
+_ANALYSIS_RETRIEVAL_QUERY_EXPANSION = (
+    "executable Python source functions methods classes "
+    "logic bugs correctness off-by-one wrong comparison "
+    "authorization identity check cache key path traversal "
+    "integer division floating-point money"
+)
+
+#: Overview / package-export paths that must not consume Analysis
+#: retrieval slots when real source chunks are available. Still indexed.
+_LOW_VALUE_ANALYSIS_BASENAMES = frozenset({"readme.md", "__init__.py"})
+
+#: When the index has at most this many preferred code chunks, Analysis
+#: may retrieve more than ``retrieval_top_k`` (capped below) so a small
+#: repo is not truncated to eight arbitrary hits.
+_SMALL_REPO_CODE_CHUNK_THRESHOLD = 32
+
+#: Hard ceiling on Analysis chunks for small repositories. Keeps the
+#: prompt modest while covering substantially more executable code.
+_SMALL_REPO_ANALYSIS_MAX_CHUNKS = 16
+
 #: How many static findings to show the model. Enough to stop it
 #: re-reporting what is already known, not so many that they crowd out
 #: the code itself.
@@ -787,10 +810,180 @@ class CodeAnalysisAgent(BaseAgent):
             return []
 
         try:
-            return self.retriever.retrieve(query)
+            return self._retrieve_for_analysis(self.retriever, query, top_k=None)
         except CodebaseAssistantError as exc:
             logger.warning("Retrieval failed for %r: %s", query, exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Analysis-specific retrieval (does not change shared Retriever API)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _analysis_retrieval_query(question: str) -> str:
+        """
+        Build the embedding query used for Analysis retrieval only.
+
+        The user-facing QUESTION section of the prompt keeps ``question``
+        unchanged; this expansion only steers vector search toward
+        executable code that typically hosts the defects Analysis hunts.
+        """
+        base = (question or "").strip() or DEFAULT_QUESTION
+        return f"{base}\n{_ANALYSIS_RETRIEVAL_QUERY_EXPANSION}"
+
+    @staticmethod
+    def _is_low_value_overview_chunk(chunk: RetrievedChunk) -> bool:
+        """
+        True for README / package ``__init__`` / non-code overview chunks.
+
+        These stay in the index for Documentation and other agents; Analysis
+        only avoids spending scarce top-k slots on them when source exists.
+        """
+        source = (chunk.source or "").replace("\\", "/")
+        basename = source.rsplit("/", 1)[-1].lower()
+        if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
+            return True
+        lower = source.lower()
+        if lower.endswith((".md", ".txt", ".rst")):
+            return True
+        language = (chunk.metadata or {}).get("language")
+        if language and str(language).lower() not in {"python", "py"}:
+            return True
+        return False
+
+    @staticmethod
+    def _chunk_identity(chunk: RetrievedChunk) -> str:
+        """Stable dedupe key for merged retrieval candidates."""
+        metadata = chunk.metadata or {}
+        chunk_id = metadata.get("chunk_id")
+        if chunk_id:
+            return str(chunk_id)
+        start = metadata.get("line_start")
+        end = metadata.get("line_end")
+        return f"{chunk.source}:{start}:{end}:{hash(chunk.content)}"
+
+    @classmethod
+    def _select_analysis_chunks(
+        cls,
+        candidates: Sequence[RetrievedChunk],
+        limit: int,
+    ) -> List[RetrievedChunk]:
+        """
+        Prefer executable source; only fill leftover slots with overviews.
+        """
+        if limit <= 0:
+            return []
+
+        preferred: List[RetrievedChunk] = []
+        deferred: List[RetrievedChunk] = []
+        seen: set[str] = set()
+
+        for chunk in candidates:
+            key = cls._chunk_identity(chunk)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cls._is_low_value_overview_chunk(chunk):
+                deferred.append(chunk)
+            else:
+                preferred.append(chunk)
+
+        selected = preferred[:limit]
+        if len(selected) < limit:
+            selected.extend(deferred[: limit - len(selected)])
+        return selected
+
+    def _preferred_code_chunk_count(self, retriever: Retriever) -> Optional[int]:
+        """
+        Count indexed Python chunks that are not low-value overviews.
+
+        Returns:
+            The count, or None when the store cannot be inspected.
+        """
+        try:
+            where = Retriever.build_filter(language="python")
+            chunks = retriever.vector_db.list_chunks(where=where)
+        except Exception as exc:
+            logger.debug(
+                "Could not count preferred Analysis code chunks: %s", exc
+            )
+            return None
+
+        count = 0
+        for chunk in chunks:
+            path = (chunk.file_path or "").replace("\\", "/")
+            basename = path.rsplit("/", 1)[-1].lower()
+            if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
+                continue
+            count += 1
+        return count
+
+    def _analysis_retrieval_limit(
+        self,
+        retriever: Retriever,
+        top_k: Optional[int],
+    ) -> int:
+        """
+        Choose how many chunks Analysis should keep after filtering.
+
+        Small repositories raise the ceiling (capped) so most executable
+        chunks can reach the model; large repositories keep
+        ``retrieval_top_k``.
+        """
+        base = (
+            top_k
+            if top_k is not None
+            else int(getattr(self.config, "retrieval_top_k", 8) or 8)
+        )
+        if base <= 0:
+            base = 8
+
+        preferred = self._preferred_code_chunk_count(retriever)
+        if preferred is None:
+            return base
+        if preferred <= 0:
+            return base
+        if preferred <= _SMALL_REPO_CODE_CHUNK_THRESHOLD:
+            return max(base, min(_SMALL_REPO_ANALYSIS_MAX_CHUNKS, preferred))
+        return base
+
+    def _retrieve_for_analysis(
+        self,
+        retriever: Retriever,
+        question: str,
+        top_k: Optional[int],
+    ) -> List[RetrievedChunk]:
+        """
+        Analysis retrieval: expanded query, code preference, small-repo cover.
+        """
+        limit = self._analysis_retrieval_limit(retriever, top_k)
+        retrieval_query = self._analysis_retrieval_query(question)
+
+        # Fetch a wider pool than ``limit`` so overview hits can be
+        # discarded without under-filling preferred slots.
+        fetch_k = max(
+            limit,
+            int(getattr(self.config, "rerank_candidates", 24) or 24),
+        )
+        preferred_n = self._preferred_code_chunk_count(retriever)
+        if preferred_n is not None and preferred_n <= _SMALL_REPO_CODE_CHUNK_THRESHOLD:
+            fetch_k = max(fetch_k, preferred_n)
+
+        python_filter = Retriever.build_filter(language="python")
+        candidates = retriever.retrieve(
+            retrieval_query, top_k=fetch_k, where=python_filter
+        )
+        selected = self._select_analysis_chunks(candidates, limit)
+
+        # Top up only if Python-filtered search under-filled (e.g. empty
+        # language metadata on older indexes). Prefer code first.
+        if len(selected) < limit:
+            extra = retriever.retrieve(retrieval_query, top_k=fetch_k)
+            selected = self._select_analysis_chunks(
+                list(selected) + list(extra), limit
+            )
+
+        return selected
 
     # ------------------------------------------------------------------
     # Pipeline stages
@@ -1190,7 +1383,9 @@ class CodeAnalysisAgent(BaseAgent):
         )
         retrieval_started = time.perf_counter()
         try:
-            chunks = pipeline.retriever.retrieve(question, top_k=top_k)
+            chunks = self._retrieve_for_analysis(
+                pipeline.retriever, question, top_k
+            )
         except CodebaseAssistantError as exc:
             note = f"Retrieval failed, prompting without code context: {exc}"
             logger.warning(note)
