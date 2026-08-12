@@ -32,22 +32,6 @@ VALID_ANALYSIS = {
     "findings": [],
 }
 
-VALID_DOC = {
-    "file_path": "math_utils.py",
-    "function_name": "add",
-    "summary": (
-        "## Purpose\n\n"
-        "Adds two numbers and returns their sum for callers that need "
-        "a tiny arithmetic helper."
-    ),
-    "parameters": [
-        {"name": "a", "type": "Any", "description": "Left operand."},
-        {"name": "b", "type": "Any", "description": "Right operand."},
-    ],
-    "returns": "The sum of a and b.",
-    "example_usage": "add(1, 2)",
-}
-
 VALID_TEST = {
     "summary": "Pytest coverage for add.",
     "generated_tests": {
@@ -74,9 +58,15 @@ def sample_repo(tmp_path: Path) -> Path:
 def _mock_client(content: str = "") -> MagicMock:
     client = MagicMock()
     client.is_available.return_value = True
-    client.generate.return_value = ModelResponse(
-        content=content, usage={}, raw={}
-    )
+    response = ModelResponse(content=content, usage={}, raw={})
+    client.generate.return_value = response
+
+    def _stream(_messages, on_chunk=None, **_kwargs):
+        if on_chunk is not None and content:
+            on_chunk(content)
+        return response
+
+    client.generate_stream.side_effect = _stream
     client.config = Config(openrouter_api_key=None)
     return client
 
@@ -92,10 +82,10 @@ def _mock_retriever(
     return retriever
 
 
-def test_analysis_valid_structured_output_uses_response_format(
+def test_analysis_valid_structured_output_streams_without_repair(
     sample_repo: Path,
 ) -> None:
-    """Valid Analysis JSON should skip repair and request json_object mode."""
+    """Valid Analysis JSON should stream once and skip the repair call."""
     client = _mock_client(content=json.dumps(VALID_ANALYSIS))
     agent = CodeAnalysisAgent(model_client=client, retriever=_mock_retriever())
 
@@ -104,9 +94,8 @@ def test_analysis_valid_structured_output_uses_response_format(
 
     assert report.model_used is True
     assert report.llm_parse_failed is False
-    assert client.generate.call_count == 1
-    kwargs = client.generate.call_args.kwargs
-    assert kwargs.get("response_format") == JSON_OBJECT_RESPONSE_FORMAT
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 0
 
 
 def test_analysis_fenced_json_cleaned_without_repair(sample_repo: Path) -> None:
@@ -123,15 +112,18 @@ def test_analysis_fenced_json_cleaned_without_repair(sample_repo: Path) -> None:
         report = agent.analyze_repository(str(sample_repo), use_rag=True)
 
     assert report.llm_parse_failed is False
-    assert client.generate.call_count == 1
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 0
     assert report.answer == VALID_ANALYSIS["answer"]
 
 
 def test_analysis_invalid_json_repaired_once(sample_repo: Path) -> None:
     """Invalid Analysis JSON gets exactly one repair attempt."""
     client = _mock_client()
+    client.generate_stream.side_effect = lambda *_a, **_k: ModelResponse(
+        content="not-json {{{", usage={}, raw={}
+    )
     client.generate.side_effect = [
-        ModelResponse(content="not-json {{{", usage={}, raw={}),
         ModelResponse(content=json.dumps(VALID_ANALYSIS), usage={}, raw={}),
     ]
     agent = CodeAnalysisAgent(model_client=client, retriever=_mock_retriever())
@@ -140,9 +132,10 @@ def test_analysis_invalid_json_repaired_once(sample_repo: Path) -> None:
         report = agent.analyze_repository(str(sample_repo), use_rag=True)
 
     assert report.llm_parse_failed is False
-    assert client.generate.call_count == 2
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 1
     assert report.answer == VALID_ANALYSIS["answer"]
-    repair_system = client.generate.call_args_list[1].args[0][0].content
+    repair_system = client.generate.call_args_list[0].args[0][0].content
     assert "JSON repair" in repair_system
     assert "code fences" in repair_system.lower()
 
@@ -150,8 +143,10 @@ def test_analysis_invalid_json_repaired_once(sample_repo: Path) -> None:
 def test_analysis_invalid_json_after_single_repair(sample_repo: Path) -> None:
     """A failed repair must not trigger a second JSON repair call."""
     client = _mock_client()
+    client.generate_stream.side_effect = lambda *_a, **_k: ModelResponse(
+        content="broken-1", usage={}, raw={}
+    )
     client.generate.side_effect = [
-        ModelResponse(content="broken-1", usage={}, raw={}),
         ModelResponse(content="broken-2", usage={}, raw={}),
         ModelResponse(content=json.dumps(VALID_ANALYSIS), usage={}, raw={}),
     ]
@@ -161,16 +156,17 @@ def test_analysis_invalid_json_after_single_repair(sample_repo: Path) -> None:
         report = agent.analyze_repository(str(sample_repo), use_rag=True)
 
     assert report.llm_parse_failed is True
-    assert client.generate.call_count == 2
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 1
     assert any("could not be parsed" in note.lower() for note in report.notes)
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
-def test_documentation_valid_structured_output_uses_response_format(
+def test_documentation_streams_freeform_markdown(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Valid Documentation JSON should skip repair and request json_object."""
-    client = _mock_client(content=json.dumps(VALID_DOC))
+    """Documentation streams freeform markdown (no JSON response_format)."""
+    client = _mock_client(content="## Purpose\n\nAdds two numbers.")
     agent = DocumentationAgent(model_client=client, retriever=_mock_retriever())
 
     response = agent.handle(
@@ -188,42 +184,36 @@ def test_documentation_valid_structured_output_uses_response_format(
     )
 
     assert response.success is True
-    assert client.generate.call_count == 1
-    assert (
-        client.generate.call_args.kwargs.get("response_format")
-        == JSON_OBJECT_RESPONSE_FORMAT
-    )
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 0
 
 
 @patch.object(DocumentationAgent, "_ensure_index", autospec=True)
-def test_documentation_fenced_json_cleaned_without_repair(
+def test_documentation_fenced_markdown_streams_without_generate(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Fenced DocumentationResult JSON should not enter the repair path."""
-    fenced = "```json\n" + json.dumps(VALID_DOC) + "\n```"
+    """Fenced documentation markdown is accepted via the stream path."""
+    fenced = "```markdown\n## Purpose\n\nAdds two numbers.\n```"
     client = _mock_client(content=fenced)
     agent = DocumentationAgent(model_client=client, retriever=_mock_retriever())
 
-    with patch.object(
-        agent, "_retry_json_repair", wraps=agent._retry_json_repair
-    ) as retry_spy:
-        response = agent.handle(
-            AgentRequest(
-                task_id="doc-fence",
-                agent_type=AgentType.DOCUMENTATION,
-                instruction="Document add.",
-                context={
-                    "repo_path": str(sample_repo),
-                    "doc_type": "docstring",
-                    "file_path": str(sample_repo / "math_utils.py"),
-                    "function_name": "add",
-                },
-            )
+    response = agent.handle(
+        AgentRequest(
+            task_id="doc-fence",
+            agent_type=AgentType.DOCUMENTATION,
+            instruction="Document add.",
+            context={
+                "repo_path": str(sample_repo),
+                "doc_type": "docstring",
+                "file_path": str(sample_repo / "math_utils.py"),
+                "function_name": "add",
+            },
         )
+    )
 
     assert response.success is True
-    assert retry_spy.call_count == 0
-    assert client.generate.call_count == 1
+    assert client.generate_stream.call_count == 1
+    assert client.generate.call_count == 0
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)

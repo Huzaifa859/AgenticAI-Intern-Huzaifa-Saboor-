@@ -515,6 +515,7 @@ def _init_state() -> None:
         "job_log": [],
         "job_show_stages": True,
         "doc_stream_text": "",
+        "doc_stream_shown": 0,
         "conversation_memory": None,
         "memory_bootstrapped": False,
     }
@@ -1021,6 +1022,7 @@ def _start_worker(
     # Reset stages visibility for each new run; user can hide during the run.
     st.session_state.job_show_stages = True
     st.session_state.doc_stream_text = ""
+    st.session_state.doc_stream_shown = 0
     st.session_state.active_job = {
         "transport": transport,
         "job_id": job_id,
@@ -1194,7 +1196,10 @@ def _poll_active_job() -> None:
     for event in events:
         message = event.get("message") or ""
         stage = event.get("stage") or "progress"
-        if stage == "documentation_stream_delta":
+        if stage in {
+            "documentation_stream_delta",
+            "analysis_stream_delta",
+        }:
             extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
             chunk = str((extra or {}).get("text") or "")
             if chunk:
@@ -1286,12 +1291,26 @@ def _render_job_monitor_live() -> None:
             elapsed=elapsed,
         )
 
-    if job == "documentation":
-        streamed = str(st.session_state.get("doc_stream_text") or "")
+    if job in {"documentation", "analysis"}:
+        full = str(st.session_state.get("doc_stream_text") or "")
+        # Free OpenRouter models often buffer the whole SSE body and
+        # deliver it in one burst. Reveal gradually so the live panel
+        # still looks like streaming instead of a sudden dump.
+        shown = int(st.session_state.get("doc_stream_shown") or 0)
+        if shown > len(full):
+            shown = len(full)
+        if shown < len(full):
+            remaining = len(full) - shown
+            step = 64 if remaining < 320 else min(360, max(96, remaining // 10))
+            shown = min(len(full), shown + step)
+        st.session_state.doc_stream_shown = shown
+        visible = full[:shown]
+        if job == "analysis" and visible.strip():
+            visible = f"```json\n{visible}"
         render_documentation_message(
-            streamed,
+            visible,
             live=True,
-            key="doc_stream_assistant",
+            key=f"{job}_stream_assistant",
         )
 
 
@@ -1756,10 +1775,17 @@ def _render_main() -> None:
         ]
     )
     active = st.session_state.get("active_job")
-    if isinstance(active, dict) and str(active.get("job") or "") == "documentation":
+    active_job = str(active.get("job") or "") if isinstance(active, dict) else ""
+    if active_job == "documentation":
         st.caption(
             "Assistant reply is streaming above — the finished answer keeps "
             "the same message layout."
+        )
+        return
+    if active_job == "analysis":
+        st.caption(
+            "Analysis is streaming above — when it finishes, findings appear "
+            "in the usual report layout."
         )
         return
 

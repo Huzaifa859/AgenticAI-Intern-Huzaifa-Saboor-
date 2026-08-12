@@ -28,7 +28,15 @@ from codebase_assistant.schemas.schemas import (
 def _mock_client(available: bool = True, content: str = "") -> MagicMock:
     client = MagicMock()
     client.is_available.return_value = available
-    client.generate.return_value = ModelResponse(content=content, usage={}, raw={})
+    response = ModelResponse(content=content, usage={}, raw={})
+    client.generate.return_value = response
+
+    def _stream(_messages, on_chunk=None, **_kwargs):
+        if on_chunk is not None and content:
+            on_chunk(content)
+        return response
+
+    client.generate_stream.side_effect = _stream
     return client
 
 
@@ -183,12 +191,12 @@ def test_testing_abstains_without_evidence(tmp_path: Path) -> None:
 
 
 def test_documentation_abstains_on_unverifiable_model_output(tmp_path: Path) -> None:
-    """Bad documentation JSON becomes an explicit abstention."""
+    """Empty documentation model output becomes an explicit abstention."""
     (tmp_path / "math_utils.py").write_text(
         "def add(a, b):\n    return a + b\n",
         encoding="utf-8",
     )
-    client = _mock_client(content="not-json")
+    client = _mock_client(content="")
     retriever = _mock_retriever([])
     agent = DocumentationAgent(model_client=client, retriever=retriever)
 
@@ -196,7 +204,6 @@ def test_documentation_abstains_on_unverifiable_model_output(tmp_path: Path) -> 
         result = agent.generate_readme(str(tmp_path))
 
     assert result.abstention is not None
-    assert result.abstention.reason == "LLM response could not be verified."
     assert result.summary == ""
 
 

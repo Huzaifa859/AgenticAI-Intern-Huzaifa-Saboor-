@@ -1206,14 +1206,38 @@ class CodeAnalysisAgent(BaseAgent):
                 static_findings=len(static_findings),
             )
             model_started = time.perf_counter()
-            try:
-                response = self.model_client.generate(
-                    [
-                        ModelMessage(role="system", content=SYSTEM_PROMPT),
-                        ModelMessage(role="user", content=prompt),
-                    ],
-                    response_format=JSON_OBJECT_RESPONSE_FORMAT,
+
+            def _on_chunk(text: str) -> None:
+                chunk = str(text or "")
+                if not chunk:
+                    return
+                self._trace(
+                    "analysis_stream_delta",
+                    text=chunk,
                 )
+
+            try:
+                # Stream tokens for the live UI. OpenRouter drops
+                # response_format on stream; the system prompt still asks
+                # for JSON and we parse the full reply afterward.
+                generate_stream = getattr(self.model_client, "generate_stream", None)
+                if callable(generate_stream):
+                    response = generate_stream(
+                        [
+                            ModelMessage(role="system", content=SYSTEM_PROMPT),
+                            ModelMessage(role="user", content=prompt),
+                        ],
+                        on_chunk=_on_chunk,
+                    )
+                else:
+                    response = self.model_client.generate(
+                        [
+                            ModelMessage(role="system", content=SYSTEM_PROMPT),
+                            ModelMessage(role="user", content=prompt),
+                        ],
+                        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                    )
+                    _on_chunk(getattr(response, "content", "") or "")
             except Exception as exc:
                 # Deliberately broad. A provider talks to the network and can
                 # raise anything its transport raises, and no failure out
