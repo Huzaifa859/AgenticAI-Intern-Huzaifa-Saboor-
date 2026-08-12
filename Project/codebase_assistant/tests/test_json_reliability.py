@@ -220,7 +220,7 @@ def test_documentation_fenced_markdown_streams_without_generate(
 def test_testing_valid_structured_output_uses_response_format(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Valid Testing JSON should skip JSON repair and request json_object."""
+    """Valid Testing JSON should stream once and request json_object."""
     client = _mock_client(content=json.dumps(VALID_TEST))
     agent = TestingAgent(model_client=client, retriever=_mock_retriever())
 
@@ -234,8 +234,9 @@ def test_testing_valid_structured_output_uses_response_format(
     )
 
     assert response.success is True
+    assert client.generate_stream.call_count == 1
     assert (
-        client.generate.call_args_list[0].kwargs.get("response_format")
+        client.generate_stream.call_args_list[0].kwargs.get("response_format")
         == JSON_OBJECT_RESPONSE_FORMAT
     )
 
@@ -250,6 +251,15 @@ def test_testing_invalid_json_repaired_once(
         ModelResponse(content="not-json {{{", usage={}, raw={}),
         ModelResponse(content=json.dumps(VALID_TEST), usage={}, raw={}),
     ]
+
+    def _stream(messages, on_chunk=None, **kwargs):
+        result = client.generate(messages, **kwargs)
+        text = getattr(result, "content", "") or ""
+        if on_chunk is not None and text:
+            on_chunk(text)
+        return result
+
+    client.generate_stream.side_effect = _stream
     agent = TestingAgent(model_client=client, retriever=_mock_retriever())
 
     response = agent.handle(
@@ -262,6 +272,7 @@ def test_testing_invalid_json_repaired_once(
     )
 
     assert response.success is True
+    assert client.generate_stream.call_count == 1
     assert client.generate.call_count == 2
     repair_system = client.generate.call_args_list[1].args[0][0].content
     assert "JSON repair" in repair_system
@@ -279,6 +290,15 @@ def test_testing_invalid_json_after_single_repair(
         ModelResponse(content="broken-2", usage={}, raw={}),
         ModelResponse(content=json.dumps(VALID_TEST), usage={}, raw={}),
     ]
+
+    def _stream(messages, on_chunk=None, **kwargs):
+        result = client.generate(messages, **kwargs)
+        text = getattr(result, "content", "") or ""
+        if on_chunk is not None and text:
+            on_chunk(text)
+        return result
+
+    client.generate_stream.side_effect = _stream
     agent = TestingAgent(model_client=client, retriever=_mock_retriever())
 
     with patch.object(

@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
@@ -82,11 +83,13 @@ _STREAM_STAGES = frozenset(
     {
         "documentation_stream_delta",
         "analysis_stream_delta",
+        "testing_stream_delta",
     }
 )
 _STREAM_MESSAGES: Dict[str, str] = {
     "documentation_stream_delta": "Streaming documentation…",
     "analysis_stream_delta": "Streaming analysis…",
+    "testing_stream_delta": "Streaming test generation…",
 }
 
 
@@ -105,16 +108,23 @@ class ProgressWriter:
         self._stream_opened_at = 0.0
         self._stream_stage = "documentation_stream_delta"
         self._stream_message = _STREAM_MESSAGES["documentation_stream_delta"]
+        # Testing generates symbols concurrently; lock keeps NDJSON deltas
+        # from interleaving mid-buffer.
+        self._lock = threading.Lock()
 
     def emit(self, stage: str, message: str = "", **extra: Any) -> None:
         """Write one progress event; never raises into the worker."""
         if not self.path:
             return
+        with self._lock:
+            self._emit_unlocked(stage, message, **extra)
+
+    def _emit_unlocked(self, stage: str, message: str = "", **extra: Any) -> None:
         stage_key = str(stage or "progress")
         # Flush any pending stream tokens before a normal stage line
         # so the UI never sees stages arrive ahead of earlier text.
         if stage_key not in _STREAM_STAGES:
-            self.flush_stream()
+            self._flush_stream_unlocked()
         text = (message or _STAGE_MESSAGES.get(stage_key) or "").strip()
         if not text:
             text = stage_key.replace("_", " ").strip().capitalize() or "Working..."
@@ -141,25 +151,33 @@ class ProgressWriter:
         text = str(chunk or "")
         if not text or not self.path:
             return
-        stage_key = str(stage or "documentation_stream_delta")
-        if stage_key not in _STREAM_STAGES:
-            stage_key = "documentation_stream_delta"
-        if self._stream_buf and stage_key != self._stream_stage:
-            self.flush_stream()
-        self._stream_stage = stage_key
-        self._stream_message = _STREAM_MESSAGES.get(stage_key, "Streaming…")
-        now = time.monotonic()
-        if not self._stream_buf:
-            self._stream_opened_at = now
-        self._stream_buf += text
-        if (
-            len(self._stream_buf) >= self._STREAM_BATCH_CHARS
-            or (now - self._stream_opened_at) >= self._STREAM_BATCH_SECONDS
-        ):
-            self.flush_stream()
+        with self._lock:
+            stage_key = str(stage or "documentation_stream_delta")
+            if stage_key not in _STREAM_STAGES:
+                stage_key = "documentation_stream_delta"
+            if self._stream_buf and stage_key != self._stream_stage:
+                self._flush_stream_unlocked()
+            self._stream_stage = stage_key
+            self._stream_message = _STREAM_MESSAGES.get(stage_key, "Streaming…")
+            now = time.monotonic()
+            if not self._stream_buf:
+                self._stream_opened_at = now
+            self._stream_buf += text
+            if (
+                len(self._stream_buf) >= self._STREAM_BATCH_CHARS
+                or (now - self._stream_opened_at) >= self._STREAM_BATCH_SECONDS
+            ):
+                self._flush_stream_unlocked()
 
     def flush_stream(self) -> None:
         """Write any buffered stream text immediately."""
+        if not self.path:
+            return
+        with self._lock:
+            self._flush_stream_unlocked()
+
+    def _flush_stream_unlocked(self) -> None:
+        """Write any buffered stream text immediately (caller holds lock)."""
         if not self.path or not self._stream_buf:
             return
         chunk = self._stream_buf

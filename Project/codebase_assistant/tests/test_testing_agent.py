@@ -71,10 +71,22 @@ def sample_repo(tmp_path: Path) -> Path:
 
 
 def _mock_client(available: bool = True, content: str = "") -> MagicMock:
-    """Build a mock LLMClient."""
+    """Build a mock LLMClient with generate + generate_stream."""
     client = MagicMock()
     client.is_available.return_value = available
-    client.generate.return_value = ModelResponse(content=content, usage={}, raw={})
+    response = ModelResponse(content=content, usage={}, raw={})
+    client.generate.return_value = response
+
+    def _stream(messages, on_chunk=None, **kwargs):
+        # Route through generate() so existing call_args assertions keep
+        # working after Testing switched to the streaming path.
+        result = client.generate(messages, **kwargs)
+        text = getattr(result, "content", "") or ""
+        if on_chunk is not None and text:
+            on_chunk(text)
+        return result
+
+    client.generate_stream.side_effect = _stream
     return client
 
 

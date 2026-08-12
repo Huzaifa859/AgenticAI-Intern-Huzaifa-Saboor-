@@ -168,6 +168,7 @@ _STAGE_WEIGHTS: Dict[str, Dict[str, float]] = {
         "testing_started": 0.26,
         "before_model_call": 0.36,
         "model_request": 0.40,
+        "testing_stream_delta": 0.52,
         "testing_symbol_generation_finished": 0.55,
         "after_model_call": 0.60,
         "model_response": 0.64,
@@ -1199,6 +1200,7 @@ def _poll_active_job() -> None:
         if stage in {
             "documentation_stream_delta",
             "analysis_stream_delta",
+            "testing_stream_delta",
         }:
             extra = event.get("extra") if isinstance(event.get("extra"), dict) else {}
             chunk = str((extra or {}).get("text") or "")
@@ -1291,7 +1293,7 @@ def _render_job_monitor_live() -> None:
             elapsed=elapsed,
         )
 
-    if job in {"documentation", "analysis"}:
+    if job in {"documentation", "analysis", "testing"}:
         full = str(st.session_state.get("doc_stream_text") or "")
         # Free OpenRouter models often buffer the whole SSE body and
         # deliver it in one burst. Reveal gradually so the live panel

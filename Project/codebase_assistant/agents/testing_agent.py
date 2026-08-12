@@ -47,6 +47,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -73,6 +74,10 @@ from ..utils.json_output import (
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
+
+#: Serialize testing stream deltas so concurrent per-symbol generation
+#: does not interleave token fragments in the live UI progress file.
+_STREAM_EMIT_LOCK = threading.Lock()
 
 #: Cap on source files read into the prompt when building repository context.
 _MAX_SOURCE_FILES = 6
@@ -913,14 +918,10 @@ class TestingAgent(BaseAgent):
             )
             model_started = time.perf_counter()
             try:
-                response = self.model_client.generate(
-                    [
-                        ModelMessage(role="system", content=_SYSTEM_PROMPT),
-                        ModelMessage(role="user", content=prompt),
-                    ],
-                    max_tokens=_TEST_MAX_TOKENS,
-                    temperature=0.0,
-                    response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                response = self._generate_with_stream(
+                    system_prompt=_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    stream_label=f"Generating tests for `{symbol.qualname}`",
                 )
             except Exception as exc:
                 logger.warning(
@@ -1308,14 +1309,10 @@ class TestingAgent(BaseAgent):
 
         model_started = time.perf_counter()
         try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(role="system", content=_REPAIR_SYSTEM_PROMPT),
-                    ModelMessage(role="user", content=repair_prompt),
-                ],
-                max_tokens=_TEST_MAX_TOKENS,
-                temperature=0.0,
-                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+            response = self._generate_with_stream(
+                system_prompt=_REPAIR_SYSTEM_PROMPT,
+                user_prompt=repair_prompt,
+                stream_label="Repairing failing tests",
             )
         except Exception as exc:
             logger.warning("OpenRouter testing repair call failed: %s", exc)
@@ -3590,6 +3587,68 @@ class TestingAgent(BaseAgent):
             ),
             None,
         )
+
+    def _generate_with_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        stream_label: str = "",
+    ) -> Any:
+        """
+        Call the model, streaming tokens to the live UI when supported.
+
+        Prefers ``generate_stream`` (same pattern as Analysis/Documentation).
+        OpenRouter may drop ``response_format`` while streaming; the system
+        prompt still requires TestingResult JSON and we parse afterward.
+        Concurrent symbol workers share ``_STREAM_EMIT_LOCK`` so deltas are
+        not character-interleaved in the progress file.
+        """
+        if self.model_client is None:
+            raise RuntimeError("No model client configured for TestingAgent.")
+
+        label = (stream_label or "").strip()
+        header_sent = False
+
+        def _on_chunk(text: str) -> None:
+            nonlocal header_sent
+            chunk = str(text or "")
+            if not chunk:
+                return
+            with _STREAM_EMIT_LOCK:
+                if label and not header_sent:
+                    self._trace(
+                        "testing_stream_delta",
+                        text=f"\n\n### {label}\n\n",
+                    )
+                    header_sent = True
+                self._trace(
+                    "testing_stream_delta",
+                    text=chunk,
+                )
+
+        messages = [
+            ModelMessage(role="system", content=system_prompt),
+            ModelMessage(role="user", content=user_prompt),
+        ]
+        generate_stream = getattr(self.model_client, "generate_stream", None)
+        if callable(generate_stream):
+            return generate_stream(
+                messages,
+                max_tokens=_TEST_MAX_TOKENS,
+                temperature=0.0,
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                on_chunk=_on_chunk,
+            )
+
+        response = self.model_client.generate(
+            messages,
+            max_tokens=_TEST_MAX_TOKENS,
+            temperature=0.0,
+            response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        )
+        _on_chunk(getattr(response, "content", "") or "")
+        return response
 
     def _retry_json_repair(
         self,
