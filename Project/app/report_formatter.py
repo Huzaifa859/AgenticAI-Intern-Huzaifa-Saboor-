@@ -17,6 +17,7 @@ import textwrap
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from codebase_assistant.agents.code_analysis_agent import CodeAnalysisReport
+from codebase_assistant.analysis.finding_attribution import attribution_lines
 from codebase_assistant.schemas.schemas import BugReport, DocumentationResult, TestingResult
 
 # Avoid pytest collecting TestingResult when this module is imported in tests.
@@ -320,7 +321,7 @@ def format_finding(
         f"{indent}[{index}] "
         f"{style(finding.bug_type, 'bold', use_color=use_color)}  "
         f"{finding.file_path}:{lines}  "
-        f"{finding.detection_method}  "
+        f"{attribution_lines(finding)[0].replace('Found by: ', '', 1)}  "
         f"conf={finding.confidence:.2f}"
     )
 
@@ -328,10 +329,17 @@ def format_finding(
         ("File", finding.file_path),
         ("Lines", lines),
         ("Type", finding.bug_type),
-        ("Method", finding.detection_method),
+        ("Found by", attribution_lines(finding)[0].replace("Found by: ", "", 1)),
         ("Confidence", f"{finding.confidence:.2f}"),
         ("Function", finding.function_name),
     ]
+    for line in attribution_lines(finding)[1:]:
+        if line == "Grounded evidence":
+            fields.append(("Grounding", "Grounded evidence"))
+        elif line == "Ungrounded evidence":
+            fields.append(("Grounding", "Ungrounded evidence"))
+        elif line == "Already documented in the code.":
+            fields.append(("Docs", "Already documented in the code."))
 
     body: List[str] = [header, ""]
     for label, value in fields:

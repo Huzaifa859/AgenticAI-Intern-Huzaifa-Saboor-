@@ -21,6 +21,12 @@ if _PROJECT_ROOT not in sys.path:
 import streamlit as st
 import html
 
+from codebase_assistant.analysis.finding_attribution import (
+    META_ALREADY_DOCUMENTED,
+    META_FOUND_BY,
+    META_GROUNDING_STATUS,
+    attribution_lines,
+)
 from codebase_assistant.utils.text_cleanup import sanitize_documentation_text
 
 _REPORT_CSS = """
@@ -749,6 +755,45 @@ def _render_ungrounded_candidates(candidates: List[Dict[str, Any]]) -> None:
                 st.markdown(str(item.get("suggested_fix")))
 
 
+def _finding_attribution_caption(finding: Mapping[str, Any]) -> str:
+    """Build the Found-by / grounding / documented caption for one finding."""
+    # Prefer metadata already shaped like a BugReport for attribution_lines.
+    try:
+        from codebase_assistant.schemas.schemas import BugReport
+
+        report = BugReport.model_validate(dict(finding))
+        return " · ".join(attribution_lines(report))
+    except Exception:
+        parts: List[str] = []
+        found = str(finding.get(META_FOUND_BY) or finding.get("detection_method") or "")
+        if found:
+            parts.append(f"Found by: {found}")
+        status = str(
+            (finding.get("metadata") or {}).get(META_GROUNDING_STATUS)
+            if isinstance(finding.get("metadata"), dict)
+            else finding.get(META_GROUNDING_STATUS)
+            or ""
+        ).lower()
+        if status == "grounded":
+            parts.append("Grounded evidence")
+        elif status == "ungrounded":
+            parts.append("Ungrounded evidence")
+        meta = dict(finding.get("metadata") or {})
+        if meta.get(META_ALREADY_DOCUMENTED) or finding.get(META_ALREADY_DOCUMENTED):
+            parts.append("Already documented in the code.")
+        return " · ".join(parts)
+
+
+def _ungrounded_finding_count(findings: Sequence[Mapping[str, Any]]) -> int:
+    count = 0
+    for finding in findings:
+        meta = dict(finding.get("metadata") or {})
+        status = str(meta.get(META_GROUNDING_STATUS) or "").lower()
+        if status == "ungrounded":
+            count += 1
+    return count
+
+
 def render_analysis_report(report: Any) -> None:
     """Render an analysis report dict in the Streamlit main pane."""
     data = _as_dict(report)
@@ -757,15 +802,16 @@ def render_analysis_report(report: Any) -> None:
         dict(item) for item in list(data.get("ungrounded_candidates") or [])
     ]
     severity = _severity_counts(findings)
+    ungrounded_in_findings = _ungrounded_finding_count(findings)
 
     st.subheader("Analysis report")
     _render_stats(
         [
-            ("Verified", str(len(findings))),
+            ("Findings", str(len(findings))),
             ("High", str(severity["high"])),
             ("Medium", str(severity["medium"])),
             ("Low", str(severity["low"])),
-            ("Ungrounded", str(len(candidates))),
+            ("Ungrounded", str(ungrounded_in_findings or len(candidates))),
         ]
     )
 
@@ -779,11 +825,11 @@ def render_analysis_report(report: Any) -> None:
     if "analysis_show_ungrounded" not in st.session_state:
         st.session_state.analysis_show_ungrounded = False
     show_ungrounded = st.checkbox(
-        "Show ungrounded candidates",
+        "Show grounding failure details",
         key="analysis_show_ungrounded",
         help=(
-            "Also show LLM/static findings that failed grounding. "
-            "They stay separate from verified findings."
+            "Show extra detail for findings whose evidence did not match "
+            "source. Ungrounded findings already appear in the main list."
         ),
     )
 
@@ -803,9 +849,9 @@ def render_analysis_report(report: Any) -> None:
         with st.expander("Model answer", expanded=False):
             st.markdown(answer)
 
-    st.markdown("### Verified findings")
+    st.markdown("### Findings")
     if not findings:
-        st.info("No verified findings.")
+        st.info("No findings.")
     else:
         filter_cols = st.columns([2, 3])
         with filter_cols[0]:
@@ -833,12 +879,13 @@ def render_analysis_report(report: Any) -> None:
         if not selected_severities:
             st.info("Select at least one severity to show findings.")
         else:
-            st.caption(f"Showing {len(filtered)} of {len(findings)} verified finding(s).")
+            st.caption(f"Showing {len(filtered)} of {len(findings)} finding(s).")
             if not filtered:
                 st.warning("No findings match the current severity/search filters.")
             else:
                 table_rows: List[Dict[str, object]] = []
                 for finding in filtered:
+                    meta = dict(finding.get("metadata") or {})
                     table_rows.append(
                         {
                             "severity": finding.get("severity"),
@@ -851,7 +898,9 @@ def render_analysis_report(report: Any) -> None:
                                 f"{finding.get('line_end')}"
                             ),
                             "type": finding.get("bug_type"),
-                            "method": finding.get("detection_method"),
+                            "found_by": meta.get(META_FOUND_BY)
+                            or finding.get("detection_method"),
+                            "grounding": meta.get(META_GROUNDING_STATUS) or "",
                             "summary": str(finding.get("description") or "")[:120],
                         }
                     )
@@ -869,11 +918,12 @@ def render_analysis_report(report: Any) -> None:
                         st.markdown(
                             finding.get("description") or "(no description)"
                         )
+                        attr = _finding_attribution_caption(finding)
                         st.caption(
                             f"Confidence: "
                             f"{float(finding.get('confidence') or 0.0):.2f} · "
-                            f"Method: {finding.get('detection_method')} · "
                             f"Function: {finding.get('function_name') or '(n/a)'}"
+                            + (f" · {attr}" if attr else "")
                         )
                         if finding.get("evidence"):
                             st.markdown("**Evidence**")
@@ -895,12 +945,12 @@ def render_analysis_report(report: Any) -> None:
         if candidates:
             _render_ungrounded_candidates(candidates)
         else:
-            st.markdown("### Unverified (failed grounding)")
-            st.caption("No ungrounded candidates in this run.")
+            st.markdown("### Grounding failure details")
+            st.caption("No ungrounded grounding-detail records in this run.")
     elif candidates:
         st.caption(
-            f"{len(candidates)} ungrounded candidate(s) hidden — "
-            "enable **Show ungrounded candidates** above to inspect them."
+            f"{len(candidates)} grounding-failure detail(s) hidden — "
+            "enable **Show grounding failure details** above to inspect them."
         )
 
 

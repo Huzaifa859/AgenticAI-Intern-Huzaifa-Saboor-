@@ -53,7 +53,7 @@ def _source_slice(repo: Path, relative: str, line_start: int, line_end: int) -> 
 
 
 def _http_response(status_code: int, payload: Optional[dict] = None) -> MagicMock:
-    """Build a mock requests.Response for OpenRouter."""
+    """Build a mock requests.Response for OpenRouter (non-stream JSON)."""
     response = MagicMock(spec=requests.Response)
     response.status_code = status_code
     response.text = json.dumps(payload) if payload is not None else ""
@@ -61,6 +61,41 @@ def _http_response(status_code: int, payload: Optional[dict] = None) -> MagicMoc
         response.json.side_effect = ValueError("no json")
     else:
         response.json.return_value = payload
+    response.close = MagicMock()
+    return response
+
+
+def _sse_http_response(content: str) -> MagicMock:
+    """Build a mock streaming Response that yields the assistant content."""
+    lines = [
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": content, "role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        ),
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "", "role": "assistant"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+    response = MagicMock(spec=requests.Response)
+    response.status_code = 200
+    response.iter_lines.return_value = iter(lines)
+    response.close = MagicMock()
     return response
 
 
@@ -198,10 +233,12 @@ def _run_with_llm_content(
     repo: Path,
     content: str,
 ) -> tuple[CodeAnalysisReport, MagicMock]:
-    """Execute analyze_repository with a mocked OpenRouter completion body."""
+    """Execute analyze_repository with a mocked OpenRouter streamed body."""
     get_patch, post_patch, sleep_patch, body = _patch_openrouter_success(content)
     with get_patch, sleep_patch, post_patch as mock_post:
-        mock_post.return_value = _http_response(200, _chat_payload(body))
+        # Analysis prefers generate_stream; serve fresh SSE per POST so
+        # empty-stream fallback does not fire against a JSON-only mock.
+        mock_post.side_effect = lambda *a, **k: _sse_http_response(body)
         report = agent.analyze_repository(
             repository_path=str(repo.resolve()),
             question=QUESTION,
@@ -277,6 +314,7 @@ def test_full_pipeline_indexes_retrieves_prompts_and_grounds(
     assert llm.file_path.replace("\\", "/") == WALLET_RELATIVE
     assert llm.evidence == evidence
     assert llm.detection_method == "llm"
+    assert llm.metadata.get("grounding_status") == "grounded"
     assert not any(
         result.file_path.replace("\\", "/") == WALLET_RELATIVE
         and result.line_start == 8
@@ -284,19 +322,22 @@ def test_full_pipeline_indexes_retrieves_prompts_and_grounds(
         for result in report.rejected
     )
 
-    # Static and LLM findings merge correctly
+    # Static and LLM findings merge correctly (counts may overlap on hybrid)
     assert report.static_findings, "expected static findings (unused import)"
     assert any(f.bug_type == "unused_import" for f in report.static_findings)
-    assert len(report.findings) == len(report.static_findings) + len(report.llm_findings)
+    assert any(f.detection_method == "llm" for f in report.findings) or any(
+        f.detection_method == "hybrid" for f in report.findings
+    )
     methods = {f.detection_method for f in report.findings}
-    assert methods == {"static", "llm"}
+    assert "static" in methods or "hybrid" in methods
+    assert "llm" in methods or "hybrid" in methods
 
 
-def test_hallucinated_findings_kept_when_grounding_disabled(
+def test_hallucinated_findings_kept_and_marked_ungrounded(
     analysis_agent: CodeAnalysisAgent,
     analysis_repo: Path,
 ) -> None:
-    """With grounding off (default), mismatched evidence is still kept."""
+    """Mismatched evidence stays visible and is annotated ungrounded."""
     content = _finding_payload(
         file_path=WALLET_RELATIVE,
         line_start=8,
@@ -311,7 +352,8 @@ def test_hallucinated_findings_kept_when_grounding_disabled(
     assert report.model_used is True
     assert report.context, "pipeline should still retrieve before the model call"
     assert any(f.bug_type == "hallucinated_bug" for f in report.findings)
-    assert report.rejected == []
+    hallucinated = next(f for f in report.findings if f.bug_type == "hallucinated_bug")
+    assert hallucinated.metadata.get("grounding_status") == "ungrounded"
     assert report.static_findings, "static findings must survive LLM output"
     assert len(report.llm_findings) >= 1
 

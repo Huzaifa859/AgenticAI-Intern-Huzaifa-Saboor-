@@ -219,9 +219,9 @@ class Config:
     # When True, analysis UIs/CLI also surface findings that failed
     # grounding as "unverified candidates" (never mixed into verified).
     analysis_show_ungrounded: bool = False
-    # When False (default), evidence grounding is skipped project-wide:
-    # analysis findings and documentation claims are not scrubbed against
-    # source/inventory. Set GROUNDING_ENABLED=true to restore verification.
+    # When False (default), documentation/testing skip evidence grounding.
+    # Code Analysis enables annotate-only grounding in CodeAnalysisAgent._bind.
+    # Set GROUNDING_ENABLED=true to turn grounding on for other agents.
     grounding_enabled: bool = False
     # When True (default), Documentation/Testing/Analysis reuse a
     # persistent cross-run cache of LLM output keyed by a hash of the

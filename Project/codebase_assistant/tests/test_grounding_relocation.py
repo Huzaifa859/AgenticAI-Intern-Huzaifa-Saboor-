@@ -258,3 +258,18 @@ def test_system_prompt_requires_accurate_citations() -> None:
     assert "Never invent files, functions, variables, or evidence" in SYSTEM_PROMPT
     assert "If you are uncertain, omit the finding" in SYSTEM_PROMPT
     assert '"findings"' in SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_independent_discovery() -> None:
+    """LLM must report bugs even when static/docs already cover them."""
+    from codebase_assistant.agents.code_analysis_agent import SYSTEM_PROMPT
+
+    lowered = SYSTEM_PROMPT.lower()
+    assert "independent bug discovery" in lowered
+    assert "known static findings" in lowered
+    assert "docstring, comment, or readme" in lowered
+    assert "do not omit a finding to avoid duplicates" in lowered
+    assert "already documented" in lowered
+    # Old suppression instructions must not remain.
+    assert "do not repeat anything listed under known static findings" not in lowered
+    assert "no new bugs were independently discovered" not in lowered

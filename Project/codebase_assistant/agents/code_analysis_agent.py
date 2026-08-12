@@ -16,12 +16,11 @@ left to rediscover it. Everything the model proposes then goes back
 through the same grounding gate the static findings passed, and anything
 that fails is dropped.
 
-The guarantee this module makes is narrow and absolute: **no finding
-reaches the caller without its evidence having been verified against the
-real source.** A model finding and a pyflakes finding are put through
-the identical check. That is why `CodeAnalysisReport.findings` can be
-trusted and `rejected` is kept separately rather than merged in with a
-lower score.
+Findings from static analysis and the model are both retained. Grounding
+classifies each finding as grounded or ungrounded without suppressing it.
+Matching static and LLM defects merge into one ``Static + LLM`` finding.
+`rejected` still records ungrounded classifications for metrics, but those
+findings remain in `findings` with attribution metadata.
 
 The agent degrades rather than fails. No provider configured, the model
 unreachable, an unparseable response, an empty index -- each of these
@@ -39,6 +38,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..analysis.finding_attribution import (
+    FOUND_BY_LLM,
+    FOUND_BY_STATIC,
+    GROUNDING_GROUNDED,
+    META_GROUNDING_STATUS,
+    annotate_batch_from_verification,
+    is_already_documented_in_source,
+    merge_attribution,
+    set_already_documented,
+    set_found_by,
+)
 from ..analysis.grounding_checker import GroundingChecker, GroundingResult
 from ..analysis.report_builder import ReportBuilder
 from ..analysis.static_analyzer import AnalysisReport as StaticAnalysisReport
@@ -103,7 +113,7 @@ _MAX_JSON_REPAIR_RAW_CHARS = 6_000
 #: (answer, proposed findings) shape changes, so previously cached LLM
 #: outputs are invalidated instead of being replayed against a stale
 #: format.
-_PROMPT_VERSION = "analysis-v1.1"
+_PROMPT_VERSION = "analysis-v1.3"
 
 _JSON_REPAIR_SYSTEM_PROMPT = """\
 You are repairing malformed code-analysis JSON.
@@ -120,6 +130,11 @@ SYSTEM_PROMPT = """\
 You are a precise code analysis assistant. You find real bugs in real \
 code, and you never invent them.
 
+Your job is independent bug discovery from the supplied repository code. \
+Downstream systems handle deduplication against static analysis and \
+annotation when a bug is already documented. Do not suppress a genuine \
+bug for either reason.
+
 You will be given code from a repository. Every line is shown with its \
 real line number in a left gutter, like:
 
@@ -131,22 +146,34 @@ Rules you must follow exactly:
 
 1. Report only findings supported by the repository code shown in \
 CODE CONTEXT. If you cannot see it, it does not exist.
+
 2. Prefer including `evidence` as the exact code snippet that supports \
 the finding, copied character for character from the code shown. Do not \
 re-indent it, do not reformat it, do not fix it, do not abbreviate it. \
 If you omit evidence, still provide accurate `file_path`, `line_start`, \
 and `line_end`.
+
 3. `file_path` must be the accurate path from the CODE CONTEXT header \
 (for example `path/as/shown/in/the/header.py`). Never invent files.
+
 4. `line_start` and `line_end` must be the most accurate real line \
 numbers from the gutter for the buggy lines.
+
 5. Never invent files, functions, variables, or evidence. Never guess \
 symbols that are not visible in CODE CONTEXT.
-6. Do not repeat anything listed under KNOWN STATIC FINDINGS. Those are \
-already confirmed.
+
+6. Report every genuine implementation bug you can verify in CODE \
+CONTEXT, even when:
+   - the same bug also appears under KNOWN STATIC FINDINGS,
+   - Static Analysis has already found it, or
+   - a docstring, comment, or README already describes it.
+Do not omit a finding to avoid duplicates or because it is already \
+documented. Still report it with accurate path, lines, and evidence.
+
 7. If you are uncertain, omit the finding. If the context is not enough \
 to answer, say so in `answer` and return an empty `findings` list. \
 Abstaining is a correct answer. Guessing is not.
+
 8. Reply with ONE JSON object and nothing else -- no prose before it, no \
 prose after it.
 
@@ -188,12 +215,13 @@ class CodeAnalysisReport:
     Attributes:
         repository_path: Repository that was analyzed.
         question: The question that drove the run.
-        findings: Verified findings, deduplicated, most severe first.
-            Every one has had its evidence checked against the source.
+        findings: Verified and attributed findings, deduplicated, most
+            severe first. Ungrounded LLM findings remain here with
+            grounding status metadata rather than being dropped.
         answer: The model's prose answer, empty when no model ran.
-        rejected: Verdicts on findings that failed grounding. Kept so
-            the hallucination rate is measurable; never merged into
-            `findings`.
+        rejected: Grounding classifications that failed evidence match.
+            Kept for hallucination metrics; the same findings also remain
+            in `findings` with an ``ungrounded`` annotation.
         context: Chunks retrieved and shown to the model.
         static_report: The deterministic pass's own result, including
             files it skipped.
@@ -233,13 +261,25 @@ class CodeAnalysisReport:
 
     @property
     def static_findings(self) -> List[BugReport]:
-        """Verified findings that came from the deterministic pass."""
-        return [f for f in self.findings if f.detection_method == "static"]
+        """Findings that include a static-analysis source."""
+        return [
+            f
+            for f in self.findings
+            if f.detection_method in ("static", "hybrid")
+            or str((f.metadata or {}).get("found_by") or "")
+            in ("Static Analysis", "Static + LLM")
+        ]
 
     @property
     def llm_findings(self) -> List[BugReport]:
-        """Verified findings that came from the model."""
-        return [f for f in self.findings if f.detection_method == "llm"]
+        """Findings that include an LLM source."""
+        return [
+            f
+            for f in self.findings
+            if f.detection_method in ("llm", "hybrid")
+            or str((f.metadata or {}).get("found_by") or "")
+            in ("LLM", "Static + LLM")
+        ]
 
     def by_severity(self) -> Dict[str, int]:
         """
@@ -265,13 +305,23 @@ class CodeAnalysisReport:
         """
         if self.abstention is not None:
             return f"abstained: {self.abstention.reason}"
+        static_only = sum(1 for f in self.findings if f.detection_method == "static")
+        llm_only = sum(1 for f in self.findings if f.detection_method == "llm")
+        hybrid = sum(1 for f in self.findings if f.detection_method == "hybrid")
+        ungrounded = sum(
+            1
+            for f in self.findings
+            if str((f.metadata or {}).get(META_GROUNDING_STATUS) or "") == "ungrounded"
+        )
         parts = [
-            f"{len(self.findings)} verified finding(s)",
-            f"{len(self.static_findings)} static",
-            f"{len(self.llm_findings)} llm",
+            f"{len(self.findings)} finding(s)",
+            f"{static_only} static",
+            f"{llm_only} llm",
         ]
-        if self.rejected:
-            parts.append(f"{len(self.rejected)} rejected as ungrounded")
+        if hybrid:
+            parts.append(f"{hybrid} static+llm")
+        if ungrounded:
+            parts.append(f"{ungrounded} ungrounded")
         if self.duplicates_removed:
             parts.append(f"{self.duplicates_removed} duplicate(s) merged")
         if not self.model_used:
@@ -472,8 +522,9 @@ class CodeAnalysisAgent(BaseAgent):
             pipeline, question, report.context, static_findings, report
         )
 
-        # 11-13. One ordered, deduplicated set.
+        # 11-13. One ordered, deduplicated set with attribution.
         merged, removed = self._merge(static_findings, llm_findings)
+        merged = self._annotate_documentation(merged, pipeline.root)
         report.findings = merged
         report.duplicates_removed = removed
         self._apply_abstention(
@@ -667,20 +718,29 @@ class CodeAnalysisAgent(BaseAgent):
             )
 
         verified = pipeline.checker.verify_reports(findings)
-        counts: Dict[str, Any] = {"findings": len(verified.grounded)}
-        for finding in verified.grounded:
+        annotated = annotate_batch_from_verification(
+            findings,
+            verified.results,
+            found_by=FOUND_BY_STATIC,
+        )
+        counts: Dict[str, Any] = {"findings": len(annotated)}
+        for finding in annotated:
             key = f"severity_{finding.severity}"
             counts[key] = counts.get(key, 0) + 1
+            status = str(finding.metadata.get(META_GROUNDING_STATUS) or "")
+            if status:
+                counts[f"grounding_{status}"] = counts.get(f"grounding_{status}", 0) + 1
 
         return CodeAnalysisResult(
             summary=(
-                f"{len(verified.grounded)} verified issue(s) in {file_path}."
-                if verified.grounded
+                f"{len(annotated)} issue(s) in {file_path}."
+                if annotated
                 else f"No issues detected in {file_path}."
             ),
             issues=[
-                f"L{f.line_start}: [{f.severity}] {f.bug_type} - {f.description}"
-                for f in verified.grounded
+                f"[{f.severity}] {f.bug_type} at {f.line_start}-{f.line_end}: "
+                f"{f.description}"
+                for f in annotated
             ],
             metrics=counts,
         )
@@ -766,13 +826,19 @@ class CodeAnalysisAgent(BaseAgent):
         if report.context:
             evidence.append(f"{len(report.context)} retrieved chunk(s)")
         if report.rejected:
-            evidence.append(f"{len(report.rejected)} ungrounded claim(s) discarded")
+            evidence.append(
+                f"{len(report.rejected)} ungrounded claim(s) annotated"
+            )
         if report.llm_proposed_count:
             evidence.append(
                 f"{report.llm_proposed_count} model finding(s) proposed"
             )
 
-        if files_analyzed == 0:
+        # Only abstain for an empty/unsupported tree when the static pass
+        # actually ran and reported zero analyzable files. A missing
+        # static_report (or a successful LLM-only annotation pass) must
+        # not wipe attributed findings.
+        if report.static_report is not None and files_analyzed == 0:
             report.abstention = builder.abstain(
                 "Repository contains no supported Python files.",
                 confidence=1.0,
@@ -874,13 +940,7 @@ class CodeAnalysisAgent(BaseAgent):
             )
             return
 
-        if report.model_used and (
-            (
-                report.llm_proposed_count > 0
-                and report.llm_grounded_count == 0
-            )
-            or report.llm_parse_failed
-        ):
+        if report.model_used and report.llm_parse_failed and not report.findings:
             report.abstention = builder.abstain(
                 "LLM response could not be verified.",
                 confidence=1.0,
@@ -1048,7 +1108,8 @@ class CodeAnalysisAgent(BaseAgent):
             report: Report to record the static result and notes on.
 
         Returns:
-            The grounded static findings.
+            Static findings with Found-by / grounding annotations. Ungrounded
+            static findings are kept and classified, never dropped.
         """
         static = pipeline.analyzer.analyze_repository_detailed(scope)
         report.static_report = static
@@ -1057,16 +1118,25 @@ class CodeAnalysisAgent(BaseAgent):
         if not static.findings:
             return []
 
+        findings = list(static.findings)
+        for finding in findings:
+            set_found_by(finding, FOUND_BY_STATIC)
+
         if not getattr(pipeline.checker, "enabled", False):
-            return list(static.findings)
+            return findings
 
         # Hash the cited files now, so an edit between this point and
         # verification is detected rather than silently tolerated.
-        self._trace("grounding_started", findings=len(static.findings), source="static")
+        self._trace("grounding_started", findings=len(findings), source="static")
         ground_started = time.perf_counter()
-        pipeline.checker.snapshot_reports(static.findings)
-        verified = pipeline.checker.verify_reports(static.findings)
+        pipeline.checker.snapshot_reports(findings)
+        verified = pipeline.checker.verify_reports(findings)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        annotated = annotate_batch_from_verification(
+            findings,
+            verified.results,
+            found_by=FOUND_BY_STATIC,
+        )
         self._trace(
             "grounding_finished",
             success=True,
@@ -1074,17 +1144,18 @@ class CodeAnalysisAgent(BaseAgent):
             grounded=len(verified.grounded),
             rejected=len(verified.rejected),
             source="static",
+            annotate_only=True,
         )
 
         if verified.rejected:
             note = (
-                f"{len(verified.rejected)} static finding(s) failed grounding; "
-                f"the source may have changed mid-run."
+                f"{len(verified.rejected)} static finding(s) annotated as "
+                f"ungrounded; the source may have changed mid-run."
             )
             logger.warning(note)
             report.notes.append(note)
 
-        return verified.grounded
+        return annotated
 
     def _gather(
         self,
@@ -1394,6 +1465,8 @@ class CodeAnalysisAgent(BaseAgent):
             return []
 
         if not getattr(pipeline.checker, "enabled", False):
+            for finding in proposed:
+                set_found_by(finding, FOUND_BY_LLM)
             report.llm_grounded_count = len(proposed)
             logger.info(
                 "Model findings: %d proposed (grounding disabled).",
@@ -1405,7 +1478,17 @@ class CodeAnalysisAgent(BaseAgent):
         ground_started = time.perf_counter()
         verified = pipeline.checker.verify_reports(proposed)
         report.rejected.extend(r for r in verified.results if not r.grounded)
-        report.llm_grounded_count = len(verified.grounded)
+        annotated = annotate_batch_from_verification(
+            proposed,
+            verified.results,
+            found_by=FOUND_BY_LLM,
+        )
+        report.llm_grounded_count = sum(
+            1
+            for finding in annotated
+            if str(finding.metadata.get(META_GROUNDING_STATUS) or "")
+            == GROUNDING_GROUNDED
+        )
         self._trace(
             "grounding_finished",
             success=True,
@@ -1413,12 +1496,13 @@ class CodeAnalysisAgent(BaseAgent):
             grounded=len(verified.grounded),
             rejected=len(verified.rejected),
             source="llm",
+            annotate_only=True,
         )
 
         for result in verified.results:
             if not result.grounded:
                 logger.warning(
-                    "Discarded ungrounded model finding at %s:%d-%d (%s): %s",
+                    "Annotated ungrounded model finding at %s:%d-%d (%s): %s",
                     result.file_path,
                     result.line_start,
                     result.line_end,
@@ -1429,16 +1513,17 @@ class CodeAnalysisAgent(BaseAgent):
         if verified.rejected:
             note = (
                 f"{len(verified.rejected)} of {len(proposed)} model finding(s) "
-                f"were discarded as ungrounded."
+                f"annotated as ungrounded (still included in findings)."
             )
             report.notes.append(note)
 
         logger.info(
-            "Model findings: %d proposed, %d grounded.",
+            "Model findings: %d proposed, %d grounded, %d kept.",
             len(proposed),
-            len(verified.grounded),
+            report.llm_grounded_count,
+            len(annotated),
         )
-        return verified.grounded
+        return annotated
 
     # ------------------------------------------------------------------
     # Prompting
@@ -1481,7 +1566,7 @@ class CodeAnalysisAgent(BaseAgent):
             if len(static_findings) > len(shown):
                 lines.append(f"- ... and {len(static_findings) - len(shown)} more")
             sections.append(
-                "KNOWN STATIC FINDINGS (already confirmed -- do not repeat these)\n"
+                "KNOWN STATIC FINDINGS (from Static Analysis; for context only)\n"
                 + "\n".join(lines)
             )
 
@@ -1494,8 +1579,8 @@ class CodeAnalysisAgent(BaseAgent):
             )
 
         sections.append(
-            "Answer the question, and report any bug you can see in the code "
-            "above that is not already listed. Reply with one JSON object."
+            "Answer the question, and report every genuine bug you can "
+            "verify in the code above. Reply with one JSON object."
         )
         return "\n\n".join(sections)
 
@@ -1847,12 +1932,11 @@ class CodeAnalysisAgent(BaseAgent):
         llm_findings: Sequence[BugReport],
     ) -> Tuple[List[BugReport], int]:
         """
-        Combine both halves into one ordered, deduplicated set.
+        Combine both halves into one ordered, attributed set.
 
         Static findings are seeded first so that when the two halves
-        describe the same defect, the deterministic account survives.
-        Its category and line range come from the AST rather than from
-        a model's reading of it.
+        describe the same defect, the deterministic account survives as
+        the base finding and attribution becomes ``Static + LLM``.
 
         Two findings are the same defect when they cite the same file
         and the same bug type over overlapping lines. Requiring the bug
@@ -1860,17 +1944,22 @@ class CodeAnalysisAgent(BaseAgent):
         line from being swallowed.
 
         Args:
-            static_findings: Grounded findings from the static pass.
-            llm_findings: Grounded findings from the model.
+            static_findings: Annotated findings from the static pass.
+            llm_findings: Annotated findings from the model.
 
         Returns:
-            The merged findings and how many were dropped as
-            duplicates.
+            The merged findings and how many were folded as duplicates.
         """
         kept: List[BugReport] = []
         removed = 0
 
         for finding in list(static_findings) + list(llm_findings):
+            if not str((finding.metadata or {}).get("found_by") or "").strip():
+                if finding.detection_method == "static":
+                    set_found_by(finding, FOUND_BY_STATIC)
+                elif finding.detection_method == "llm":
+                    set_found_by(finding, FOUND_BY_LLM)
+
             duplicate = next(
                 (other for other in kept if self._same_defect(other, finding)), None
             )
@@ -1878,13 +1967,13 @@ class CodeAnalysisAgent(BaseAgent):
                 kept.append(finding)
                 continue
 
+            merge_attribution(duplicate, finding)
             removed += 1
             logger.debug(
-                "Merged duplicate %s at %s:%d into the %s finding.",
+                "Merged duplicate %s at %s:%d into Static + LLM attribution.",
                 finding.bug_type,
                 finding.file_path,
                 finding.line_start,
-                duplicate.detection_method,
             )
 
         kept.sort(
@@ -1896,6 +1985,54 @@ class CodeAnalysisAgent(BaseAgent):
             )
         )
         return kept, removed
+
+    def _annotate_documentation(
+        self,
+        findings: Sequence[BugReport],
+        workspace_root: str,
+    ) -> List[BugReport]:
+        """
+        Mark findings already called out in docstrings/comments.
+
+        Documentation status is an annotation only — findings are never
+        removed because they are already documented.
+        """
+        annotated: List[BugReport] = []
+        source_cache: Dict[str, str] = {}
+
+        for finding in findings:
+            relative = (finding.file_path or "").strip()
+            if relative and relative not in source_cache:
+                source_cache[relative] = self._read_source_file(
+                    workspace_root, relative
+                )
+            source = source_cache.get(relative, "")
+            documented = bool(source) and is_already_documented_in_source(
+                source,
+                description=finding.description,
+                bug_type=finding.bug_type,
+            )
+            set_already_documented(finding, documented)
+            annotated.append(finding)
+        return annotated
+
+    @staticmethod
+    def _read_source_file(workspace_root: str, file_path: str) -> str:
+        """Best-effort whole-file read for documentation annotations."""
+        root = (workspace_root or "").strip()
+        relative = (file_path or "").strip()
+        if not root or not relative:
+            return ""
+        candidate = (
+            relative
+            if os.path.isabs(relative)
+            else os.path.normpath(os.path.join(root, relative))
+        )
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            return ""
 
     @staticmethod
     def _same_defect(left: BugReport, right: BugReport) -> bool:
@@ -1967,6 +2104,9 @@ class CodeAnalysisAgent(BaseAgent):
                 config=self.config,
                 filesystem=filesystem,
                 tracer=self.tracer,
+                # Analysis always runs grounding as an annotation layer.
+                # Other agents still honour Config.grounding_enabled.
+                enabled=True,
             ),
             indexer=self._indexer
             or Indexer(

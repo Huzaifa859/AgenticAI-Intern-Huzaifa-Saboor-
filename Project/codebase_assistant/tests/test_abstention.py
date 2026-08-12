@@ -17,6 +17,7 @@ import pytest
 from codebase_assistant.agents.code_analysis_agent import CodeAnalysisAgent
 from codebase_assistant.agents.documentation_agent import DocumentationAgent
 from codebase_assistant.agents.testing_agent import TestingAgent
+from codebase_assistant.config import Config
 from codebase_assistant.schemas.schemas import (
     AgentRequest,
     AgentType,
@@ -93,8 +94,8 @@ def test_analysis_abstains_when_retrieval_returns_nothing(tmp_path: Path) -> Non
     assert report.context == []
 
 
-def test_analysis_keeps_findings_when_grounding_disabled(tmp_path: Path) -> None:
-    """With grounding disabled, LLM findings are kept even without evidence match."""
+def test_analysis_keeps_findings_when_grounding_annotates_mismatch(tmp_path: Path) -> None:
+    """Ungrounded LLM findings remain visible when grounding is enabled."""
     (tmp_path / "math_utils.py").write_text(
         "def add(a, b):\n    return a + b\n",
         encoding="utf-8",
@@ -124,7 +125,11 @@ def test_analysis_keeps_findings_when_grounding_disabled(tmp_path: Path) -> None
         metadata={"file_path": "math_utils.py"},
     )
     retriever = _mock_retriever([chunk])
-    agent = CodeAnalysisAgent(model_client=client, retriever=retriever)
+    agent = CodeAnalysisAgent(
+        model_client=client,
+        retriever=retriever,
+        config=Config(grounding_enabled=True, output_cache_enabled=False),
+    )
 
     with patch.object(agent, "_sync_index", return_value=None):
         report = agent.analyze_repository(str(tmp_path), use_rag=True)
@@ -132,8 +137,8 @@ def test_analysis_keeps_findings_when_grounding_disabled(tmp_path: Path) -> None
     assert report.abstention is None
     assert len(report.findings) >= 1
     assert report.llm_proposed_count >= 1
-    assert report.llm_grounded_count >= 1
-    assert report.rejected == []
+    mismatched = next(f for f in report.findings if f.bug_type == "undefined_variable")
+    assert mismatched.metadata.get("grounding_status") == "ungrounded"
 
 
 def test_parse_response_keeps_finding_without_model_evidence(tmp_path: Path) -> None:
