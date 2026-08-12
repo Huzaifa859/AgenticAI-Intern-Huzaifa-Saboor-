@@ -198,7 +198,7 @@ class Config:
     claude_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     model_name: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     preferred_provider: str = "openrouter"
     fallback_provider: str = "ollama"
