@@ -12,15 +12,13 @@ temporary directory and executed via pytest's Python API; pass/fail
 counts are appended to TestingResult.summary without changing schemas
 or mutating generated_tests.
 
-When the first pytest run reports failures or errors, the agent performs
-exactly one repair iteration: it sends the original tests, pytest
-output, and repository context back to the model, then reruns pytest
-on the repaired sources.
+Failing pytest runs are reported as-is: the agent does not call the
+model again to repair or regenerate tests.
 
 Test generation is symbol-scoped: the agent scans the repository with
 AST, then prompts once per public function or public class (with its
-public methods) before merging modules and entering the execution /
-repair pipeline.
+public methods) before merging modules and entering the execution
+pipeline.
 
 After pytest execution, the agent measures real line coverage with
 pytest-cov (JSON report preferred) and stores that value in
@@ -31,7 +29,7 @@ Before pytest runs, generated modules are AST-parsed and their imports
 are validated against the repository inventory, the Python stdlib, and
 installed third-party packages. Unused invalid imports are removed;
 modules with used invalid imports are skipped for the current run so
-remaining tests can still execute (or the existing repair loop can run).
+remaining tests can still execute.
 """
 
 from __future__ import annotations
@@ -85,9 +83,6 @@ _MAX_SOURCE_FILES = 6
 #: Cap on characters taken from each source file (fallback when no RAG).
 _MAX_FILE_CHARS = 2000
 
-#: Shorter file excerpts when retrieved chunks are already present.
-_MAX_FILE_CHARS_WITH_RETRIEVAL = 800
-
 #: Cap on retrieved chunks rendered into the prompt.
 _MAX_CONTEXT_CHUNKS = 5
 
@@ -96,12 +91,6 @@ _MAX_CHUNK_CHARS = 900
 
 #: Soft ceiling on the assembled user-prompt size (chars).
 _MAX_PROMPT_CHARS = 12_000
-
-#: Cap on pytest failure text embedded in a repair prompt.
-_MAX_PYTEST_OUTPUT_CHARS = 4_000
-
-#: Cap on generated-test source embedded in a repair prompt.
-_MAX_REPAIR_TEST_CHARS = 6_000
 
 #: Generation ceiling for test-generation calls. Raised from 1536 so
 #: JSON output for classes with several methods is less likely to be
@@ -221,39 +210,6 @@ Return ONE JSON object only - no markdown fences, no commentary:
 included) that a developer could save and run. \
 `coverage_estimate` is a float in [0.0, 1.0] for the visible public \
 surface you actually wrote tests for - be conservative.
-"""
-
-_REPAIR_SYSTEM_PROMPT = """\
-You are a senior Python test engineer repairing failing pytest modules.
-
-You receive:
-1) the originally generated pytest sources,
-2) the pytest failure / error output (primary debugging signal),
-3) repository context for the code under test.
-
-Hard rules (follow exactly):
-1. Fix ONLY the failing tests. Preserve every passing test unchanged \
-unless a minimal shared-import fix is required for the suite to load.
-2. Do not invent modules, functions, classes, constants, or exceptions \
-that are absent from the repository context.
-3. Use the pytest error output as the primary signal: fix assertions, \
-imports, fixtures, and call signatures that the traceback identifies.
-4. Return complete, valid pytest module source (imports included). No \
-pseudo-code, no placeholders, no markdown fences around the JSON.
-5. Prefer the smallest change that makes the suite collect and pass.
-6. If a failure cannot be fixed from the evidence, keep that test but \
-adjust it to match observable behavior in the repository context — \
-never invent APIs.
-
-Return ONE JSON object only:
-
-{
-  "summary": "What was repaired and why.",
-  "generated_tests": {
-    "test_module_name.py": "complete repaired pytest module source"
-  },
-  "coverage_estimate": 0.0
-}
 """
 
 _WRITING_INSTRUCTIONS = """\
@@ -688,7 +644,7 @@ class TestingAgent(BaseAgent):
         Run the testing pipeline for one request.
 
         Stages: index → AST inventory/symbol scan → per-symbol generation →
-        merge → import validation → execute pytest → optional one-shot repair.
+        merge → import validation → execute pytest → report coverage.
         """
         empty = self._empty_result()
 
@@ -789,9 +745,6 @@ class TestingAgent(BaseAgent):
 
         selected = symbols[:_MAX_SYMBOLS_TO_TEST]
         partial_results: List[TestingResult] = []
-        repair_chunks: List[RetrievedChunk] = []
-        repair_excerpts: List[str] = []
-        seen_excerpt_paths: Set[str] = set()
 
         # Run per-symbol LLM calls concurrently. Each call is fully independent
         # (separate prompt, no shared mutable state between symbols).
@@ -839,25 +792,7 @@ class TestingAgent(BaseAgent):
                             duration_ms=(time.perf_counter() - t0) * 1000.0,
                             cache_hit=True,
                         )
-                        module_excerpt = None
-                        try:
-                            if filesystem.file_exists(symbol.module_path):
-                                module_text = filesystem.read_file(symbol.module_path)
-                                module_excerpt = (
-                                    symbol.module_path,
-                                    self._format_file_excerpt(
-                                        symbol.module_path,
-                                        module_text,
-                                        _MAX_FILE_CHARS_WITH_RETRIEVAL,
-                                    ),
-                                )
-                        except Exception as exc:
-                            logger.warning(
-                                "Could not read module %s for repair context: %s",
-                                symbol.module_path,
-                                exc,
-                            )
-                        return normalized, [], module_excerpt
+                        return normalized
                     except Exception as exc:
                         logger.warning(
                             "Discarding invalid cached test output for %s: %s",
@@ -876,26 +811,6 @@ class TestingAgent(BaseAgent):
                 if part
             )
             chunks = self._retrieve_context(query, symbol.module_path)
-
-            # Collect repair excerpt for this module (thread-local, returned).
-            module_excerpt = None
-            try:
-                if filesystem.file_exists(symbol.module_path):
-                    module_text = filesystem.read_file(symbol.module_path)
-                    module_excerpt = (
-                        symbol.module_path,
-                        self._format_file_excerpt(
-                            symbol.module_path,
-                            module_text,
-                            _MAX_FILE_CHARS_WITH_RETRIEVAL,
-                        ),
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Could not read module %s for repair context: %s",
-                    symbol.module_path,
-                    exc,
-                )
 
             excerpt = self._format_file_excerpt(
                 symbol.module_path,
@@ -944,7 +859,7 @@ class TestingAgent(BaseAgent):
                     error=str(exc),
                     duration_ms=(time.perf_counter() - t0) * 1000.0,
                 )
-                return None, chunks, module_excerpt
+                return None
 
             self._trace(
                 "model_response",
@@ -1021,19 +936,12 @@ class TestingAgent(BaseAgent):
                 files=len(normalized.generated_tests),
                 duration_ms=(time.perf_counter() - t0) * 1000.0,
             )
-            return normalized, chunks, module_excerpt
+            return normalized
 
         with ThreadPoolExecutor(max_workers=_MAX_TEST_WORKERS) as pool:
             futures = [pool.submit(_run_one_symbol, sym) for sym in selected]
             for future in as_completed(futures):
-                normalized, sym_chunks, module_excerpt = future.result()
-                if sym_chunks:
-                    repair_chunks.extend(sym_chunks)
-                if module_excerpt is not None:
-                    path, text = module_excerpt
-                    if path not in seen_excerpt_paths:
-                        repair_excerpts.append(text)
-                        seen_excerpt_paths.add(path)
+                normalized = future.result()
                 if normalized is not None and normalized.generated_tests:
                     partial_results.append(normalized)
 
@@ -1072,9 +980,6 @@ class TestingAgent(BaseAgent):
             result.coverage_estimate,
         )
 
-        chunks = self._dedupe_chunks(repair_chunks)[:_MAX_CONTEXT_CHUNKS]
-        source_excerpts = repair_excerpts[:_MAX_SOURCE_FILES]
-
         if result.generated_tests:
             result, import_report = self._apply_import_validation(
                 workspace=workspace,
@@ -1086,7 +991,7 @@ class TestingAgent(BaseAgent):
                 import_report.executable_tests or result.generated_tests,
                 target_path=target_path,
             )
-            # Used-invalid imports with no executable suite should enter repair.
+            # Used-invalid imports with no executable suite: surface in summary.
             if (
                 import_report.rejected_files
                 and not import_report.executable_tests
@@ -1130,20 +1035,7 @@ class TestingAgent(BaseAgent):
                 )
 
             result = self._apply_execution_summary(result, first_outcome.summary)
-
-            if first_outcome.needs_repair:
-                result = self._repair_failing_tests(
-                    workspace=workspace,
-                    instruction=instruction,
-                    target_path=target_path,
-                    result=result,
-                    first_outcome=first_outcome,
-                    chunks=chunks,
-                    source_excerpts=source_excerpts,
-                    inventory=inventory,
-                )
-            else:
-                result = self._apply_coverage_measurement(result, first_outcome)
+            result = self._apply_coverage_measurement(result, first_outcome)
 
         self._trace(
             "testing_finished",
@@ -1268,116 +1160,6 @@ class TestingAgent(BaseAgent):
             )
         finally:
             self._cleanup_temp_test_dir(temp_dir)
-
-    def _repair_failing_tests(
-        self,
-        *,
-        workspace: str,
-        instruction: str,
-        target_path: str,
-        result: TestingResult,
-        first_outcome: _ExecutionOutcome,
-        chunks: Sequence[RetrievedChunk],
-        source_excerpts: Sequence[str],
-        inventory: Optional[Sequence[str]] = None,
-    ) -> TestingResult:
-        """
-        Perform exactly one repair iteration after a failing pytest run.
-
-        On repair-generation failure, preserves the original generated
-        tests and the first execution summary. On a successful repair
-        parse, replaces ``generated_tests`` with the repaired sources and
-        appends the second pytest summary (even if it still fails).
-        """
-        original_tests = dict(result.generated_tests)
-        self._trace(
-            "testing_repair_started",
-            failed=first_outcome.failed,
-            errors=first_outcome.errors,
-            files=len(original_tests),
-        )
-
-        repair_prompt = self._build_repair_prompt(
-            instruction=instruction,
-            target_path=target_path,
-            original_tests=original_tests,
-            pytest_output=first_outcome.output,
-            first_summary=first_outcome.summary,
-            chunks=chunks,
-            source_excerpts=source_excerpts,
-        )
-
-        model_started = time.perf_counter()
-        try:
-            response = self._generate_with_stream(
-                system_prompt=_REPAIR_SYSTEM_PROMPT,
-                user_prompt=repair_prompt,
-                stream_label="Repairing failing tests",
-            )
-        except Exception as exc:
-            logger.warning("OpenRouter testing repair call failed: %s", exc)
-            self._trace(
-                "testing_repair_failed",
-                success=False,
-                error=str(exc),
-                duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            )
-            return self._apply_coverage_measurement(result, first_outcome)
-
-        repaired = self._parse_response(response.content)
-        if not repaired.generated_tests:
-            self._trace(
-                "testing_repair_failed",
-                success=False,
-                error="repair response produced no generated_tests",
-                duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            )
-            return self._apply_coverage_measurement(result, first_outcome)
-
-        self._trace(
-            "testing_repair_generated",
-            success=True,
-            duration_ms=(time.perf_counter() - model_started) * 1000.0,
-            files=len(repaired.generated_tests),
-            content_chars=len(response.content or ""),
-        )
-
-        repaired, repair_imports = self._apply_import_validation(
-            workspace=workspace,
-            result=repaired,
-            inventory=inventory or (),
-        )
-        second_outcome = self._run_generated_tests(
-            workspace,
-            repair_imports.executable_tests or repaired.generated_tests,
-            target_path=target_path,
-        )
-        coverage = (
-            repaired.coverage_estimate
-            if repaired.coverage_estimate is not None
-            else result.coverage_estimate
-        )
-        combined = self._merge_summaries(
-            result.summary,
-            "Repair: attempted one fix iteration.",
-            second_outcome.summary,
-        )
-        finished = TestingResult(
-            summary=combined,
-            generated_tests=repaired.generated_tests,
-            coverage_estimate=coverage,
-            abstention=None,
-        )
-        finished = self._apply_coverage_measurement(finished, second_outcome)
-        self._trace(
-            "testing_repair_finished",
-            success=not second_outcome.needs_repair,
-            passed=second_outcome.passed,
-            failed=second_outcome.failed,
-            errors=second_outcome.errors,
-            repaired_files=len(repaired.generated_tests),
-        )
-        return finished
 
     @staticmethod
     def _apply_execution_summary(
@@ -2125,7 +1907,7 @@ class TestingAgent(BaseAgent):
 
         Unused invalid imports are removed. Modules that still reference
         invalid imports are excluded from the executable set. Never
-        abstains; callers continue with remaining tests or repair.
+        abstains; callers continue with remaining executable tests.
         """
         generated = dict(result.generated_tests or {})
         if not generated:
@@ -3426,96 +3208,6 @@ class TestingAgent(BaseAgent):
             "Return only the TestingResult JSON object. "
             "`generated_tests` values must be complete runnable pytest "
             "modules. Do not wrap the JSON in markdown fences."
-        )
-        return self._truncate_prompt("\n\n".join(sections))
-
-    def _build_repair_prompt(
-        self,
-        *,
-        instruction: str,
-        target_path: str,
-        original_tests: Dict[str, str],
-        pytest_output: str,
-        first_summary: str,
-        chunks: Sequence[RetrievedChunk],
-        source_excerpts: Sequence[str],
-    ) -> str:
-        """
-        Build the user prompt for a single test-repair model call.
-
-        The pytest failure output is the primary debugging signal; the
-        original sources and repository context ground the fix.
-        """
-        packed_chunks = self._dedupe_chunks(chunks)[:_MAX_CONTEXT_CHUNKS]
-        sections = [
-            "TESTING REPAIR MODE\nFix failing pytest modules only.",
-            (
-                "REPAIR RULES\n"
-                "- Fix only failing tests; preserve passing tests.\n"
-                "- Use PYTEST FAILURE OUTPUT as the primary debugging signal.\n"
-                "- Do not invent nonexistent modules or APIs.\n"
-                "- Return only valid pytest source inside TestingResult JSON."
-            ),
-            f"REQUEST\n{instruction}",
-            f"TARGET\n{target_path}",
-            f"FIRST EXECUTION SUMMARY\n{first_summary or '(none)'}",
-        ]
-
-        failure_text = (pytest_output or "").strip() or "(no pytest output captured)"
-        if len(failure_text) > _MAX_PYTEST_OUTPUT_CHARS:
-            failure_text = (
-                failure_text[:_MAX_PYTEST_OUTPUT_CHARS]
-                + "\n...[truncated pytest output]"
-            )
-        sections.append(f"PYTEST FAILURE OUTPUT\n{failure_text}")
-
-        rendered_tests: List[str] = []
-        budget = _MAX_REPAIR_TEST_CHARS
-        for name, source in original_tests.items():
-            body = source if source is not None else ""
-            if len(body) > budget:
-                body = body[:budget] + "\n...[truncated test source]"
-                budget = 0
-            else:
-                budget = max(0, budget - len(body))
-            rendered_tests.append(f"### {name}\n{body}")
-            if budget == 0:
-                break
-        sections.append(
-            "ORIGINAL GENERATED TESTS\n" + "\n\n".join(rendered_tests)
-        )
-
-        if packed_chunks:
-            rendered = []
-            for index, chunk in enumerate(packed_chunks, start=1):
-                source = getattr(chunk, "source", None) or (
-                    chunk.metadata.get("file_path", "unknown")
-                    if chunk.metadata
-                    else "unknown"
-                )
-                body = chunk.content or ""
-                if len(body) > _MAX_CHUNK_CHARS:
-                    body = body[:_MAX_CHUNK_CHARS] + "\n..."
-                rendered.append(
-                    f"[{index}] source={source} score={float(chunk.score):.3f}\n{body}"
-                )
-            sections.append(
-                "RETRIEVED CONTEXT\n" + "\n\n".join(rendered)
-            )
-        else:
-            sections.append("RETRIEVED CONTEXT\n(none)")
-
-        if source_excerpts:
-            sections.append(
-                "REPOSITORY CONTENTS\n" + "\n\n".join(source_excerpts)
-            )
-        else:
-            sections.append("REPOSITORY CONTENTS\n(none)")
-
-        sections.append(
-            "OUTPUT CONTRACT\n"
-            "Return only the TestingResult JSON object with repaired "
-            "`generated_tests` values. Do not wrap the JSON in markdown fences."
         )
         return self._truncate_prompt("\n\n".join(sections))
 

@@ -648,7 +648,7 @@ def test_pipeline_appends_execution_and_keeps_source(
 
 
 # ---------------------------------------------------------------------------
-# Repair loop (exactly one iteration)
+# Pytest failures are reported without an automatic repair LLM call
 # ---------------------------------------------------------------------------
 
 _FAILING_TEST_SOURCE = (
@@ -657,153 +657,46 @@ _FAILING_TEST_SOURCE = (
     "    assert add(1, 2) == 999\n"
 )
 
-_FIXED_TEST_SOURCE = (
-    "from math_utils import add\n\n"
-    "def test_add_wrong_expectation():\n"
-    "    assert add(1, 2) == 3\n"
-)
-
 _FAILING_PAYLOAD = {
     "summary": "Initial tests with a wrong assertion.",
     "generated_tests": {"test_math_utils.py": _FAILING_TEST_SOURCE},
     "coverage_estimate": 0.4,
 }
 
-_REPAIRED_PAYLOAD = {
-    "summary": "Fixed the failing assertion to match add().",
-    "generated_tests": {"test_math_utils.py": _FIXED_TEST_SOURCE},
-    "coverage_estimate": 0.5,
-}
-
-_STILL_FAILING_REPAIR_PAYLOAD = {
-    "summary": "Attempted repair but assertion is still wrong.",
-    "generated_tests": {
-        "test_math_utils.py": (
-            "from math_utils import add\n\n"
-            "def test_add_wrong_expectation():\n"
-            "    assert add(1, 2) == 42\n"
-        )
-    },
-    "coverage_estimate": 0.45,
-}
-
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_succeeds_after_initial_failure(
+def test_pytest_failures_keep_original_tests_without_repair_llm(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Failing first run should trigger one repair that can make tests pass."""
+    """Failing pytest must report results and never call a repair model."""
     from codebase_assistant.tracing.tracer import Tracer
 
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(content=json.dumps(_REPAIRED_PAYLOAD), usage={}, raw={}),
-    ]
+    client = _mock_client(content=json.dumps(_FAILING_PAYLOAD))
     agent = _agent(client, _mock_retriever())
-    agent.tracer = Tracer(run_id="repair-ok")
+    agent.tracer = Tracer(run_id="no-repair")
 
     response = agent.handle(_request(sample_repo))
 
     assert response.success is True
-    assert client.generate.call_count == 2
-    assert (
-        response.output.generated_tests["test_math_utils.py"] == _FIXED_TEST_SOURCE
-    )
-    assert "Repair: attempted one fix iteration." in response.output.summary
-    assert response.output.summary.count("Execution:") == 2
-    assert "1 passed" in response.output.summary
-    # Repair call uses the repair system prompt.
-    repair_messages = client.generate.call_args_list[1].args[0]
-    assert "failing" in repair_messages[0].content.lower()
-    assert "PYTEST FAILURE OUTPUT" in repair_messages[1].content
-    names = agent.tracer.event_names()
-    assert "testing_repair_started" in names
-    assert "testing_repair_generated" in names
-    assert "testing_repair_finished" in names
-
-
-@patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_still_fails_returns_repaired_tests(
-    _mock_index: Any, sample_repo: Path
-) -> None:
-    """If the repaired suite still fails, return repaired sources + 2nd run."""
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(
-            content=json.dumps(_STILL_FAILING_REPAIR_PAYLOAD), usage={}, raw={}
-        ),
-    ]
-    agent = _agent(client, _mock_retriever())
-
-    response = agent.handle(_request(sample_repo))
-
-    assert response.success is True
-    assert client.generate.call_count == 2
-    assert (
-        response.output.generated_tests["test_math_utils.py"]
-        == _STILL_FAILING_REPAIR_PAYLOAD["generated_tests"]["test_math_utils.py"]
-    )
-    assert "Repair: attempted one fix iteration." in response.output.summary
-    assert response.output.summary.count("Execution:") == 2
-    assert "failed" in response.output.summary
-
-
-@patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_generation_failure_keeps_original_tests(
-    _mock_index: Any, sample_repo: Path
-) -> None:
-    """Repair LLM failure must preserve the original generated tests."""
-    from codebase_assistant.tracing.tracer import Tracer
-
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        RuntimeError("OpenRouter unavailable"),
-    ]
-    agent = _agent(client, _mock_retriever())
-    agent.tracer = Tracer(run_id="repair-fail")
-
-    response = agent.handle(_request(sample_repo))
-
-    assert response.success is True
-    assert client.generate.call_count == 2
+    client.generate.assert_called_once()
     assert (
         response.output.generated_tests["test_math_utils.py"] == _FAILING_TEST_SOURCE
     )
     assert "Repair: attempted one fix iteration." not in response.output.summary
     assert response.output.summary.count("Execution:") == 1
     assert "1 failed" in response.output.summary
-    assert "testing_repair_failed" in agent.tracer.event_names()
+    names = agent.tracer.event_names()
+    assert "testing_repair_started" not in names
+    assert "testing_repair_generated" not in names
+    assert "testing_repair_finished" not in names
+    assert "testing_repair_failed" not in names
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_invalid_output_keeps_original_tests(
+def test_passing_tests_still_single_generate(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Invalid repair JSON must not replace the original generated tests."""
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(content="not-json {{{", usage={}, raw={}),
-    ]
-    agent = _agent(client, _mock_retriever())
-
-    response = agent.handle(_request(sample_repo))
-
-    assert response.success is True
-    assert (
-        response.output.generated_tests["test_math_utils.py"] == _FAILING_TEST_SOURCE
-    )
-    assert response.output.summary.count("Execution:") == 1
-
-
-@patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_skipped_when_tests_pass_initially(
-    _mock_index: Any, sample_repo: Path
-) -> None:
-    """Passing first pytest run must not call the repair model."""
+    """Passing pytest run must use only the generation model call."""
     client = _mock_client(content=json.dumps(VALID_TEST_PAYLOAD))
     agent = _agent(client, _mock_retriever())
 
@@ -813,60 +706,7 @@ def test_repair_skipped_when_tests_pass_initially(
     client.generate.assert_called_once()
     assert "Repair: attempted one fix iteration." not in response.output.summary
     assert response.output.summary.count("Execution:") == 1
-
-
-@patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_only_one_repair_attempt_occurs(
-    _mock_index: Any, sample_repo: Path
-) -> None:
-    """A still-failing repair must not trigger a second repair loop."""
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(
-            content=json.dumps(_STILL_FAILING_REPAIR_PAYLOAD), usage={}, raw={}
-        ),
-        ModelResponse(content=json.dumps(_REPAIRED_PAYLOAD), usage={}, raw={}),
-    ]
-    agent = _agent(client, _mock_retriever())
-
-    with patch.object(
-        agent,
-        "_repair_failing_tests",
-        wraps=agent._repair_failing_tests,
-    ) as repair_spy:
-        response = agent.handle(_request(sample_repo))
-
-    assert response.success is True
-    assert client.generate.call_count == 2
-    assert repair_spy.call_count == 1
-
-
-@patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_has_no_infinite_loop(
-    _mock_index: Any, sample_repo: Path
-) -> None:
-    """Even if every execution fails, generate is called at most twice."""
-    always_fail = {
-        "summary": "Always wrong.",
-        "generated_tests": {"test_math_utils.py": _FAILING_TEST_SOURCE},
-        "coverage_estimate": 0.1,
-    }
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(always_fail), usage={}, raw={}),
-        ModelResponse(content=json.dumps(always_fail), usage={}, raw={}),
-    ] + [
-        ModelResponse(content=json.dumps(always_fail), usage={}, raw={})
-        for _ in range(5)
-    ]
-    agent = _agent(client, _mock_retriever())
-
-    response = agent.handle(_request(sample_repo))
-
-    assert response.success is True
-    assert client.generate.call_count == 2
-    assert response.output.summary.count("Execution:") == 2
+    assert "passed" in response.output.summary
 
 
 # ---------------------------------------------------------------------------
@@ -1159,23 +999,22 @@ def test_pipeline_abstains_when_no_public_symbols(
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_existing_repair_loop_still_works_with_ast_generation(
+def test_ast_generation_preserves_failing_tests_without_repair(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Symbol-scoped generation still feeds the one-shot repair loop."""
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(content=json.dumps(_REPAIRED_PAYLOAD), usage={}, raw={}),
-    ]
+    """Symbol-scoped generation reports pytest failures without a repair call."""
+    client = _mock_client(content=json.dumps(_FAILING_PAYLOAD))
     agent = _agent(client, _mock_retriever())
 
     response = agent.handle(_request(sample_repo))
 
     assert response.success is True
-    assert client.generate.call_count == 2
-    assert "Repair: attempted one fix iteration." in response.output.summary
-    assert response.output.generated_tests["test_math_utils.py"] == _FIXED_TEST_SOURCE
+    client.generate.assert_called_once()
+    assert "Repair: attempted one fix iteration." not in response.output.summary
+    assert (
+        response.output.generated_tests["test_math_utils.py"] == _FAILING_TEST_SOURCE
+    )
+    assert "1 failed" in response.output.summary
 
 
 # ---------------------------------------------------------------------------
@@ -1339,24 +1178,23 @@ def test_coverage_stored_in_testing_result(
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_repair_loop_still_works_with_coverage(
+def test_coverage_still_measured_when_tests_fail(
     _mock_index: Any, sample_repo: Path
 ) -> None:
-    """Coverage measurement must not break the one-shot repair loop."""
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(_FAILING_PAYLOAD), usage={}, raw={}),
-        ModelResponse(content=json.dumps(_REPAIRED_PAYLOAD), usage={}, raw={}),
-    ]
+    """Coverage measurement must still run when pytest fails (no repair)."""
+    client = _mock_client(content=json.dumps(_FAILING_PAYLOAD))
     agent = _agent(client, _mock_retriever())
 
     response = agent.handle(_request(sample_repo))
 
     assert response.success is True
-    assert client.generate.call_count == 2
-    assert "Repair: attempted one fix iteration." in response.output.summary
+    client.generate.assert_called_once()
+    assert "Repair: attempted one fix iteration." not in response.output.summary
     assert "Coverage:" in response.output.summary
-    assert response.output.generated_tests["test_math_utils.py"] == _FIXED_TEST_SOURCE
+    assert (
+        response.output.generated_tests["test_math_utils.py"] == _FAILING_TEST_SOURCE
+    )
+    assert "1 failed" in response.output.summary
 
 
 def test_parse_coverage_term_fallback() -> None:
@@ -1638,13 +1476,13 @@ def test_import_validation_pipeline_executes_remaining_tests(
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
-def test_import_validation_triggers_repair_when_all_used_invalid(
+def test_import_validation_does_not_trigger_repair_when_all_used_invalid(
     _mock_index: Any, tmp_path: Path
 ) -> None:
-    """Used invalid imports with no executable suite still enter repair."""
+    """Used invalid imports with no executable suite must not call repair LLM."""
     from codebase_assistant.tracing.tracer import Tracer
 
-    # Single public symbol so generation uses one LLM call before repair.
+    # Single public symbol so generation uses one LLM call.
     (tmp_path / "auth.py").write_text(
         "def login(user):\n"
         "    return user\n",
@@ -1661,24 +1499,9 @@ def test_import_validation_triggers_repair_when_all_used_invalid(
         },
         "coverage_estimate": 0.4,
     }
-    repaired = {
-        "summary": "Repaired auth tests.",
-        "generated_tests": {
-            "test_auth.py": (
-                "from auth import login\n\n"
-                "def test_login():\n"
-                "    assert login('a') == 'a'\n"
-            )
-        },
-        "coverage_estimate": 0.8,
-    }
-    client = _mock_client()
-    client.generate.side_effect = [
-        ModelResponse(content=json.dumps(bad), usage={}, raw={}),
-        ModelResponse(content=json.dumps(repaired), usage={}, raw={}),
-    ]
+    client = _mock_client(content=json.dumps(bad))
     agent = _agent(client, _mock_retriever())
-    agent.tracer = Tracer(run_id="imp-repair")
+    agent.tracer = Tracer(run_id="imp-no-repair")
 
     response = agent.handle(
         AgentRequest(
@@ -1693,10 +1516,10 @@ def test_import_validation_triggers_repair_when_all_used_invalid(
     )
 
     assert response.success is True
-    assert client.generate.call_count == 2
-    assert "Repair: attempted one fix iteration." in response.output.summary
-    assert "fake_function" not in response.output.generated_tests["test_auth.py"]
-    assert "login" in response.output.generated_tests["test_auth.py"]
+    client.generate.assert_called_once()
+    assert "Repair: attempted one fix iteration." not in response.output.summary
+    assert "fake_function" in response.output.generated_tests["test_auth.py"]
+    assert "testing_repair_started" not in agent.tracer.event_names()
 
 
 @patch.object(TestingAgent, "_ensure_index", autospec=True)
