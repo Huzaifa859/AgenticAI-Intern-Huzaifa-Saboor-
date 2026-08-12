@@ -602,8 +602,16 @@ class OpenRouterProvider(BaseProvider):
 
             content = "".join(pieces)
             if not content.strip():
-                raise ModelResponseError(
-                    "OpenRouter stream completed with empty assistant content."
+                # Treat empty HTTP-200 streams as a model-level failure so
+                # generate_stream() can try the next model in the chain.
+                # Do not retry the same model: empty content is not a
+                # transient transport blip.
+                raise _ModelUnavailable(
+                    ModelResponseError(
+                        "OpenRouter stream completed with empty assistant "
+                        "content."
+                    ),
+                    "empty content",
                 )
             logger.info(
                 "OpenRouter stream succeeded: model=%s content_chars=%d",

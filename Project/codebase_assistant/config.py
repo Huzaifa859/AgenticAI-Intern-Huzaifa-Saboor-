@@ -206,7 +206,7 @@ class Config:
     # Per-agent model routing: each agent uses a specialist free model
     # optimised for its specific task. Falls back to openrouter_model when
     # the env var is absent, keeping single-model setups unchanged.
-    analysis_model: str = "google/gemma-4-31b-it:free"
+    analysis_model: str = "google/gemma-4-26b-a4b-it:free"
     testing_model: str = "cohere/north-mini-code:free"
     documentation_model: str = "openai/gpt-oss-20b:free"
     # When True, DocumentationAgent keeps imperfect LLM text (invalid JSON

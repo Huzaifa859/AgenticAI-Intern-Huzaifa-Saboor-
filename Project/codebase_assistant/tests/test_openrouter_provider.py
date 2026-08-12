@@ -461,3 +461,129 @@ def test_generate_without_api_key_raises() -> None:
     provider = _provider(api_key="")
     with pytest.raises(ProviderUnavailableError):
         provider.generate(MESSAGES)
+
+
+def _sse_http_response(content_pieces: List[str]) -> MagicMock:
+    """Build a mock streaming Response whose iter_lines yields SSE data."""
+    import json
+
+    lines: List[str] = []
+    for piece in content_pieces:
+        event = {
+            "choices": [
+                {
+                    "delta": {"content": piece, "role": "assistant"},
+                    "finish_reason": None,
+                }
+            ]
+        }
+        lines.append("data: " + json.dumps(event))
+    lines.append(
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "", "role": "assistant"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+    )
+    lines.append("data: [DONE]")
+
+    response = MagicMock(spec=requests.Response)
+    response.status_code = 200
+    response.iter_lines.return_value = iter(lines)
+    response.close = MagicMock()
+    return response
+
+
+def _sse_empty_http_response() -> MagicMock:
+    """HTTP 200 stream with no usable assistant content."""
+    import json
+
+    lines = [
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "", "role": "assistant"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        ),
+        "data: [DONE]",
+    ]
+    response = MagicMock(spec=requests.Response)
+    response.status_code = 200
+    response.iter_lines.return_value = iter(lines)
+    response.close = MagicMock()
+    return response
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_generate_stream_success_returns_joined_content(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """A normal streamed response should join delta.content and succeed."""
+    mock_post.return_value = _sse_http_response(["Hello", " world"])
+    provider = _provider()
+    chunks: List[str] = []
+
+    result = provider.generate_stream(MESSAGES, on_chunk=chunks.append)
+
+    assert result.content == "Hello world"
+    assert result.raw["model_used"] == PRIMARY
+    assert result.raw["streamed"] is True
+    assert chunks == ["Hello", " world"]
+    mock_post.assert_called_once()
+    mock_sleep.assert_not_called()
+    assert mock_post.call_args.kwargs["json"]["stream"] is True
+    assert "response_format" not in mock_post.call_args.kwargs["json"]
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_generate_stream_empty_content_falls_back_to_next_model(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """An empty HTTP-200 stream should try the next model in the chain once."""
+    mock_post.side_effect = [
+        _sse_empty_http_response(),
+        _sse_http_response(["Answer from Gemma."]),
+    ]
+    provider = _provider()
+
+    result = provider.generate_stream(MESSAGES)
+
+    assert result.content == "Answer from Gemma."
+    assert result.raw["model_used"] == GEMMA
+    assert _models_called(mock_post) == [PRIMARY, GEMMA]
+    # Empty content must not burn same-model transport retries.
+    assert mock_post.call_count == 2
+    mock_sleep.assert_not_called()
+
+
+@patch("codebase_assistant.models.providers.openrouter_provider.time.sleep")
+@patch("codebase_assistant.models.providers.openrouter_provider.requests.post")
+def test_generate_stream_all_models_empty_raises_model_response_error(
+    mock_post: MagicMock, mock_sleep: MagicMock
+) -> None:
+    """If every model returns an empty stream, raise the final ModelResponseError."""
+    mock_post.side_effect = [
+        _sse_empty_http_response(),
+        _sse_empty_http_response(),
+    ]
+    provider = _provider()
+
+    with pytest.raises(ModelResponseError, match="empty assistant content"):
+        provider.generate_stream(MESSAGES)
+
+    assert _models_called(mock_post) == [PRIMARY, GEMMA]
+    assert mock_post.call_count == 2
+    mock_sleep.assert_not_called()
