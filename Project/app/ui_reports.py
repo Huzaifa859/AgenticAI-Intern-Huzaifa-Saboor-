@@ -326,6 +326,9 @@ def _follow_streaming_viewport(*, tick: int = 0) -> None:
     injects into the parent document (unlike ``components.html`` iframes). A
     single interval watches for ``#ca-doc-stream-end`` and scrolls while it
     exists so fragment remounts / delayed paints still follow the stream.
+
+    If the user scrolls away from the bottom, auto-follow pauses immediately
+    and only resumes when they return near the bottom themselves.
     """
     # tick changes force Streamlit to accept a new HTML payload periodically.
     st.html(
@@ -333,28 +336,75 @@ def _follow_streaming_viewport(*, tick: int = 0) -> None:
 <div id="ca-scroll-tick" data-tick="{int(tick)}" style="display:none" aria-hidden="true"></div>
 <script>
 (function () {{
-  function scrollRoot() {{
-    var end = document.getElementById("ca-doc-stream-end");
-    if (!end) return false;
-    var root =
+  var BOTTOM_PX = 96;
+
+  function getRoot() {{
+    return (
       document.querySelector('[data-testid="stMain"]') ||
       document.querySelector('[data-testid="stAppViewContainer"]') ||
-      document.querySelector("section.main");
+      document.querySelector("section.main")
+    );
+  }}
+
+  function nearBottom(root) {{
+    if (!root) return true;
+    return root.scrollHeight - root.scrollTop - root.clientHeight <= BOTTOM_PX;
+  }}
+
+  function bindScrollGuard(root) {{
+    if (!root || root.__caDocScrollBound) return;
+    root.__caDocScrollBound = true;
+    root.addEventListener(
+      "scroll",
+      function () {{
+        // Ignore the scroll we just caused programmatically.
+        if (window.__caDocProgrammaticScroll) return;
+        if (!document.getElementById("ca-doc-stream-end")) return;
+        // User left the bottom → stop forcing; back at bottom → resume.
+        window.__caDocFollowPaused = !nearBottom(root);
+      }},
+      {{ passive: true }}
+    );
+  }}
+
+  function scrollRoot() {{
+    var end = document.getElementById("ca-doc-stream-end");
+    if (!end) {{
+      window.__caDocStreamActive = false;
+      window.__caDocFollowPaused = false;
+      return false;
+    }}
+    // Fresh stream session: always start following again.
+    if (!window.__caDocStreamActive) {{
+      window.__caDocStreamActive = true;
+      window.__caDocFollowPaused = false;
+    }}
+    var root = getRoot();
     if (root) {{
+      bindScrollGuard(root);
+      if (window.__caDocFollowPaused) return true;
+      window.__caDocProgrammaticScroll = true;
       root.scrollTop = root.scrollHeight;
+      requestAnimationFrame(function () {{
+        window.__caDocProgrammaticScroll = false;
+      }});
       return true;
     }}
+    if (window.__caDocFollowPaused) return true;
     if (typeof end.scrollIntoView === "function") {{
       end.scrollIntoView({{ behavior: "auto", block: "end", inline: "nearest" }});
     }}
     return true;
   }}
+
   scrollRoot();
   if (!window.__caDocFollowTimer) {{
     window.__caDocFollowTimer = setInterval(function () {{
       if (!scrollRoot()) {{
         clearInterval(window.__caDocFollowTimer);
         window.__caDocFollowTimer = null;
+        window.__caDocStreamActive = false;
+        window.__caDocFollowPaused = false;
       }}
     }}, 120);
   }}
