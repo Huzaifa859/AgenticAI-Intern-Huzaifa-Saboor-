@@ -55,6 +55,7 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
+from ..utils.text_cleanup import sanitize_documentation_text
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,12 @@ _DOC_MAX_TOKENS = 3072
 #: Bump this whenever the documentation prompt template or the shape of
 #: the expected model prose changes, so previously cached LLM outputs are
 #: invalidated instead of being replayed against a stale format.
-_PROMPT_VERSION = "doc-v4-readme-single"
+_PROMPT_VERSION = "doc-v7-ascii-cleanup"
+
+#: Consecutive repeats of a 2–8 character unit that trigger truncation.
+_REPEAT_UNIT_MIN = 2
+_REPEAT_UNIT_MAX = 8
+_REPEAT_MIN_COUNT = 50
 
 #: Cap on file paths listed in the repository inventory section.
 _MAX_INVENTORY_FILES = 150
@@ -178,23 +184,44 @@ Write freeform markdown documentation grounded only in the evidence
 you are given (retrieved context, inventory, project files, source).
 
 Rules:
-1. Never invent files, symbols, APIs, dependencies, or commands that
-   are not present in the evidence.
-2. Prefer retrieved context when available; use repository contents to
+1. Write in English only.
+2. Never invent files, symbols, APIs, dependencies, commands, clone
+   URLs, or install steps that are not present in the evidence.
+3. Prefer retrieved context when available; use repository contents to
    fill gaps.
-3. If something is unknown from the evidence, say so briefly or omit it.
-4. Do NOT return JSON, YAML, or any machine envelope.
-5. Do NOT wrap the entire reply in a markdown fence.
-6. Choose your own structure. Write whatever README / documentation
-   layout you think is clearest for this target — headings, sections,
+4. If something is unknown from the evidence, say so briefly or omit it.
+   Do not invent filler sections (for example Technologies Used) when
+   the evidence does not support them.
+5. Stop as soon as the documentation is complete. No padding, no
+   trailing filler, no repeated closing remarks.
+6. Do not repeat characters, words, or lines.
+7. Never emit placeholders such as [object Object], undefined, null, or
+   raw JSON blobs.
+8. Prefer bullet lists over markdown tables. If you use a table, put
+   each row on its own line with a proper header separator row.
+9. Prefer plain ASCII punctuation (-, --) over fancy dashes or box
+   drawing when listing paths.
+10. Do NOT return JSON, YAML, or any machine envelope.
+11. Do NOT wrap the entire reply in a markdown fence.
+12. Choose your own structure. Write whatever README / documentation
+   layout you think is clearest for this target - headings, sections,
    lists, and examples are up to you.
 """
 
 #: Soft guidance only — the model picks its own README-style layout.
 _FREEFORM_GUIDANCE = (
-    "Write freeform markdown documentation for the target. "
+    "Write freeform markdown documentation for the target in English only. "
     "Invent your own README-style structure based on what the evidence "
-    "supports. Do not follow a fixed section template. Do not return JSON."
+    "supports. Prefer bullet lists over tables. Stop when the doc is "
+    "complete - no filler, no invented URLs/install steps, no placeholders "
+    "like [object Object], and no repeated characters, words, or lines. "
+    "Do not follow a fixed section template. Do not return JSON."
+)
+
+#: Detects a short unit (2–8 chars) repeated many times in a row.
+_REPETITIVE_RUN = re.compile(
+    rf"(.{{{_REPEAT_UNIT_MIN},{_REPEAT_UNIT_MAX}}}?)"
+    rf"\1{{{_REPEAT_MIN_COUNT - 1},}}"
 )
 
 _MODE_GUIDANCE = {
@@ -1470,6 +1497,7 @@ class DocumentationAgent(BaseAgent):
             )
 
         content = str(getattr(response, "content", "") or "").strip()
+        content = self._sanitize_documentation_output(content)
         self._trace(
             "model_response",
             event_type=TraceEventType.MODEL_CALL,
@@ -3338,10 +3366,44 @@ class DocumentationAgent(BaseAgent):
             sections.append("REPOSITORY CONTENTS\n(none)")
 
         sections.append(
-            "Write freeform markdown only. Choose your own README-style "
-            "structure. Do not return JSON."
+            "Write freeform markdown only, in English. Prefer bullet lists "
+            "over tables. Stop when complete - no filler, no invented "
+            "URLs/install steps, no [object Object] placeholders, and no "
+            "repeated characters, words, or lines. Do not return JSON."
         )
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _truncate_repetitive_output(text: str) -> str:
+        """
+        Drop runaway short-substring loops some models append at the end.
+
+        Looks for a 2–8 character unit repeated many times consecutively and
+        truncates from the start of that run. Normal prose is left unchanged.
+        """
+        source = text or ""
+        if len(source) < _REPEAT_UNIT_MIN * _REPEAT_MIN_COUNT:
+            return source
+        match = _REPETITIVE_RUN.search(source)
+        if match is None:
+            return source
+        trimmed = source[: match.start()].rstrip()
+        logger.warning(
+            "Truncated repetitive documentation output at char %d "
+            "(unit=%r, kept %d of %d chars).",
+            match.start(),
+            match.group(1),
+            len(trimmed),
+            len(source),
+        )
+        return trimmed
+
+    @classmethod
+    def _sanitize_documentation_output(cls, text: str) -> str:
+        """Normalize punctuation/junk, then cut repetitive runaway tails."""
+        return cls._truncate_repetitive_output(
+            sanitize_documentation_text(text or "")
+        )
 
     @staticmethod
     def _empty_result(

@@ -21,6 +21,8 @@ if _PROJECT_ROOT not in sys.path:
 import streamlit as st
 import html
 
+from codebase_assistant.utils.text_cleanup import sanitize_documentation_text
+
 _REPORT_CSS = """
 <style>
 .ca-chip-row {
@@ -139,6 +141,8 @@ _REPORT_CSS = """
   border-collapse: collapse;
   margin: 0 0 0.95rem;
   font-size: 0.92rem;
+  display: block;
+  overflow-x: auto;
 }
 .ca-doc-msg-body th,
 .ca-doc-msg-body td {
@@ -150,6 +154,11 @@ _REPORT_CSS = """
 .ca-doc-msg-body th {
   background: var(--secondary-background-color, #1f2937);
   font-weight: 650;
+}
+.ca-doc-msg-body hr {
+  border: 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.35);
+  margin: 1rem 0;
 }
 .ca-doc-placeholder {
   color: var(--text-color, #9ca3af);
@@ -204,14 +213,63 @@ def _render_inline_markdown(text: str) -> str:
     return "".join(pieces)
 
 
+def _split_table_cells(line: str) -> List[str]:
+    """Split one markdown table row into cell texts."""
+    stripped = (line or "").strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _is_table_separator(line: str) -> bool:
+    """True when a line is a GFM table separator row."""
+    cells = _split_table_cells(line)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-+:?", cell or "") is not None for cell in cells)
+
+
+def _looks_like_table_row(line: str) -> bool:
+    """True when a line looks like a pipe-delimited markdown table row."""
+    stripped = (line or "").strip()
+    if stripped.count("|") < 2:
+        return False
+    if _is_table_separator(stripped):
+        return False
+    return True
+
+
+def _render_markdown_table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Render a small HTML table from already-split markdown cells."""
+    head_cells = "".join(
+        f"<th>{_render_inline_markdown(cell)}</th>" for cell in header
+    )
+    body_rows: List[str] = []
+    width = len(header)
+    for row in rows:
+        padded = list(row) + [""] * max(0, width - len(row))
+        cells = "".join(
+            f"<td>{_render_inline_markdown(cell)}</td>" for cell in padded[:width]
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+    return (
+        "<table><thead><tr>"
+        f"{head_cells}</tr></thead><tbody>"
+        f"{''.join(body_rows)}</tbody></table>"
+    )
+
+
 def documentation_body_html(text: str, *, live: bool = False) -> str:
     """
     Convert documentation markdown into safe HTML for the shared message UI.
 
-    Supports headings, lists, fenced code, paragraphs, and light inline marks.
-    Unclosed fences mid-stream are closed so partial replies still render.
+    Supports headings, lists, tables, fenced code, paragraphs, and light
+    inline marks. Unclosed fences mid-stream are closed so partial replies
+    still render.
     """
-    source = text or ""
+    source = sanitize_documentation_text(text or "")
     if source.count("```") % 2 == 1:
         source = source + "\n```"
     if not source.strip():
@@ -280,6 +338,29 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
             index += 1
             continue
 
+        if stripped in {"---", "***", "___"}:
+            flush_paragraph()
+            flush_list()
+            blocks.append("<hr />")
+            index += 1
+            continue
+
+        if (
+            _looks_like_table_row(stripped)
+            and index + 1 < len(lines)
+            and _is_table_separator(lines[index + 1].strip())
+        ):
+            flush_paragraph()
+            flush_list()
+            header = _split_table_cells(stripped)
+            index += 2
+            rows: List[List[str]] = []
+            while index < len(lines) and _looks_like_table_row(lines[index].strip()):
+                rows.append(_split_table_cells(lines[index].strip()))
+                index += 1
+            blocks.append(_render_markdown_table(header, rows))
+            continue
+
         bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
         numbered = re.match(r"^\d+[.)]\s+(.+)$", stripped)
         if bullet or numbered:
@@ -310,7 +391,16 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
     if live:
         # Attach caret to the last text-bearing block without nesting invalid HTML.
         caret = '<span class="ca-doc-caret" aria-hidden="true"></span>'
-        for tag in ("</p>", "</li>", "</h4>", "</h3>", "</h2>", "</h1>", "</code></pre>"):
+        for tag in (
+            "</p>",
+            "</li>",
+            "</h4>",
+            "</h3>",
+            "</h2>",
+            "</h1>",
+            "</table>",
+            "</code></pre>",
+        ):
             if body.endswith(tag):
                 if tag == "</code></pre>":
                     return body[: -len(tag)] + caret + tag

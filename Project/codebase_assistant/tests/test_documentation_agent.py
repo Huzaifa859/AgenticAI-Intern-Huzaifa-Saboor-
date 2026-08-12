@@ -342,7 +342,61 @@ def test_system_prompt_enforces_grounding_and_markdown() -> None:
     lowered = _SYSTEM_PROMPT.lower()
     assert "never invent" in lowered
     assert "markdown" in lowered
-    assert "single paragraph" in lowered
+    assert "english only" in lowered
+    assert "stop as soon as the documentation is complete" in lowered
+    assert "do not repeat characters, words, or lines" in lowered
+    assert "[object object]" in lowered
+    assert "prefer bullet lists" in lowered
+
+
+def test_truncate_repetitive_output_cuts_runaway_tail() -> None:
+    """Short substring loops should be truncated after the useful prose."""
+    good = "## Overview\n\nPure Python shop helpers.\n\n## Technologies Used\n"
+    junk = "那些" * 80
+    trimmed = DocumentationAgent._truncate_repetitive_output(good + junk)
+    assert trimmed == good.rstrip()
+    assert "那些" not in trimmed
+
+
+def test_truncate_repetitive_output_keeps_normal_prose() -> None:
+    """Ordinary documentation must not be truncated by the repetition guard."""
+    prose = (
+        "## Purpose\n\n"
+        "Provide helpers for auth, billing, and inventory.\n\n"
+        "### Notes\n\n"
+        "No external dependencies — pure Python standard library.\n"
+    )
+    assert DocumentationAgent._truncate_repetitive_output(prose) == prose
+
+
+def test_sanitize_documentation_output_strips_object_object() -> None:
+    """JS-style [object Object] placeholders should be removed."""
+    messy = (
+        "## Installation\n\n"
+        "cd demo1\n"
+        ",[object Object],\n"
+        ",[object Object],\n"
+        "No packages needed.\n"
+    )
+    cleaned = DocumentationAgent._sanitize_documentation_output(messy)
+    assert "[object Object]" not in cleaned
+    assert "No packages needed." in cleaned
+    assert "cd demo1" in cleaned
+
+
+def test_sanitize_documentation_output_normalizes_fancy_punctuation() -> None:
+    """Unicode dashes / trees and mojibake should become plain ASCII."""
+    fancy = "demo1 \u2013 Logic\nstatic\u2011analysis\n├── shop/\n└── README.md\n"
+    mojibake = "demo1 â Logic\nstaticâanalysis\nâââ shop/\n"
+    for source in (fancy, mojibake):
+        cleaned = DocumentationAgent._sanitize_documentation_output(source)
+        assert "â" not in cleaned
+        assert "\u2013" not in cleaned
+        assert "\u2011" not in cleaned
+        assert "├" not in cleaned
+        assert "demo1 - Logic" in cleaned
+        assert "static-analysis" in cleaned
+        assert "|--" in cleaned or "+--" in cleaned
 
 
 def test_dedupe_chunks_removes_duplicate_content() -> None:
