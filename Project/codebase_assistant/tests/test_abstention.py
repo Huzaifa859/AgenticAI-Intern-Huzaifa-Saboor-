@@ -136,6 +136,77 @@ def test_analysis_keeps_findings_when_grounding_disabled(tmp_path: Path) -> None
     assert report.rejected == []
 
 
+def test_parse_response_keeps_finding_without_model_evidence(tmp_path: Path) -> None:
+    """Missing evidence must not drop a finding that has a file path."""
+    (tmp_path / "wallet.py").write_text(
+        "def withdraw(amount):\n    balance = balance - amount\n    return balance\n",
+        encoding="utf-8",
+    )
+    agent = CodeAnalysisAgent(model_client=_mock_client(content="{}"))
+    _answer, findings = agent.parse_response(
+        json.dumps(
+            {
+                "answer": "Balance is used before assignment.",
+                "findings": [
+                    {
+                        "bug_type": "undefined_variable",
+                        "description": "balance is read before it is set",
+                        "severity": "high",
+                        "file_path": "wallet.py",
+                        "line_start": 2,
+                        "line_end": 2,
+                        "confidence": 0.0,
+                    }
+                ],
+            }
+        ),
+        workspace_root=str(tmp_path),
+    )
+
+    assert len(findings) == 1
+    assert findings[0].file_path == "wallet.py"
+    assert findings[0].confidence == 0.5
+    assert findings[0].evidence == "    balance = balance - amount"
+
+
+def test_analysis_keeps_streamed_findings_when_grounding_off(tmp_path: Path) -> None:
+    """End-to-end: slim streamed findings must reach report.findings."""
+    (tmp_path / "wallet.py").write_text(
+        "def withdraw(amount):\n    balance = balance - amount\n    return balance\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "answer": "Found an undefined variable.",
+        "findings": [
+            {
+                "bug_type": "undefined_variable",
+                "description": "balance used before assignment",
+                "severity": "high",
+                "file_path": "wallet.py",
+                "line_start": 2,
+                "line_end": 2,
+                "confidence": 0.0,
+            }
+        ],
+    }
+    client = _mock_client(content=json.dumps(payload))
+    chunk = RetrievedChunk(
+        source="wallet.py",
+        content="def withdraw(amount):\n    balance = balance - amount\n",
+        score=0.9,
+        metadata={"file_path": "wallet.py"},
+    )
+    agent = CodeAnalysisAgent(model_client=client, retriever=_mock_retriever([chunk]))
+
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+
+    assert report.abstention is None
+    assert len(report.findings) >= 1
+    assert any(f.bug_type == "undefined_variable" for f in report.findings)
+    assert report.llm_proposed_count >= 1
+
+
 def test_documentation_abstains_without_evidence(tmp_path: Path) -> None:
     """Documentation abstains when the repository has no usable source."""
     client = _mock_client(content=json.dumps({"summary": "should not be used"}))

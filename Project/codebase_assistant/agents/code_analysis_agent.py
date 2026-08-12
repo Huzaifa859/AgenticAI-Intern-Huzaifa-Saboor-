@@ -103,7 +103,7 @@ _MAX_JSON_REPAIR_RAW_CHARS = 6_000
 #: (answer, proposed findings) shape changes, so previously cached LLM
 #: outputs are invalidated instead of being replayed against a stale
 #: format.
-_PROMPT_VERSION = "analysis-v1"
+_PROMPT_VERSION = "analysis-v1.1"
 
 _JSON_REPAIR_SYSTEM_PROMPT = """\
 You are repairing malformed code-analysis JSON.
@@ -131,15 +131,15 @@ Rules you must follow exactly:
 
 1. Report only findings supported by the repository code shown in \
 CODE CONTEXT. If you cannot see it, it does not exist.
-2. `evidence` must be the exact code snippet that supports the finding, \
-copied character for character from the code shown. Do not re-indent \
-it, do not reformat it, do not fix it, do not abbreviate it. It is a \
-quotation, not a description.
+2. Prefer including `evidence` as the exact code snippet that supports \
+the finding, copied character for character from the code shown. Do not \
+re-indent it, do not reformat it, do not fix it, do not abbreviate it. \
+If you omit evidence, still provide accurate `file_path`, `line_start`, \
+and `line_end`.
 3. `file_path` must be the accurate path from the CODE CONTEXT header \
 (for example `path/as/shown/in/the/header.py`). Never invent files.
 4. `line_start` and `line_end` must be the most accurate real line \
-numbers from the gutter, and `evidence` must be exactly the lines in \
-that range.
+numbers from the gutter for the buggy lines.
 5. Never invent files, functions, variables, or evidence. Never guess \
 symbols that are not visible in CODE CONTEXT.
 6. Do not repeat anything listed under KNOWN STATIC FINDINGS. Those are \
@@ -159,7 +159,7 @@ Reply in exactly this shape:
       "bug_type": "short_snake_case_category",
       "description": "What is wrong and why it matters.",
       "severity": "low | medium | high",
-      "confidence": 0.0,
+      "confidence": 0.7,
       "file_path": "path/as/shown/in/the/header.py",
       "function_name": "enclosing_function_or_<module>",
       "line_start": 1,
@@ -170,9 +170,8 @@ Reply in exactly this shape:
   ]
 }
 
-Every finding you return is checked against the real file. Any finding \
-whose evidence does not match the source exactly is discarded, and a \
-discarded finding helps no one."""
+Incorrect file paths or line numbers make a finding useless. Evidence \
+is preferred but optional when path and lines are accurate."""
 
 
 @dataclass
@@ -477,7 +476,11 @@ class CodeAnalysisAgent(BaseAgent):
         merged, removed = self._merge(static_findings, llm_findings)
         report.findings = merged
         report.duplicates_removed = removed
-        self._apply_abstention(report, used_rag=use_rag)
+        self._apply_abstention(
+            report,
+            used_rag=use_rag,
+            grounding_enabled=bool(getattr(pipeline.checker, "enabled", False)),
+        )
         report.duration_seconds = time.time() - started
 
         self._trace(
@@ -734,7 +737,11 @@ class CodeAnalysisAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _apply_abstention(
-        self, report: CodeAnalysisReport, *, used_rag: bool
+        self,
+        report: CodeAnalysisReport,
+        *,
+        used_rag: bool,
+        grounding_enabled: bool = False,
     ) -> None:
         """
         Attach an explicit abstention when grounded evidence is insufficient.
@@ -743,6 +750,10 @@ class CodeAnalysisAgent(BaseAgent):
         do not abstain — that is a successful empty result. Abstention is
         reserved for missing inputs, unverifiable LLM claims, empty
         retrieval with no static support, or only-too-uncertain findings.
+
+        When grounding is disabled, keep parsed LLM findings without
+        confidence gating — a copied schema ``confidence: 0.0`` must not
+        wipe the report after a successful stream.
         """
         builder = ReportBuilder()
         files_analyzed = 0
@@ -760,14 +771,6 @@ class CodeAnalysisAgent(BaseAgent):
             evidence.append(
                 f"{report.llm_proposed_count} model finding(s) proposed"
             )
-
-        confident = builder.filter_confident(report.findings)
-        uncertain = [
-            finding
-            for finding in report.findings
-            if finding not in confident
-        ]
-        report.findings = confident
 
         if files_analyzed == 0:
             report.abstention = builder.abstain(
@@ -788,6 +791,61 @@ class CodeAnalysisAgent(BaseAgent):
                 reason=report.abstention.reason,
             )
             return
+
+        if not grounding_enabled:
+            if report.findings:
+                return
+            if report.model_used and report.llm_parse_failed:
+                report.abstention = builder.abstain(
+                    "LLM response could not be verified.",
+                    confidence=1.0,
+                    evidence_available=evidence,
+                    recommended_next_steps=[
+                        "Inspect the retrieved source for the claimed lines.",
+                        "Ask a narrower question tied to a concrete file.",
+                    ],
+                )
+                report.answer = ""
+                report.notes.append(f"Abstained: {report.abstention.reason}")
+                self._trace(
+                    "abstention",
+                    success=True,
+                    reason=report.abstention.reason,
+                )
+                return
+            if (
+                used_rag
+                and report.model_used
+                and not report.context
+                and report.llm_proposed_count == 0
+                and not str(report.answer or "").strip()
+            ):
+                report.abstention = builder.abstain(
+                    "No grounded evidence was found.",
+                    confidence=1.0,
+                    evidence_available=evidence,
+                    recommended_next_steps=[
+                        "Ensure the repository was indexed successfully.",
+                        "Ask about a concrete module that exists in the repo.",
+                    ],
+                )
+                report.findings = []
+                report.answer = ""
+                report.notes.append(f"Abstained: {report.abstention.reason}")
+                self._trace(
+                    "abstention",
+                    success=True,
+                    reason=report.abstention.reason,
+                )
+            return
+
+        confident = builder.filter_confident(report.findings)
+        uncertain = [
+            finding
+            for finding in report.findings
+            if finding not in confident
+        ]
+        report.findings = confident
 
         if confident:
             return
@@ -1301,7 +1359,10 @@ class CodeAnalysisAgent(BaseAgent):
                 )
 
             report.llm_parse_failed = payload is None
-            answer, proposed = self.parse_response(raw_content)
+            answer, proposed = self.parse_response(
+                raw_content,
+                workspace_root=pipeline.root,
+            )
             report.answer = answer
             report.llm_proposed_count = len(proposed)
 
@@ -1472,22 +1533,28 @@ class CodeAnalysisAgent(BaseAgent):
     # Response parsing
     # ------------------------------------------------------------------
 
-    def parse_response(self, content: str) -> Tuple[str, List[BugReport]]:
+    def parse_response(
+        self,
+        content: str,
+        *,
+        workspace_root: str = "",
+    ) -> Tuple[str, List[BugReport]]:
         """
         Turn a model response into an answer and candidate findings.
 
         Tolerant by design. Models wrap JSON in fences, prefix it with
         "Here is the analysis:", and occasionally return a bare array.
-        None of that is worth failing over, and none of it can smuggle
-        an unverified finding through -- everything parsed here still
-        has to survive grounding.
+        None of that is worth failing over.
 
         A finding with missing or malformed fields is dropped
         individually with a log line, so one bad entry does not cost the
-        rest.
+        rest. Evidence is preferred but optional: when omitted, lines are
+        sliced from disk for the UI when possible (grounding is off by
+        default, so empty evidence must not discard a cited finding).
 
         Args:
             content: Raw text from the model.
+            workspace_root: Repository root used to fill missing evidence.
 
         Returns:
             The prose answer and the candidate BugReports.
@@ -1514,19 +1581,30 @@ class CodeAnalysisAgent(BaseAgent):
 
         findings: List[BugReport] = []
         for index, entry in enumerate(raw):
-            report = self._to_bug_report(entry, index)
+            report = self._to_bug_report(
+                entry,
+                index,
+                workspace_root=workspace_root,
+            )
             if report is not None:
                 findings.append(report)
 
         return answer, findings
 
-    def _to_bug_report(self, entry: Any, index: int) -> Optional[BugReport]:
+    def _to_bug_report(
+        self,
+        entry: Any,
+        index: int,
+        *,
+        workspace_root: str = "",
+    ) -> Optional[BugReport]:
         """
         Convert one parsed entry into a BugReport.
 
         Args:
             entry: A single item from the model's `findings` list.
             index: Its position, for the log line.
+            workspace_root: Repo root for optional evidence fill.
 
         Returns:
             The BugReport, or None if the entry is unusable.
@@ -1536,11 +1614,17 @@ class CodeAnalysisAgent(BaseAgent):
             return None
 
         try:
-            line_start = int(entry.get("line_start", 0))
-            line_end = int(entry.get("line_end", line_start))
+            raw_start = entry.get("line_start", 1)
+            line_start = int(1 if raw_start in (None, "") else raw_start)
+            raw_end = entry.get("line_end", line_start)
+            line_end = int(line_start if raw_end in (None, "") else raw_end)
         except (TypeError, ValueError):
             logger.warning("findings[%d] has non-numeric line numbers; dropped.", index)
             return None
+
+        if line_start < 1:
+            line_start = 1
+        line_end = max(line_end, line_start)
 
         severity = str(entry.get("severity", "medium")).strip().lower()
         if severity not in SEVERITY_RANK:
@@ -1550,18 +1634,38 @@ class CodeAnalysisAgent(BaseAgent):
             confidence = float(entry.get("confidence", 0.5))
         except (TypeError, ValueError):
             confidence = 0.5
+        # Models often copy the schema example ``0.0`` literally; that
+        # would be wiped by ReportBuilder.min_confidence (0.4).
+        if confidence <= 0.0:
+            confidence = 0.5
 
-        file_path = str(entry.get("file_path") or "").strip()
-        evidence = self._strip_gutter(str(entry.get("evidence") or ""))
-
-        if not file_path or not evidence.strip():
-            # Grounding would reject these anyway; dropping them here
-            # keeps the rejection log about hallucinations rather than
-            # about malformed output.
+        file_path = str(
+            entry.get("file_path")
+            or entry.get("file")
+            or entry.get("path")
+            or entry.get("filename")
+            or ""
+        ).strip()
+        if not file_path:
             logger.warning(
-                "findings[%d] has no file path or no evidence; dropped.", index
+                "findings[%d] has no file path (keys=%s); dropped.",
+                index,
+                sorted(str(key) for key in entry.keys()),
             )
             return None
+
+        evidence = self._strip_gutter(str(entry.get("evidence") or ""))
+        if not evidence.strip():
+            evidence = self._evidence_from_file(
+                workspace_root,
+                file_path,
+                line_start,
+                line_end,
+            )
+
+        function_name = str(entry.get("function_name") or "<module>").strip()
+        if not function_name:
+            function_name = "<module>"
 
         try:
             return BugReport(
@@ -1571,9 +1675,9 @@ class CodeAnalysisAgent(BaseAgent):
                 severity=severity,  # type: ignore[arg-type]
                 confidence=min(max(confidence, 0.0), MAX_LLM_CONFIDENCE),
                 file_path=file_path,
-                function_name=str(entry.get("function_name") or "<module>").strip(),
+                function_name=function_name,
                 line_start=line_start,
-                line_end=max(line_end, line_start),
+                line_end=line_end,
                 evidence=evidence,
                 suggested_fix=(
                     str(entry["suggested_fix"]).strip()
@@ -1585,6 +1689,44 @@ class CodeAnalysisAgent(BaseAgent):
         except Exception as exc:
             logger.warning("findings[%d] could not be built: %s", index, exc)
             return None
+
+    @staticmethod
+    def _evidence_from_file(
+        workspace_root: str,
+        file_path: str,
+        line_start: int,
+        line_end: int,
+    ) -> str:
+        """
+        Best-effort read of ``file_path`` lines for the findings UI.
+
+        Returns an empty string when the file cannot be read; callers
+        must not drop the finding solely for that reason.
+        """
+        root = (workspace_root or "").strip()
+        relative = (file_path or "").strip()
+        if not root or not relative or line_start < 1:
+            return ""
+
+        candidate = (
+            relative
+            if os.path.isabs(relative)
+            else os.path.normpath(os.path.join(root, relative))
+        )
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return ""
+
+        start = line_start - 1
+        end = max(line_end, line_start)
+        if start >= len(lines):
+            return ""
+        sliced = lines[start:end]
+        if not sliced:
+            return ""
+        return "".join(sliced).rstrip("\n")
 
     @staticmethod
     def _strip_gutter(evidence: str) -> str:
