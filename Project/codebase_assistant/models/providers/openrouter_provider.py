@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import requests
 
@@ -121,6 +121,7 @@ class OpenRouterProvider(BaseProvider):
         base_url: str = "https://openrouter.ai/api/v1",
         timeout: Optional[float] = None,
         config: Optional[Config] = None,
+        fallback_models: Optional[Sequence[str]] = None,
     ) -> None:
         """
         Initialize the OpenRouter provider.
@@ -134,6 +135,11 @@ class OpenRouterProvider(BaseProvider):
             timeout: Per-request timeout in seconds. When omitted,
                 read from ``OPENROUTER_TIMEOUT`` or a safe default.
             config: Optional Config instance. Loaded when not supplied.
+            fallback_models: Ordered OpenRouter fallbacks for this
+                provider instance. When ``None``, the module default
+                ``_FALLBACK_MODELS`` chain is used. Pass an explicit
+                sequence (including empty) to override that default —
+                agent clients supply their Config-defined chains here.
         """
         cfg = config or Config.load()
 
@@ -152,6 +158,14 @@ class OpenRouterProvider(BaseProvider):
         self.base_url = resolved_base
         self.timeout = float(resolved_timeout)
         self._config = cfg
+        if fallback_models is None:
+            self._fallback_models: tuple[str, ...] = tuple(_FALLBACK_MODELS)
+        else:
+            self._fallback_models = tuple(
+                str(item).strip()
+                for item in fallback_models
+                if str(item or "").strip()
+            )
 
     def generate(self, messages: List[ModelMessage], **kwargs) -> ModelResponse:
         """
@@ -289,7 +303,7 @@ class OpenRouterProvider(BaseProvider):
             duplicates.
         """
         chain: List[str] = []
-        for candidate in (str(primary or ""),) + _FALLBACK_MODELS:
+        for candidate in (str(primary or ""),) + tuple(self._fallback_models):
             if candidate and candidate not in chain:
                 chain.append(candidate)
         return chain

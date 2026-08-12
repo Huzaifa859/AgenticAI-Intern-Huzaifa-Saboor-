@@ -20,7 +20,7 @@ import inspect
 import logging
 import re
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Pattern, Tuple
+from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
 from .agents.base import BaseAgent
 from .agents.code_analysis_agent import CodeAnalysisAgent
@@ -350,16 +350,25 @@ class Supervisor:
             )
         return provider
 
-    def _make_agent_client(self, model: str) -> LLMClient:
+    def _make_agent_client(
+        self,
+        model: str,
+        fallback_models: Sequence[str],
+    ) -> LLMClient:
         """
         Build a dedicated LLMClient for one agent backed by its own
-        OpenRouterProvider pinned to ``model``.
+        OpenRouterProvider pinned to ``model`` with agent-specific
+        OpenRouter fallbacks.
+
+        Agent clients do not attach Ollama as a ProviderManager fallback;
+        failover stays inside the OpenRouter model chain from Config.
 
         If provider construction fails (e.g. bad key), falls back to the
         shared ``self.provider_manager`` so the agent still works.
 
         Args:
             model: The OpenRouter model slug the agent should use.
+            fallback_models: Ordered OpenRouter fallbacks for this agent.
 
         Returns:
             An LLMClient whose primary model is ``model``.
@@ -371,10 +380,11 @@ class Supervisor:
                 max_tokens=self.config.max_tokens,
                 base_url=self.config.openrouter_base_url,
                 config=self.config,
+                fallback_models=fallback_models,
             )
             dedicated_manager = ProviderManager(
                 preferred=dedicated_provider,
-                fallback=self.ollama_provider,
+                fallback=None,
                 preferred_name=self.config.preferred_provider,
                 fallback_name=self.config.fallback_provider,
                 cache_seconds=self.config.provider_cache_seconds,
@@ -403,9 +413,9 @@ class Supervisor:
 
         Each agent receives a dedicated LLMClient backed by a model
         optimised for its specific task:
-          - CodeAnalysisAgent  → config.analysis_model      (deep reasoning)
-          - DocumentationAgent → config.documentation_model (prose / markdown)
-          - TestingAgent       → config.testing_model       (fast code output)
+          - CodeAnalysisAgent  → config.analysis_model_chain()
+          - DocumentationAgent → config.documentation_model_chain()
+          - TestingAgent       → config.testing_model_chain()
 
         Returns:
             A mapping from AgentType to the corresponding agent instance.
@@ -421,16 +431,25 @@ class Supervisor:
         ast_cache: Dict[Tuple[str, float], Any] = {}
 
         # Build one dedicated client per agent so each uses its own
-        # specialist free model while sharing the Ollama failover.
-        analysis_client = self._make_agent_client(self.config.analysis_model)
-        docs_client = self._make_agent_client(self.config.documentation_model)
-        testing_client = self._make_agent_client(self.config.testing_model)
+        # OpenRouter primary + fallback chain from Config.
+        analysis_client = self._make_agent_client(
+            self.config.analysis_model,
+            self.config.analysis_fallback_models,
+        )
+        docs_client = self._make_agent_client(
+            self.config.documentation_model,
+            self.config.documentation_fallback_models,
+        )
+        testing_client = self._make_agent_client(
+            self.config.testing_model,
+            self.config.testing_fallback_models,
+        )
 
         logger.info(
             "Agent model routing — analysis=%s | docs=%s | testing=%s",
-            self.config.analysis_model,
-            self.config.documentation_model,
-            self.config.testing_model,
+            " → ".join(self.config.analysis_model_chain()),
+            " → ".join(self.config.documentation_model_chain()),
+            " → ".join(self.config.testing_model_chain()),
         )
 
         # CodeAnalysisAgent builds a per-repository Indexer under

@@ -82,6 +82,34 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_model_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """
+    Read a comma-separated list of OpenRouter model slugs.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is unset or empty.
+
+    Returns:
+        Parsed non-empty model slugs, or ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    parsed = tuple(part.strip() for part in str(raw).split(",") if part.strip())
+    return parsed or default
+
+
+def _dedupe_model_chain(*parts: str) -> Tuple[str, ...]:
+    """Return ordered unique model slugs, dropping blanks."""
+    chain: list[str] = []
+    for part in parts:
+        slug = str(part or "").strip()
+        if slug and slug not in chain:
+            chain.append(slug)
+    return tuple(chain)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     """
     Read a boolean setting from the environment.
@@ -203,12 +231,24 @@ class Config:
     preferred_provider: str = "openrouter"
     fallback_provider: str = "ollama"
     provider_cache_seconds: int = 60
-    # Per-agent model routing: each agent uses a specialist free model
-    # optimised for its specific task. Falls back to openrouter_model when
-    # the env var is absent, keeping single-model setups unchanged.
-    analysis_model: str = "google/gemma-4-26b-a4b-it:free"
-    testing_model: str = "cohere/north-mini-code:free"
-    documentation_model: str = "openai/gpt-oss-20b:free"
+    # Per-agent OpenRouter model routing (primary + ordered fallbacks).
+    # Each agent's dedicated OpenRouterProvider uses only its own chain;
+    # Ollama is not part of these agent fallback lists.
+    analysis_model: str = "anthropic/claude-sonnet-4.5"
+    analysis_fallback_models: Tuple[str, ...] = (
+        "qwen/qwen3-coder-plus",
+        "qwen/qwen3-coder",
+    )
+    documentation_model: str = "google/gemini-2.5-flash"
+    documentation_fallback_models: Tuple[str, ...] = (
+        "qwen/qwen3-coder-flash",
+        "google/gemini-2.5-flash-lite",
+    )
+    testing_model: str = "google/gemini-2.5-flash"
+    testing_fallback_models: Tuple[str, ...] = (
+        "anthropic/claude-sonnet-4.5",
+        "qwen/qwen3-coder-plus",
+    )
     # When True, DocumentationAgent keeps imperfect LLM text (invalid JSON
     # salvage / soft grounding) with warnings instead of emptying results.
     # Best for demos; set DOCUMENTATION_LENIENT=false for strict abstention.
@@ -351,10 +391,40 @@ class Config:
             analysis_model=_env_str(
                 "ANALYSIS_MODEL", defaults.analysis_model
             ),
+            analysis_fallback_models=_env_model_list(
+                "ANALYSIS_FALLBACK_MODELS",
+                defaults.analysis_fallback_models,
+            ),
             testing_model=_env_str(
                 "TESTING_MODEL", defaults.testing_model
+            ),
+            testing_fallback_models=_env_model_list(
+                "TESTING_FALLBACK_MODELS",
+                defaults.testing_fallback_models,
             ),
             documentation_model=_env_str(
                 "DOCUMENTATION_MODEL", defaults.documentation_model
             ),
+            documentation_fallback_models=_env_model_list(
+                "DOCUMENTATION_FALLBACK_MODELS",
+                defaults.documentation_fallback_models,
+            ),
+        )
+
+    def analysis_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Code Analysis OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.analysis_model, *self.analysis_fallback_models
+        )
+
+    def documentation_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Documentation OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.documentation_model, *self.documentation_fallback_models
+        )
+
+    def testing_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Testing OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.testing_model, *self.testing_fallback_models
         )
