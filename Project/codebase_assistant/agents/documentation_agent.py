@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from ..analysis.report_builder import ReportBuilder
 from ..cache.output_cache import OutputCache
 from ..rag.indexer import Indexer
+from ..rag.retriever import Retriever
 from ..schemas.schemas import (
     AbstentionResult,
     AgentRequest,
@@ -57,6 +58,10 @@ from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
 from ..utils.text_cleanup import sanitize_documentation_text
 from .base import BaseAgent
+from .code_analysis_agent import (
+    CodeAnalysisAgent,
+    _LOW_VALUE_ANALYSIS_BASENAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +74,23 @@ _MAX_FILE_CHARS = 2500
 #: Shorter file excerpts when retrieved chunks are already present.
 _MAX_FILE_CHARS_WITH_RETRIEVAL = 1500
 
-#: Cap on retrieved chunks rendered into the prompt.
-_MAX_CONTEXT_CHUNKS = 8
+#: Maximum retrieved chunks Documentation may send to the LLM by repo size.
+#: Same small/medium/large buckets as Analysis (preferred Python chunk count).
+_DOC_SMALL_MAX_CHUNKS = 8
+_DOC_MEDIUM_MAX_CHUNKS = 16
+_DOC_LARGE_MAX_CHUNKS = 24
+
+_DOC_CONTEXT_LIMITS = {
+    "small": _DOC_SMALL_MAX_CHUNKS,
+    "medium": _DOC_MEDIUM_MAX_CHUNKS,
+    "large": _DOC_LARGE_MAX_CHUNKS,
+}
+
+#: Candidate pool ceiling for Documentation retrieve → keep.
+_DOC_FETCH_POOL_CAP = 48
+
+#: Backward-compatible alias: small-repo Documentation chunk ceiling.
+_MAX_CONTEXT_CHUNKS = _DOC_SMALL_MAX_CHUNKS
 
 #: Cap on characters per retrieved chunk in the prompt.
 _MAX_CHUNK_CHARS = 1200
@@ -3070,6 +3090,63 @@ class DocumentationAgent(BaseAgent):
             )
         return excerpts
 
+    def _preferred_code_chunk_count(self) -> Optional[int]:
+        """
+        Count preferred executable Python chunks (Analysis size metric).
+
+        Returns:
+            The count, or None when the store cannot be inspected.
+        """
+        if self.retriever is None:
+            return None
+        try:
+            where = Retriever.build_filter(language="python")
+            chunks = self.retriever.vector_db.list_chunks(where=where)
+        except Exception as exc:
+            logger.debug(
+                "Could not count preferred Documentation code chunks: %s", exc
+            )
+            return None
+
+        # Production VectorDB returns a list; reject other types so test
+        # doubles (e.g. MagicMock) cannot be treated as infinite iterables.
+        if not isinstance(chunks, (list, tuple)):
+            return None
+
+        count = 0
+        for chunk in chunks:
+            path = (getattr(chunk, "file_path", None) or "").replace("\\", "/")
+            basename = path.rsplit("/", 1)[-1].lower()
+            if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
+                continue
+            count += 1
+        return count
+
+    def _docs_retrieval_limit(self) -> int:
+        """
+        Size-based Documentation keep ceiling (8 / 16 / 24).
+
+        Uses the same preferred-chunk size buckets as Analysis so agents
+        agree on small/medium/large. Ignores ``Config.retrieval_top_k``.
+        """
+        preferred = self._preferred_code_chunk_count()
+        bucket = CodeAnalysisAgent._analysis_repo_size_bucket(preferred)
+        return int(_DOC_CONTEXT_LIMITS[bucket])
+
+    def _docs_fetch_k(self, limit: int, preferred_n: Optional[int]) -> int:
+        """
+        Candidate pool for Documentation retrieve → dedupe → keep.
+
+        Must be at least ``limit`` (usually larger) so global
+        ``retrieval_top_k=8`` cannot silently block 16 / 24.
+        """
+        cfg = getattr(self.retriever, "config", None) if self.retriever else None
+        configured = int(getattr(cfg, "rerank_candidates", 0) or 0)
+        fetch_k = max(limit, configured, limit * 2)
+        if preferred_n is not None and preferred_n > 0:
+            fetch_k = max(fetch_k, min(preferred_n, _DOC_FETCH_POOL_CAP))
+        return min(max(fetch_k, limit), _DOC_FETCH_POOL_CAP)
+
     def _retrieve_context(
         self,
         query: str,
@@ -3081,15 +3158,22 @@ class DocumentationAgent(BaseAgent):
         Retrieve RAG chunks for the documentation request.
 
         When ``source_file`` is set, keep only chunks from that file.
-        Always attempts retrieval. Returns an empty list when the
-        retriever is missing, the index is empty, or retrieval fails.
+        Keep count is size-based (8 / 16 / 24). Returns an empty list when
+        the retriever is missing, the index is empty, or retrieval fails.
         """
         if self.retriever is None:
             logger.info("No retriever configured; continuing with repository files only.")
             return []
 
+        limit = self._docs_retrieval_limit()
+        preferred_n = self._preferred_code_chunk_count()
+        fetch_k = self._docs_fetch_k(limit, preferred_n)
+
         try:
-            chunks = self.retriever.retrieve(query=query or target_path or "documentation")
+            chunks = self.retriever.retrieve(
+                query=query or target_path or "documentation",
+                top_k=fetch_k,
+            )
         except Exception as exc:
             logger.warning(
                 "Retrieval failed; continuing with repository files only: %s",
@@ -3102,7 +3186,7 @@ class DocumentationAgent(BaseAgent):
             return []
         if source_file:
             chunks = self._filter_chunks_by_file(chunks, source_file)
-        return self._dedupe_chunks(chunks)[:_MAX_CONTEXT_CHUNKS]
+        return self._dedupe_chunks(chunks)[:limit]
 
     def _filter_chunks_by_file(
         self,
