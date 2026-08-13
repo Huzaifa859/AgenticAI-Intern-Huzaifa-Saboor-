@@ -20,6 +20,7 @@ overrides implemented below.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
@@ -28,6 +29,43 @@ try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional at install time
     load_dotenv = None  # type: ignore[assignment]
+
+
+#: Local UI/CLI runtime data root when ``CODEBASE_ASSISTANT_DATA_DIR`` is unset.
+#: Kept in sync with ``app.ui_paths.streamlit_data_dir`` so Chroma bases match.
+_DEFAULT_RUNTIME_DATA_DIRNAME = "codebase_assistant_streamlit"
+
+
+def default_runtime_data_dir() -> str:
+    """
+    Canonical on-disk runtime data root for local app entry points.
+
+    Precedence:
+    1. ``CODEBASE_ASSISTANT_DATA_DIR`` when set
+    2. ``{temp}/codebase_assistant_streamlit``
+    """
+    override = (os.environ.get("CODEBASE_ASSISTANT_DATA_DIR") or "").strip()
+    if override:
+        return override
+    return os.path.join(tempfile.gettempdir(), _DEFAULT_RUNTIME_DATA_DIRNAME)
+
+
+def default_chroma_persist_directory() -> str:
+    """
+    Canonical Chroma persistence base for the application.
+
+    Precedence:
+    1. ``CHROMA_PERSIST_DIR`` when set (explicit override always wins)
+    2. ``{CODEBASE_ASSISTANT_DATA_DIR}/chroma`` when the data dir is set
+    3. ``{temp}/codebase_assistant_streamlit/chroma`` (Streamlit/worker default)
+
+    ``Config()``, ``Config.load()``, and ``app.ui_paths.chroma_persist_dir``
+    all resolve through this helper so CLI and Streamlit share one store.
+    """
+    override = (os.environ.get("CHROMA_PERSIST_DIR") or "").strip()
+    if override:
+        return override
+    return os.path.join(default_runtime_data_dir(), "chroma")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -150,7 +188,10 @@ class Config:
             skipped.
         ignore_directories: Directory names excluded from ingestion.
 
-        chroma_persist_directory: Directory ChromaDB persists to.
+        chroma_persist_directory: Directory ChromaDB persists to. Defaults
+            to the Streamlit/worker canonical base
+            (``{temp}/codebase_assistant_streamlit/chroma``) unless
+            ``CHROMA_PERSIST_DIR`` or ``CODEBASE_ASSISTANT_DATA_DIR`` is set.
         chroma_collection_name: Name of the ChromaDB collection holding
             code chunks.
         embedding_model_name: sentence-transformers model used to embed
@@ -211,7 +252,10 @@ class Config:
     )
 
     # --- RAG / vector store (proposal: Indexing Design) ---------------
-    chroma_persist_directory: str = "./.codebase_assistant/chroma"
+    # default_factory keeps CLI / Config.load / Streamlit on one base.
+    chroma_persist_directory: str = field(
+        default_factory=default_chroma_persist_directory
+    )
     chroma_collection_name: str = "codebase_chunks"
     embedding_model_name: str = "all-mpnet-base-v2"
     retrieval_top_k: int = 8

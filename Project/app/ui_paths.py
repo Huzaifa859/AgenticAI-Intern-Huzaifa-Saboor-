@@ -11,8 +11,12 @@ OS temp directory so local ``run_ui.bat`` keeps working unchanged.
 from __future__ import annotations
 
 import os
-import tempfile
 from typing import Optional
+
+from codebase_assistant.config import (
+    default_chroma_persist_directory,
+    default_runtime_data_dir,
+)
 
 
 def streamlit_data_dir() -> str:
@@ -21,19 +25,21 @@ def streamlit_data_dir() -> str:
 
     Env: ``CODEBASE_ASSISTANT_DATA_DIR``
     Default: ``{temp}/codebase_assistant_streamlit``
+
+    Delegates to ``codebase_assistant.config.default_runtime_data_dir`` so
+    CLI ``Config.load()`` and Streamlit/worker share one data root.
     """
-    override = (os.environ.get("CODEBASE_ASSISTANT_DATA_DIR") or "").strip()
-    if override:
-        return override
-    return os.path.join(tempfile.gettempdir(), "codebase_assistant_streamlit")
+    return default_runtime_data_dir()
 
 
 def chroma_persist_dir() -> str:
-    """Env ``CHROMA_PERSIST_DIR`` or ``{data_dir}/chroma``."""
-    override = (os.environ.get("CHROMA_PERSIST_DIR") or "").strip()
-    if override:
-        return override
-    return os.path.join(streamlit_data_dir(), "chroma")
+    """
+    Env ``CHROMA_PERSIST_DIR`` or ``{data_dir}/chroma``.
+
+    Same resolution as ``Config.default_chroma_persist_directory`` /
+    ``Config.load().chroma_persist_directory`` when env is unset.
+    """
+    return default_chroma_persist_directory()
 
 
 def github_clones_dir() -> str:

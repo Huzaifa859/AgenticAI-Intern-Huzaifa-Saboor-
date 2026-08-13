@@ -93,6 +93,10 @@ from ui_reports import (  # noqa: E402
     render_testing_result,
 )
 
+# Same canonical Chroma/memory bases as worker.py / CLI (explicit env wins).
+os.environ.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
+os.environ.setdefault("MEMORY_STORE_PATH", memory_store_path())
+
 #: Sidebar widget keys prefilling from ConversationMemory targets.
 _SIDEBAR_TARGET_KEYS = (
     "sidebar_file_path",

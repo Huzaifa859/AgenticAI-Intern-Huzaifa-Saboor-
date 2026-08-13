@@ -87,6 +87,11 @@ from ui_memory import (  # noqa: E402
     summarize_documentation_for_memory,
     summarize_testing_for_memory,
 )
+from ui_paths import chroma_persist_dir, memory_store_path  # noqa: E402
+
+# Align CLI with Streamlit/worker before Config.load(); explicit env wins.
+os.environ.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
+os.environ.setdefault("MEMORY_STORE_PATH", memory_store_path())
 
 #: Clones resolved during this execution, keyed by canonical repository URL.
 _CLONE_CACHE: Dict[str, str] = {}
