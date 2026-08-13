@@ -38,7 +38,6 @@ import re
 import shutil
 import stat
 import sys
-import tempfile
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -89,10 +88,11 @@ from ui_memory import (  # noqa: E402
     summarize_testing_for_memory,
 )
 
-#: Clones made during this execution, keyed by canonical repository URL.
+#: Clones resolved during this execution, keyed by canonical repository URL.
 _CLONE_CACHE: Dict[str, str] = {}
 
-#: Temporary directories holding those clones, removed on exit.
+#: Truly temporary directories eligible for atexit cleanup. Durable GitHub
+#: clones are never registered here.
 _TEMPORARY_ROOTS: List[str] = []
 
 #: Non-interactive ``--agent`` values and their meanings.
@@ -353,13 +353,22 @@ def _cli_trace(
         pass
 
 
+def _is_git_checkout(path: str) -> bool:
+    """True when ``path`` looks like an existing git working tree."""
+    return os.path.isdir(path) and os.path.isdir(os.path.join(path, ".git"))
+
+
 def clone_or_reuse_repository(
     github_tools: GitHubTools,
     repo_url: str,
     tracer: Optional[Tracer] = None,
 ) -> str:
     """
-    Make a remote repository available locally, reusing an earlier clone.
+    Make a remote repository available in the durable GitHub clone cache.
+
+    Same canonical URL always maps to the same on-disk directory so the
+    Indexer/Chroma identity stays stable across CLI process restarts.
+    Existing checkouts are reused as-is (no fetch/pull in GitHubTools).
 
     Args:
         github_tools: The existing GitHubTools component to clone with.
@@ -373,9 +382,11 @@ def clone_or_reuse_repository(
         InvalidRepositoryURLError: If the URL fails validation.
         RepositoryCloneError: If the repository cannot be cloned.
     """
+    from ui_paths import durable_github_clone_path
+
     key = normalize_repository_url(repo_url)
     cached = _CLONE_CACHE.get(key)
-    if cached and os.path.isdir(cached):
+    if cached and _is_git_checkout(cached):
         print(f"Reusing existing clone of {key}.")
         _cli_trace(
             tracer,
@@ -383,17 +394,36 @@ def clone_or_reuse_repository(
             repository_url=repo_url,
             repository_path=cached,
             reused=True,
+            durable=True,
         )
         return cached
 
     print("Validating repository...")
     github_tools.validate_repository(repo_url)
 
-    temporary_root = tempfile.mkdtemp(prefix="codebase_assistant_clone_")
-    _TEMPORARY_ROOTS.append(temporary_root)
-    destination = os.path.join(temporary_root, "repo")
+    destination = durable_github_clone_path(repo_url)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
 
-    print("Cloning repository...")
+    if _is_git_checkout(destination):
+        print(f"Reusing durable clone of {key}.")
+        _cli_trace(
+            tracer,
+            "repository_cloned",
+            repository_url=repo_url,
+            repository_path=destination,
+            reused=True,
+            durable=True,
+        )
+        _CLONE_CACHE[key] = destination
+        return destination
+
+    if os.path.exists(destination) and not _is_git_checkout(destination):
+        raise RepositoryCloneError(
+            f"Durable clone destination {destination} exists but is not a "
+            f"git repository."
+        )
+
+    print("Cloning repository into durable cache...")
     github_tools.clone_repository(repo_url, destination)
     print("Repository cloned.")
     _cli_trace(
@@ -402,6 +432,7 @@ def clone_or_reuse_repository(
         repository_url=repo_url,
         repository_path=destination,
         reused=False,
+        durable=True,
     )
 
     _CLONE_CACHE[key] = destination
@@ -409,7 +440,11 @@ def clone_or_reuse_repository(
 
 
 def cleanup_temporary_clones() -> None:
-    """Remove every temporary clone created during this execution."""
+    """
+    Remove temporary clone workspaces created during this execution.
+
+    Durable GitHub clones are never deleted here.
+    """
     while _TEMPORARY_ROOTS:
         remove_temporary_tree(_TEMPORARY_ROOTS.pop())
     _CLONE_CACHE.clear()

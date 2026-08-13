@@ -14,7 +14,6 @@ import os
 import shutil
 import stat
 import sys
-import tempfile
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -50,10 +49,14 @@ from codebase_assistant.tools.github_tools import GitHubTools  # noqa: E402
 from codebase_assistant.tracing.events import TraceEventType  # noqa: E402
 from codebase_assistant.tracing.tracer import Tracer  # noqa: E402
 
-#: Clones made during this process, keyed by canonical repository URL.
+#: Clones resolved during this process, keyed by canonical repository URL.
+#: Values are durable clone paths under ``github_clones_dir()`` (or a
+#: temporary path only for legacy/error recovery). Survives only in-memory;
+#: on-disk durability comes from the github_clones directory itself.
 _CLONE_CACHE: Dict[str, str] = {}
 
-#: Temporary directories holding those clones, removed on exit.
+#: Truly temporary directories eligible for atexit cleanup. Durable GitHub
+#: clones under ``github_clones_dir()`` are never added here.
 _TEMPORARY_ROOTS: List[str] = []
 
 
@@ -119,35 +122,70 @@ def _service_trace(
         pass
 
 
+def _is_git_checkout(path: str) -> bool:
+    """True when ``path`` looks like an existing git working tree."""
+    return os.path.isdir(path) and os.path.isdir(os.path.join(path, ".git"))
+
+
 def clone_or_reuse_repository(
     github_tools: GitHubTools,
     repo_url: str,
     tracer: Optional[Tracer] = None,
 ) -> str:
     """
-    Make a remote repository available locally, reusing an earlier clone.
+    Make a remote repository available in the durable GitHub clone cache.
+
+    Same canonical URL always resolves to the same on-disk directory under
+    ``github_clones_dir()``, so Indexer / Chroma identity stays stable
+    across process restarts. Existing checkouts are reused as-is
+    (GitHubTools has no fetch/pull helper); a missing checkout is cloned
+    once into that durable path.
 
     Raises:
         InvalidRepositoryURLError: If the URL fails validation.
         RepositoryCloneError: If the repository cannot be cloned.
     """
+    from ui_paths import durable_github_clone_path, github_clones_dir
+
     key = normalize_repository_url(repo_url)
     cached = _CLONE_CACHE.get(key)
-    if cached and os.path.isdir(cached):
+    if cached and _is_git_checkout(cached):
         _service_trace(
             tracer,
             "repository_cloned",
             repository_url=repo_url,
             repository_path=cached,
             reused=True,
+            durable=True,
         )
         return cached
 
     github_tools.validate_repository(repo_url)
 
-    temporary_root = tempfile.mkdtemp(prefix="codebase_assistant_clone_")
-    _TEMPORARY_ROOTS.append(temporary_root)
-    destination = os.path.join(temporary_root, "repo")
+    destination = durable_github_clone_path(repo_url)
+    # Never register durable paths in _TEMPORARY_ROOTS.
+    ensure_dir = os.path.dirname(destination)
+    os.makedirs(ensure_dir, exist_ok=True)
+
+    if _is_git_checkout(destination):
+        _service_trace(
+            tracer,
+            "repository_cloned",
+            repository_url=repo_url,
+            repository_path=destination,
+            reused=True,
+            durable=True,
+            clones_root=github_clones_dir(),
+        )
+        _CLONE_CACHE[key] = destination
+        return destination
+
+    if os.path.exists(destination) and not _is_git_checkout(destination):
+        # Occupied non-git path under the durable cache — do not wipe.
+        raise RepositoryCloneError(
+            f"Durable clone destination {destination} exists but is not a "
+            f"git repository."
+        )
 
     github_tools.clone_repository(repo_url, destination)
     _service_trace(
@@ -156,6 +194,8 @@ def clone_or_reuse_repository(
         repository_url=repo_url,
         repository_path=destination,
         reused=False,
+        durable=True,
+        clones_root=github_clones_dir(),
     )
 
     _CLONE_CACHE[key] = destination
@@ -163,7 +203,12 @@ def clone_or_reuse_repository(
 
 
 def cleanup_temporary_clones() -> None:
-    """Remove every temporary clone created during this process."""
+    """
+    Remove temporary clone workspaces created during this process.
+
+    Durable GitHub clones under ``github_clones_dir()`` are never deleted.
+    The in-process URL→path cache is cleared; on-disk durable clones remain.
+    """
     while _TEMPORARY_ROOTS:
         remove_temporary_tree(_TEMPORARY_ROOTS.pop())
     _CLONE_CACHE.clear()
