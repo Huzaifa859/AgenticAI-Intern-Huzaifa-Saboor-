@@ -1586,8 +1586,6 @@ def _render_sidebar() -> None:
 
     if st.session_state.repo_path:
         st.sidebar.success(f"Ready: `{st.session_state.repo_path}`")
-    if st.session_state.provider_status:
-        st.sidebar.caption(st.session_state.provider_status)
 
     _render_history_sidebar()
     _render_memory_sidebar()

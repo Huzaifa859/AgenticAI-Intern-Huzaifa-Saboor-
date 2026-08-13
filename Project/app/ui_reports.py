@@ -78,11 +78,13 @@ _REPORT_CSS = """
   background: #dbeafe;
   border-color: rgba(30, 58, 138, 0.16);
 }
-/* ChatGPT-style assistant prose — theme-aware so dark mode stays readable. */
+/* ChatGPT-style assistant prose — inherit Streamlit theme text/background.
+   Streamlit 1.x often does not expose --text-color to custom HTML, so light
+   hardcoded fallbacks made streamed text unreadable in Light Mode. */
 .ca-doc-fallback {
   margin: 0.35rem 0 0.5rem;
   padding: 0.15rem 0.05rem;
-  color: var(--text-color, #e8eaed);
+  color: inherit;
   font-size: 0.98rem;
   line-height: 1.7;
   max-width: 52rem;
@@ -98,12 +100,12 @@ _REPORT_CSS = """
 }
 .ca-doc-msg-body > :first-child { margin-top: 0; }
 .ca-doc-msg-body > :last-child { margin-bottom: 0; }
-.ca-doc-msg-body p { margin: 0 0 0.85rem; }
+.ca-doc-msg-body p { margin: 0 0 0.85rem; color: inherit; }
 .ca-doc-msg-body h1,
 .ca-doc-msg-body h2,
 .ca-doc-msg-body h3,
 .ca-doc-msg-body h4 {
-  color: var(--text-color, #f3f4f6);
+  color: inherit;
   font-weight: 650;
   line-height: 1.3;
   margin: 1.15rem 0 0.5rem;
@@ -115,13 +117,15 @@ _REPORT_CSS = """
 .ca-doc-msg-body ol {
   margin: 0 0 0.85rem;
   padding-left: 1.35rem;
+  color: inherit;
 }
-.ca-doc-msg-body li { margin: 0.2rem 0; }
+.ca-doc-msg-body li { margin: 0.2rem 0; color: inherit; }
 .ca-doc-msg-body code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.86em;
-  background: var(--secondary-background-color, #1f2937);
-  color: var(--text-color, #e5e7eb);
+  background: rgba(128, 128, 128, 0.14);
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  color: inherit;
   border-radius: 5px;
   padding: 0.1rem 0.35rem;
 }
@@ -129,9 +133,12 @@ _REPORT_CSS = """
   margin: 0 0 0.95rem;
   padding: 0.85rem 0.95rem;
   border-radius: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  background: var(--secondary-background-color, #111827);
+  border: 1px solid rgba(128, 128, 128, 0.28);
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
+  background: rgba(128, 128, 128, 0.10);
+  background: color-mix(in srgb, currentColor 8%, transparent);
   overflow-x: auto;
+  color: inherit;
 }
 .ca-doc-msg-body pre code {
   background: transparent;
@@ -149,26 +156,31 @@ _REPORT_CSS = """
   font-size: 0.92rem;
   display: block;
   overflow-x: auto;
+  color: inherit;
 }
 .ca-doc-msg-body th,
 .ca-doc-msg-body td {
-  border: 1px solid rgba(148, 163, 184, 0.25);
+  border: 1px solid rgba(128, 128, 128, 0.28);
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
   padding: 0.45rem 0.6rem;
   text-align: left;
   vertical-align: top;
+  color: inherit;
 }
 .ca-doc-msg-body th {
-  background: var(--secondary-background-color, #1f2937);
+  background: rgba(128, 128, 128, 0.12);
+  background: color-mix(in srgb, currentColor 10%, transparent);
   font-weight: 650;
 }
 .ca-doc-msg-body hr {
   border: 0;
-  border-top: 1px solid rgba(148, 163, 184, 0.35);
+  border-top: 1px solid rgba(128, 128, 128, 0.35);
+  border-top-color: color-mix(in srgb, currentColor 28%, transparent);
   margin: 1rem 0;
 }
 .ca-doc-placeholder {
-  color: var(--text-color, #9ca3af);
-  opacity: 0.75;
+  color: inherit;
+  opacity: 0.72;
   margin: 0;
 }
 .ca-doc-caret {
@@ -177,7 +189,7 @@ _REPORT_CSS = """
   height: 1.05em;
   margin-left: 1px;
   border-radius: 1px;
-  background: var(--text-color, #e5e7eb);
+  background: currentColor;
   vertical-align: -0.15em;
   animation: ca-doc-caret 1s steps(1, end) infinite;
 }
@@ -567,6 +579,111 @@ def _parse_execution_counts(summary: str) -> Dict[str, int]:
         if found:
             counts[key] = int(found.group(1))
     return counts
+
+
+def _sanitize_testing_summary_for_ui(summary: str) -> str:
+    """
+    Remove pytest/collection/traceback/exception noise from a testing summary.
+
+    Presentation-only: pass/fail/skip/coverage stay; error counts, Detail
+    tails, stack traces, warnings, and internal debug fragments are dropped.
+    """
+    text = str(summary or "")
+    if not text.strip():
+        return ""
+
+    # Strip "Detail: …" tails on the Execution line only (keep Coverage/etc.).
+    text = re.sub(
+        r"(Execution:[^\n]*?\.)\s*Detail:\s*[^\n]*",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"[ \t]*Detail:\s*[^\n]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Never surface pytest error counts in the Testing UI summary.
+    text = re.sub(
+        r",?\s*\d+\s+errors?\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    keep: List[str] = []
+    skipping_traceback = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        indented = bool(line[:1].isspace()) if line else False
+
+        if skipping_traceback:
+            # Stay in traceback mode until a normal summary section resumes.
+            if (
+                not stripped
+                or indented
+                or stripped.startswith("File ")
+                or stripped.startswith("~")
+                or stripped.startswith("^")
+                or stripped.startswith("...")
+                or re.match(r"^[A-Za-z_][\w.]*Error\b", stripped)
+                or re.match(r"^[A-Za-z_][\w.]*Exception\b", stripped)
+                or re.match(r"^(raise|assert)\b", stripped, flags=re.IGNORECASE)
+            ):
+                continue
+            skipping_traceback = False
+
+        if lower.startswith("traceback (most recent call last)"):
+            skipping_traceback = True
+            continue
+        if "traceback" in lower:
+            continue
+        if lower.startswith("warning:") or lower.startswith("warnings:"):
+            continue
+        if re.search(
+            r"\b(collection error|error collecting|during collection)\b",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if re.match(r"^(e\s+|error!?|!!!)", lower):
+            continue
+        if re.search(
+            r"(site-packages|_pytest|importtestmodule|pytest\.py|import_path\s*\()",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if re.match(r"^[A-Za-z_][\w.]*Error\b", stripped) or re.match(
+            r"^[A-Za-z_][\w.]*Exception\b", stripped
+        ):
+            continue
+        if re.match(r"^(raise|assert)\b", stripped, flags=re.IGNORECASE):
+            continue
+        # Truncated traceback/code fragments left after Detail stripping.
+        if re.match(r"^[A-Za-z_][\w.]*\s*=\s*[A-Za-z_][\w.]*\s*\(\s*$", stripped):
+            continue
+        if re.match(r"^[A-Za-z_][\w.]*\.\.\.$", stripped):
+            continue
+        if re.search(r"\berrors?\b", stripped, flags=re.IGNORECASE) and (
+            lower.startswith("execution:") or "passed" in lower or "failed" in lower
+        ):
+            stripped = re.sub(r",?\s*\d*\s*errors?\b", "", stripped, flags=re.IGNORECASE)
+            stripped = re.sub(r"\s{2,}", " ", stripped).strip(" ,")
+            if not stripped:
+                continue
+            keep.append(stripped)
+            continue
+        keep.append(line)
+
+    # Collapse excess blank lines left after removals.
+    cleaned = "\n".join(keep)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 
 def _detect_writeback_note(summary: str) -> str:
@@ -1014,6 +1131,7 @@ def render_testing_result(result: Any) -> None:
 
     summary = str(data.get("summary") or "")
     counts = _parse_execution_counts(summary)
+    display_summary = _sanitize_testing_summary_for_ui(summary)
     generated = dict(data.get("generated_tests") or {})
     names = sorted(generated.keys())
     coverage_pct = float(data.get("coverage_estimate") or 0.0) * 100.0
@@ -1022,18 +1140,19 @@ def render_testing_result(result: Any) -> None:
         passed=counts["passed"],
         failed=counts["failed"],
         skipped=counts["skipped"],
-        errors=counts["errors"],
+        # Hide pytest error counts in the Testing UI.
+        errors=0,
         coverage_pct=coverage_pct,
         files=len(names),
     )
 
-    if summary:
-        expanded = not _is_long_log(summary)
+    if display_summary:
+        expanded = not _is_long_log(display_summary)
         label = "Pytest log / summary"
-        if _is_long_log(summary):
+        if _is_long_log(display_summary):
             label += " (collapsed — long output)"
         with st.expander(label, expanded=expanded):
-            st.code(summary, language="text")
+            st.code(display_summary, language="text")
 
     _render_abstention(data.get("abstention"))
 

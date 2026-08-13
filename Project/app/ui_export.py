@@ -173,8 +173,11 @@ def documentation_to_markdown(
 
 def testing_to_markdown(result: Any) -> str:
     """Render a testing result as Markdown."""
+    from ui_reports import _sanitize_testing_summary_for_ui
+
     data = _as_dict(result)
     generated = dict(data.get("generated_tests") or {})
+    summary = _sanitize_testing_summary_for_ui(str(data.get("summary") or ""))
     lines: List[str] = [
         "# Testing result",
         "",
@@ -183,7 +186,7 @@ def testing_to_markdown(result: Any) -> str:
         "",
         "## Summary",
         "",
-        str(data.get("summary") or "").strip() or "_No summary._",
+        summary or "_No summary._",
         "",
     ]
     if generated:
