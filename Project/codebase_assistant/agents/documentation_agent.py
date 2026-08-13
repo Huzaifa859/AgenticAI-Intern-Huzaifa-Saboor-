@@ -44,7 +44,6 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from ..analysis.report_builder import ReportBuilder
 from ..cache.output_cache import OutputCache
 from ..rag.indexer import Indexer
-from ..rag.retriever import Retriever
 from ..schemas.schemas import (
     AbstentionResult,
     AgentRequest,
@@ -59,8 +58,8 @@ from ..tracing.events import TraceEventType
 from ..utils.text_cleanup import sanitize_documentation_text
 from .base import BaseAgent
 from .code_analysis_agent import (
-    CodeAnalysisAgent,
-    _LOW_VALUE_ANALYSIS_BASENAMES,
+    _ANALYSIS_MEDIUM_PREFERRED_MAX,
+    _ANALYSIS_SMALL_PREFERRED_MAX,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,7 +74,7 @@ _MAX_FILE_CHARS = 2500
 _MAX_FILE_CHARS_WITH_RETRIEVAL = 1500
 
 #: Maximum retrieved chunks Documentation may send to the LLM by repo size.
-#: Same small/medium/large buckets as Analysis (preferred Python chunk count).
+#: Bucket *thresholds* match Analysis (40 / 150); the counted units differ.
 _DOC_SMALL_MAX_CHUNKS = 8
 _DOC_MEDIUM_MAX_CHUNKS = 16
 _DOC_LARGE_MAX_CHUNKS = 24
@@ -85,6 +84,10 @@ _DOC_CONTEXT_LIMITS = {
     "medium": _DOC_MEDIUM_MAX_CHUNKS,
     "large": _DOC_LARGE_MAX_CHUNKS,
 }
+
+#: Same numeric Small/Medium/Large cutoffs as Analysis size buckets.
+_DOC_SMALL_SIZE_MAX = _ANALYSIS_SMALL_PREFERRED_MAX
+_DOC_MEDIUM_SIZE_MAX = _ANALYSIS_MEDIUM_PREFERRED_MAX
 
 #: Candidate pool ceiling for Documentation retrieve → keep.
 _DOC_FETCH_POOL_CAP = 48
@@ -137,6 +140,49 @@ _SKIP_DIR_NAMES = frozenset(
     }
 )
 
+#: Extra path components ignored when *sizing* a Documentation repository
+#: (vendored/generated/cache trees that should not inflate Small/Medium/Large).
+_DOC_SIZE_SKIP_DIR_NAMES = _SKIP_DIR_NAMES | frozenset(
+    {
+        "dist",
+        "build",
+        "vendor",
+        "vendored",
+        ".cache",
+        "htmlcov",
+        "coverage",
+        ".eggs",
+        "eggs",
+        ".idea",
+        ".vscode",
+        "wheels",
+        ".ruff_cache",
+        ".hypothesis",
+        "egg-info",
+    }
+)
+
+#: Lockfiles / cache artifacts never counted toward Documentation size.
+_DOC_SIZE_SKIP_BASENAMES = frozenset(
+    {
+        "poetry.lock",
+        "pipfile.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "cargo.lock",
+        "composer.lock",
+        "uv.lock",
+        "pdm.lock",
+        ".coverage",
+        "coverage.xml",
+    }
+)
+
+#: Indexed suffixes that count toward Documentation repository size.
+#: Includes README/markdown (unlike Analysis preferred-code counting).
+_DOC_SIZE_RELEVANT_SUFFIXES = frozenset({".py", ".md", ".txt", ".rst"})
+
 #: Project metadata files that reveal dependencies and run instructions.
 _PROJECT_FILES = (
     "requirements.txt",
@@ -153,6 +199,8 @@ _PROJECT_FILES = (
     "README.md",
     "README.rst",
 )
+
+_PROJECT_FILE_BASENAMES = frozenset(name.lower() for name in _PROJECT_FILES)
 
 #: Cap on characters read from each project metadata file.
 _MAX_PROJECT_FILE_CHARS = 1200
@@ -3090,9 +3138,58 @@ class DocumentationAgent(BaseAgent):
             )
         return excerpts
 
-    def _preferred_code_chunk_count(self) -> Optional[int]:
+    @classmethod
+    def _is_documentation_size_relevant_path(cls, path: str) -> bool:
         """
-        Count preferred executable Python chunks (Analysis size metric).
+        True when an indexed path should count toward Docs size buckets.
+
+        README / markdown / project metadata count. Vendored trees,
+        caches, lockfiles, and other irrelevant artifacts do not.
+        """
+        normalized = (path or "").replace("\\", "/").strip()
+        if not normalized:
+            return False
+        parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+        if not parts:
+            return False
+        lowered_parts = [part.lower() for part in parts]
+        # Skip directory components only (not the basename), so a root
+        # file named oddly cannot be excluded by accident.
+        if any(part in _DOC_SIZE_SKIP_DIR_NAMES for part in lowered_parts[:-1]):
+            return False
+        if any(part.endswith(".egg-info") for part in lowered_parts[:-1]):
+            return False
+        basename = lowered_parts[-1]
+        if basename in _DOC_SIZE_SKIP_BASENAMES:
+            return False
+        if basename in _PROJECT_FILE_BASENAMES:
+            return True
+        return any(basename.endswith(suffix) for suffix in _DOC_SIZE_RELEVANT_SUFFIXES)
+
+    @classmethod
+    def _docs_repo_size_bucket(cls, relevant_count: Optional[int]) -> str:
+        """
+        Classify Documentation repository size.
+
+        Uses the same numeric cutoffs as Analysis (40 / 150) but is fed
+        Documentation-relevant chunk counts, not Analysis preferred-code
+        counts.
+        """
+        if relevant_count is None or relevant_count <= 0:
+            return "medium"
+        if relevant_count <= _DOC_SMALL_SIZE_MAX:
+            return "small"
+        if relevant_count <= _DOC_MEDIUM_SIZE_MAX:
+            return "medium"
+        return "large"
+
+    def _documentation_relevant_chunk_count(self) -> Optional[int]:
+        """
+        Count indexed chunks relevant to Documentation sizing.
+
+        Includes README/markdown/project metadata and Python sources.
+        Does not exclude README the way Analysis preferred-code counting
+        does. Ignores vendored/generated/cache/lockfile paths.
 
         Returns:
             The count, or None when the store cannot be inspected.
@@ -3100,11 +3197,11 @@ class DocumentationAgent(BaseAgent):
         if self.retriever is None:
             return None
         try:
-            where = Retriever.build_filter(language="python")
-            chunks = self.retriever.vector_db.list_chunks(where=where)
+            # No language filter: markdown/README must be visible to Docs.
+            chunks = self.retriever.vector_db.list_chunks()
         except Exception as exc:
             logger.debug(
-                "Could not count preferred Documentation code chunks: %s", exc
+                "Could not count Documentation-relevant chunks: %s", exc
             )
             return None
 
@@ -3115,25 +3212,29 @@ class DocumentationAgent(BaseAgent):
 
         count = 0
         for chunk in chunks:
-            path = (getattr(chunk, "file_path", None) or "").replace("\\", "/")
-            basename = path.rsplit("/", 1)[-1].lower()
-            if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
-                continue
-            count += 1
+            path = (
+                getattr(chunk, "file_path", None)
+                or (getattr(chunk, "metadata", None) or {}).get("file_path")
+                or ""
+            )
+            if self._is_documentation_size_relevant_path(str(path)):
+                count += 1
         return count
 
     def _docs_retrieval_limit(self) -> int:
         """
         Size-based Documentation keep ceiling (8 / 16 / 24).
 
-        Uses the same preferred-chunk size buckets as Analysis so agents
-        agree on small/medium/large. Ignores ``Config.retrieval_top_k``.
+        Classification uses Documentation-relevant indexed content
+        (including README/docs metadata). Ignores ``Config.retrieval_top_k``.
+        README/project files still arrive via dedicated inventory / project
+        file prompt sections — this limit only sizes RAG keep count.
         """
-        preferred = self._preferred_code_chunk_count()
-        bucket = CodeAnalysisAgent._analysis_repo_size_bucket(preferred)
+        relevant = self._documentation_relevant_chunk_count()
+        bucket = self._docs_repo_size_bucket(relevant)
         return int(_DOC_CONTEXT_LIMITS[bucket])
 
-    def _docs_fetch_k(self, limit: int, preferred_n: Optional[int]) -> int:
+    def _docs_fetch_k(self, limit: int, relevant_n: Optional[int]) -> int:
         """
         Candidate pool for Documentation retrieve → dedupe → keep.
 
@@ -3143,8 +3244,8 @@ class DocumentationAgent(BaseAgent):
         cfg = getattr(self.retriever, "config", None) if self.retriever else None
         configured = int(getattr(cfg, "rerank_candidates", 0) or 0)
         fetch_k = max(limit, configured, limit * 2)
-        if preferred_n is not None and preferred_n > 0:
-            fetch_k = max(fetch_k, min(preferred_n, _DOC_FETCH_POOL_CAP))
+        if relevant_n is not None and relevant_n > 0:
+            fetch_k = max(fetch_k, min(relevant_n, _DOC_FETCH_POOL_CAP))
         return min(max(fetch_k, limit), _DOC_FETCH_POOL_CAP)
 
     def _retrieve_context(
@@ -3160,14 +3261,18 @@ class DocumentationAgent(BaseAgent):
         When ``source_file`` is set, keep only chunks from that file.
         Keep count is size-based (8 / 16 / 24). Returns an empty list when
         the retriever is missing, the index is empty, or retrieval fails.
+
+        Does not force README into the RAG top-k; README and project
+        metadata remain available through inventory / project-file
+        sections in ``_build_prompt``.
         """
         if self.retriever is None:
             logger.info("No retriever configured; continuing with repository files only.")
             return []
 
         limit = self._docs_retrieval_limit()
-        preferred_n = self._preferred_code_chunk_count()
-        fetch_k = self._docs_fetch_k(limit, preferred_n)
+        relevant_n = self._documentation_relevant_chunk_count()
+        fetch_k = self._docs_fetch_k(limit, relevant_n)
 
         try:
             chunks = self.retriever.retrieve(
