@@ -111,14 +111,26 @@ _ANALYSIS_RETRIEVAL_QUERY_EXPANSION = (
 #: retrieval slots when real source chunks are available. Still indexed.
 _LOW_VALUE_ANALYSIS_BASENAMES = frozenset({"readme.md", "__init__.py"})
 
-#: When the index has at most this many preferred code chunks, Analysis
-#: may retrieve more than ``retrieval_top_k`` (capped below) so a small
-#: repo is not truncated to eight arbitrary hits.
-_SMALL_REPO_CODE_CHUNK_THRESHOLD = 32
+#: Preferred executable Python chunk counts that classify repository size
+#: for Analysis context sizing (not Documentation / Testing).
+_ANALYSIS_SMALL_PREFERRED_MAX = 40
+_ANALYSIS_MEDIUM_PREFERRED_MAX = 150
 
-#: Hard ceiling on Analysis chunks for small repositories. Keeps the
-#: prompt modest while covering substantially more executable code.
-_SMALL_REPO_ANALYSIS_MAX_CHUNKS = 16
+#: Maximum chunks Analysis may send to the LLM by repository size.
+#: These are ceilings; fewer available chunks means fewer are sent.
+_ANALYSIS_SMALL_MAX_CHUNKS = 12
+_ANALYSIS_MEDIUM_MAX_CHUNKS = 20
+_ANALYSIS_LARGE_MAX_CHUNKS = 32
+
+_ANALYSIS_CONTEXT_LIMITS = {
+    "small": _ANALYSIS_SMALL_MAX_CHUNKS,
+    "medium": _ANALYSIS_MEDIUM_MAX_CHUNKS,
+    "large": _ANALYSIS_LARGE_MAX_CHUNKS,
+}
+
+#: Upper bound on the Analysis vector/rerank candidate pool so large
+#: indexes are not fully dumped into retrieval.
+_ANALYSIS_FETCH_POOL_CAP = 64
 
 #: How many static findings to show the model. Enough to stop it
 #: re-reporting what is already known, not so many that they crowd out
@@ -487,8 +499,8 @@ class CodeAnalysisAgent(BaseAgent):
             use_rag: When False, indexing and retrieval are skipped
                 entirely. The model still runs, with static findings but
                 no retrieved code.
-            top_k: Chunks to retrieve. Defaults to
-                `Config.retrieval_top_k`.
+            top_k: Optional hard override for Analysis chunk count.
+                When omitted, size-based limits apply (12 / 20 / 32).
 
         Returns:
             The verified findings and everything about how they were
@@ -600,8 +612,8 @@ class CodeAnalysisAgent(BaseAgent):
         Args:
             repository_path: Repository to analyze.
             question: The natural language question.
-            top_k: Chunks to retrieve. Defaults to
-                `Config.retrieval_top_k`.
+            top_k: Optional hard override for Analysis chunk count.
+                When omitted, size-based limits apply (12 / 20 / 32).
 
         Returns:
             The answer, plus any verified findings the question turned
@@ -918,34 +930,59 @@ class CodeAnalysisAgent(BaseAgent):
             count += 1
         return count
 
+    @classmethod
+    def _analysis_repo_size_bucket(cls, preferred: Optional[int]) -> str:
+        """
+        Classify repository size from preferred executable chunk count.
+
+        Returns:
+            ``"small"``, ``"medium"``, or ``"large"``.
+        """
+        if preferred is None or preferred <= 0:
+            # Unknown / empty index: medium keeps prompts bounded.
+            return "medium"
+        if preferred <= _ANALYSIS_SMALL_PREFERRED_MAX:
+            return "small"
+        if preferred <= _ANALYSIS_MEDIUM_PREFERRED_MAX:
+            return "medium"
+        return "large"
+
     def _analysis_retrieval_limit(
         self,
         retriever: Retriever,
         top_k: Optional[int],
     ) -> int:
         """
-        Choose how many chunks Analysis should keep after filtering.
+        Effective Analysis ``retrieval_top_k`` / final keep ceiling.
 
-        Small repositories raise the ceiling (capped) so most executable
-        chunks can reach the model; large repositories keep
-        ``retrieval_top_k``.
+        Size-based maxima (12 / 20 / 32). An explicit ``top_k`` overrides
+        for tests and callers; ``Config.retrieval_top_k`` is not used so
+        Documentation / Testing defaults cannot silently cap Analysis.
         """
-        base = (
-            top_k
-            if top_k is not None
-            else int(getattr(self.config, "retrieval_top_k", 8) or 8)
-        )
-        if base <= 0:
-            base = 8
+        if top_k is not None:
+            return max(1, int(top_k))
 
         preferred = self._preferred_code_chunk_count(retriever)
-        if preferred is None:
-            return base
-        if preferred <= 0:
-            return base
-        if preferred <= _SMALL_REPO_CODE_CHUNK_THRESHOLD:
-            return max(base, min(_SMALL_REPO_ANALYSIS_MAX_CHUNKS, preferred))
-        return base
+        bucket = self._analysis_repo_size_bucket(preferred)
+        return int(_ANALYSIS_CONTEXT_LIMITS[bucket])
+
+    def _analysis_fetch_k(
+        self,
+        limit: int,
+        preferred_n: Optional[int],
+    ) -> int:
+        """
+        Candidate pool size for Analysis retrieve → select/rerank.
+
+        Must be at least ``limit`` (and usually larger) so overview
+        demotion cannot silently prevent reaching 12 / 20 / 32.
+        """
+        configured = int(getattr(self.config, "rerank_candidates", 0) or 0)
+        # At least 2x the keep limit so preferred slots survive filtering.
+        fetch_k = max(limit, configured, limit * 2)
+        if preferred_n is not None and preferred_n > 0:
+            fetch_k = max(fetch_k, min(preferred_n, _ANALYSIS_FETCH_POOL_CAP))
+        return min(max(fetch_k, limit), _ANALYSIS_FETCH_POOL_CAP)
 
     def _retrieve_for_analysis(
         self,
@@ -954,20 +991,12 @@ class CodeAnalysisAgent(BaseAgent):
         top_k: Optional[int],
     ) -> List[RetrievedChunk]:
         """
-        Analysis retrieval: expanded query, code preference, small-repo cover.
+        Analysis retrieval: expanded query, code preference, size-based keep.
         """
         limit = self._analysis_retrieval_limit(retriever, top_k)
         retrieval_query = self._analysis_retrieval_query(question)
-
-        # Fetch a wider pool than ``limit`` so overview hits can be
-        # discarded without under-filling preferred slots.
-        fetch_k = max(
-            limit,
-            int(getattr(self.config, "rerank_candidates", 24) or 24),
-        )
         preferred_n = self._preferred_code_chunk_count(retriever)
-        if preferred_n is not None and preferred_n <= _SMALL_REPO_CODE_CHUNK_THRESHOLD:
-            fetch_k = max(fetch_k, preferred_n)
+        fetch_k = self._analysis_fetch_k(limit, preferred_n)
 
         python_filter = Retriever.build_filter(language="python")
         candidates = retriever.retrieve(
