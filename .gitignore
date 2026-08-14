@@ -25,16 +25,22 @@ __pycache__/
 **/chroma_store/
 **/.chroma/
 **/chroma/
-**/chroma.sqlite3
+*.sqlite3
 
 # Benchmark run outputs (keep directory via .gitkeep)
 Project/benchmarks/results/*
 !Project/benchmarks/results/.gitkeep
 
-# Environment variables
+# Local validation / e2e / bench artifacts (scratch outputs under Project/)
+.bench_*/
+_bench*/
+_e2e*/
+_validate*/
+_rerun*/
+
+# Environment variables (keep committed templates)
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
 
 # Python packaging

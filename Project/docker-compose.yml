@@ -1,7 +1,8 @@
 # docker-compose.yml
 # ==================
 #
-# Streamlit-only deployment (OpenRouter). No Ollama / Jupyter / MCP ports.
+# Streamlit + warm worker deployment (OpenRouter).
+# No Ollama / Jupyter / MCP sidecars.
 #
 #     cp .env.example .env   # set OPENROUTER_API_KEY
 #     docker compose up --build
@@ -16,13 +17,17 @@ services:
     env_file:
       - .env
     environment:
+      # Persist RAG index, session memory, and UI run history on the volume.
       CODEBASE_ASSISTANT_DATA_DIR: /data
       CHROMA_PERSIST_DIR: /data/chroma
       MEMORY_STORE_PATH: /data/memory
       RUN_HISTORY_PATH: /data/history/ui_run_history.jsonl
+      # Warm worker stays container-local (not published).
       CA_WORKER_HOST: 127.0.0.1
       CA_WORKER_PORT: "8765"
       CA_WORKER_URL: http://127.0.0.1:8765
+      # OPENROUTER_API_KEY (and optional GITHUB_TOKEN / model overrides)
+      # come from env_file: .env — do not hardcode secrets here.
     volumes:
       - ca_data:/data
     restart: unless-stopped

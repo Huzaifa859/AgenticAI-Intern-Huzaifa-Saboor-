@@ -2,6 +2,7 @@
 # ==========
 #
 # Streamlit Web UI for Codebase Assistant (OpenRouter).
+# Ships only the runtime app package + demo repo — not tests/docs/benchmarks.
 #
 # Build / run from the Project directory:
 #
@@ -22,13 +23,18 @@ WORKDIR /app
 
 # Dependency layer first so code-only changes reuse the pip cache.
 # Longer timeout/retries: PyPI downloads from inside Docker are often slow.
-COPY codebase_assistant/requirements.txt ./requirements.txt
+COPY requirements-docker.txt ./requirements.txt
 ENV PIP_DEFAULT_TIMEOUT=100 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN pip install --upgrade pip \
     && pip install --no-cache-dir --retries 10 --default-timeout=100 -r requirements.txt
 
-COPY . .
+# Runtime application only (see .dockerignore for excluded paths).
+COPY app ./app
+COPY codebase_assistant ./codebase_assistant
+COPY .streamlit ./.streamlit
+COPY examples/demo_repo ./examples/demo_repo
+COPY .env.example ./.env.example
 
 RUN useradd -m appuser \
     && mkdir -p /data/chroma /data/memory /data/history \
