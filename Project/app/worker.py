@@ -180,10 +180,19 @@ class ProgressWriter:
         """Write any buffered stream text immediately (caller holds lock)."""
         if not self.path or not self._stream_buf:
             return
+        stage = self._stream_stage or "documentation_stream_delta"
         chunk = self._stream_buf
         self._stream_buf = ""
         self._stream_opened_at = 0.0
-        stage = self._stream_stage or "documentation_stream_delta"
+        if stage == "documentation_stream_delta":
+            # Strip JS placeholders before the UI ever sees them.
+            from codebase_assistant.utils.text_cleanup import (  # noqa: E402
+                strip_object_object_junk,
+            )
+
+            chunk = strip_object_object_junk(chunk)
+            if not chunk:
+                return
         message = self._stream_message or _STREAM_MESSAGES.get(
             stage,
             "Streaming…",

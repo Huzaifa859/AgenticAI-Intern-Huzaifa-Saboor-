@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Mapping, Optional
 
+from codebase_assistant.utils.text_cleanup import sanitize_documentation_text
+
 
 def _as_dict(value: Any) -> Dict[str, Any]:
     if value is None:
@@ -141,7 +143,8 @@ def documentation_to_markdown(
         "",
         f"- Target: `{target}`",
         "",
-        str(data.get("summary") or "").strip() or "_Empty documentation summary._",
+        sanitize_documentation_text(str(data.get("summary") or "").strip())
+        or "_Empty documentation summary._",
         "",
     ]
     parameters = list(data.get("parameters") or [])

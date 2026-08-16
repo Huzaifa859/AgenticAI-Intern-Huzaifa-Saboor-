@@ -376,10 +376,13 @@ def test_sanitize_documentation_output_strips_object_object() -> None:
         "cd demo1\n"
         ",[object Object],\n"
         ",[object Object],\n"
+        "\\[object Object\\]\n"
+        "object Object\n"
         "No packages needed.\n"
     )
     cleaned = DocumentationAgent._sanitize_documentation_output(messy)
     assert "[object Object]" not in cleaned
+    assert "object Object" not in cleaned
     assert "No packages needed." in cleaned
     assert "cd demo1" in cleaned
 

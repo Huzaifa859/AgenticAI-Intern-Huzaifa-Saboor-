@@ -27,7 +27,10 @@ from codebase_assistant.analysis.finding_attribution import (
     META_GROUNDING_STATUS,
     attribution_lines,
 )
-from codebase_assistant.utils.text_cleanup import sanitize_documentation_text
+from codebase_assistant.utils.text_cleanup import (
+    sanitize_documentation_text,
+    strip_object_object_junk,
+)
 
 _REPORT_CSS = """
 <style>
@@ -205,6 +208,13 @@ def _ensure_report_styles() -> None:
     st.markdown(_REPORT_CSS, unsafe_allow_html=True)
 
 
+def _html_escape_visible(text: str) -> str:
+    """Escape text so Streamlit markdown cannot revive ``[object Object]`` links."""
+    escaped = html.escape(text or "")
+    # st.markdown(..., unsafe_allow_html=True) still parses [text] as links.
+    return escaped.replace("[", "&#91;").replace("]", "&#93;")
+
+
 def _render_inline_markdown(text: str) -> str:
     """Escape text and apply a small inline markdown subset."""
     raw = text or ""
@@ -217,17 +227,17 @@ def _render_inline_markdown(text: str) -> str:
     )
     for match in pattern.finditer(raw):
         if match.start() > cursor:
-            pieces.append(html.escape(raw[cursor : match.start()]))
+            pieces.append(_html_escape_visible(raw[cursor : match.start()]))
         token = match.group(0)
         if token.startswith("`"):
-            pieces.append(f"<code>{html.escape(token[1:-1])}</code>")
+            pieces.append(f"<code>{_html_escape_visible(token[1:-1])}</code>")
         elif token.startswith("**") or token.startswith("__"):
-            pieces.append(f"<strong>{html.escape(token[2:-2])}</strong>")
+            pieces.append(f"<strong>{_html_escape_visible(token[2:-2])}</strong>")
         else:
-            pieces.append(f"<em>{html.escape(token[1:-1])}</em>")
+            pieces.append(f"<em>{_html_escape_visible(token[1:-1])}</em>")
         cursor = match.end()
     if cursor < len(raw):
-        pieces.append(html.escape(raw[cursor:]))
+        pieces.append(_html_escape_visible(raw[cursor:]))
     return "".join(pieces)
 
 
@@ -340,7 +350,7 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
                 index += 1
             if index < len(lines):
                 index += 1
-            code = html.escape("\n".join(code_lines))
+            code = _html_escape_visible("\n".join(code_lines))
             lang_attr = f' class="language-{html.escape(lang)}"' if lang else ""
             blocks.append(f"<pre><code{lang_attr}>{code}</code></pre>")
             continue
@@ -406,6 +416,9 @@ def documentation_body_html(text: str, *, live: bool = False) -> str:
     flush_list()
 
     body = "".join(blocks) if blocks else f"<p>{_render_inline_markdown(source)}</p>"
+    # Scrub again after HTML escaping. ``[`` is not escaped by html.escape, and
+    # ``&#91;object Object&#93;`` still renders as visible junk in the browser.
+    body = strip_object_object_junk(body)
     if live:
         # Attach caret to the last text-bearing block without nesting invalid HTML.
         caret = '<span class="ca-doc-caret" aria-hidden="true"></span>'
@@ -540,14 +553,14 @@ def render_documentation_message(
     del title, key  # Call-site compatibility; chrome stays intentionally minimal.
     _ensure_report_styles()
     body = documentation_body_html(text, live=live)
-    # Sentinel sits after the message so scroll helpers can find the bottom.
     sentinel = (
         '<div id="ca-doc-stream-end" aria-hidden="true"></div>' if live else ""
     )
-    st.markdown(
+    # Use st.html so Streamlit's markdown parser cannot turn leftover
+    # [object Object] tokens into visible "object Object" link text.
+    st.html(
         f'<div class="ca-doc-fallback"><div class="ca-doc-msg-body">{body}</div></div>'
-        f"{sentinel}",
-        unsafe_allow_html=True,
+        f"{sentinel}"
     )
     if live:
         _follow_streaming_viewport(tick=len(text or ""))
@@ -1109,7 +1122,7 @@ def render_documentation_result(
 
     _render_abstention(data.get("abstention"))
 
-    body = str(data.get("summary") or "").strip()
+    body = sanitize_documentation_text(str(data.get("summary") or ""))
     if write_note and write_note in body:
         body = body.replace(write_note, "").rstrip()
 

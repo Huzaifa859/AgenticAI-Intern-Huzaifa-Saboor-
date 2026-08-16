@@ -55,7 +55,7 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tracing.events import TraceEventType
-from ..utils.text_cleanup import sanitize_documentation_text
+from ..utils.text_cleanup import sanitize_documentation_text, strip_object_object_junk
 from .base import BaseAgent
 from .code_analysis_agent import (
     _ANALYSIS_MEDIUM_PREFERRED_MAX,
@@ -1520,8 +1520,8 @@ class DocumentationAgent(BaseAgent):
         model_started = time.perf_counter()
 
         def _on_chunk(text: str) -> None:
-            chunk = str(text or "")
-            if not chunk:
+            chunk = strip_object_object_junk(str(text or ""))
+            if not chunk.strip():
                 return
             self._trace(
                 "documentation_stream_delta",

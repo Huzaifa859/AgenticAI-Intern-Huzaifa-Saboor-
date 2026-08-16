@@ -92,6 +92,9 @@ from ui_reports import (  # noqa: E402
     render_documentation_result,
     render_testing_result,
 )
+from codebase_assistant.utils.text_cleanup import (  # noqa: E402
+    strip_object_object_junk,
+)
 
 # Same canonical Chroma/memory bases as worker.py / CLI (explicit env wins).
 os.environ.setdefault("CHROMA_PERSIST_DIR", chroma_persist_dir())
@@ -1232,6 +1235,9 @@ def _poll_active_job() -> None:
             stage,
             float(job_state.get("fraction") or 0.02),
         )
+    # Strip JS-style [object Object] junk on the full accumulated buffer so it
+    # is caught even when split across streamed chunks, for all three agents.
+    stream_buf = strip_object_object_junk(stream_buf)
     st.session_state.doc_stream_text = stream_buf
     st.session_state.job_log = log[-40:]
 
