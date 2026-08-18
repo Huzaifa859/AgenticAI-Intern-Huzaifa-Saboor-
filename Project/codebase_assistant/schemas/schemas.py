@@ -21,7 +21,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AgentType(str, Enum):
@@ -219,6 +219,88 @@ class TestGenerationResult(BaseModel):
     execution_status: Literal["passed", "failed", "error"]
     tests_passed: int
     tests_failed: int
+
+
+class CodeChunk(BaseModel):
+    """
+    Represents a single indexed unit of source code.
+
+    This is the output of AST-aware chunking (one chunk per function or
+    class, per the proposal's Indexing Design) and the unit that gets
+    embedded and stored in the vector database.
+
+    `line_start` and `line_end` are the load-bearing fields: they are
+    what lets GroundingChecker read the real source and confirm that the
+    code a bug report quotes actually exists where it claims. A chunk
+    without accurate line numbers cannot be used to ground a claim.
+
+    Distinct from RetrievedChunk, which represents a chunk *coming back*
+    from a similarity search along with its score. CodeChunk is the
+    index-time record; RetrievedChunk is the query-time result.
+
+    Attributes:
+        chunk_id: Stable unique identifier for this chunk, used as the
+            vector store primary key. Must be reproducible across runs
+            so re-indexing updates a chunk rather than duplicating it.
+        file_path: Path to the source file, relative to the repository
+            root. Kept relative so an index stays valid regardless of
+            where the repository was cloned.
+        language: Source language of the chunk. Python only in the MVP,
+            but recorded explicitly so a future multi-language index
+            does not need a migration.
+        class_name: Name of the enclosing class, or None for a
+            module-level function or a chunk that is itself a class.
+        function_name: Name of the function or method this chunk covers,
+            or None for a class-level or module-level chunk.
+        line_start: First line of the chunk in the source file,
+            1-indexed and inclusive.
+        line_end: Last line of the chunk in the source file, 1-indexed
+            and inclusive.
+        imports: Import statements in scope for this chunk, carried
+            along because a function's meaning often depends on names
+            imported at the top of its module — which the chunk itself
+            does not contain.
+        content: The exact source text of the chunk, byte-for-byte as it
+            appears in the file. Must not be reformatted, or grounding
+            verification against the original source will fail.
+        metadata: Arbitrary extra detail (decorators, docstring
+            presence, complexity scores) that does not yet warrant a
+            dedicated field.
+    """
+
+    chunk_id: str
+    file_path: str
+    language: str
+    class_name: Optional[str] = None
+    function_name: Optional[str] = None
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    imports: List[str] = Field(default_factory=list)
+    content: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_line_range(self) -> "CodeChunk":
+        """
+        Reject chunks whose line range is inverted.
+
+        Catching this at construction matters because an invalid range
+        would otherwise surface much later as a silent grounding
+        failure, where a legitimate bug report gets discarded for
+        reasons that have nothing to do with the report itself.
+
+        Returns:
+            The validated CodeChunk.
+
+        Raises:
+            ValueError: If `line_end` precedes `line_start`.
+        """
+        if self.line_end < self.line_start:
+            raise ValueError(
+                f"line_end ({self.line_end}) cannot precede "
+                f"line_start ({self.line_start})."
+            )
+        return self
 
 
 class RetrievedChunk(BaseModel):

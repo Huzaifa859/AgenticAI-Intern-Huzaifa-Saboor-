@@ -18,11 +18,22 @@ __pycache__/
 # VS Code
 .vscode/
 
-# ChromaDB
+# ChromaDB / Codebase Assistant runtime data
+# Config defaults: ./.codebase_assistant/chroma and memory_store
+.codebase_assistant/
+**/.codebase_assistant/
 **/chroma_store/
 
 # Environment variables
 .env
+.env.local
+.env.*.local
+!.env.example
+
+# Python packaging
+dist/
+build/
+*.egg-info/
 
 # OS files
 .DS_Store

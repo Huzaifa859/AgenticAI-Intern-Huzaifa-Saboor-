@@ -2,19 +2,29 @@
 registry.py
 ===========
 
-Defines the ToolRegistry, a central place where all tools (GitHub,
-Filesystem, and future additions) are registered and looked up by
-name.
+Central registry where all tools (GitHub, Filesystem, and future
+additions) are registered, looked up, and invoked by name.
 
-NOTE: This only implements plain in-process tool registration/lookup.
-MCP (Model Context Protocol) server-based tools are NOT implemented
-yet — that will be added as a separate integration later.
+Tools are plain Python callables. Keeping invocation behind
+`call_tool` means agents never hold a reference to a concrete tool
+implementation, so a tool can be replaced -- eventually by an
+MCP-hosted equivalent -- without touching calling code.
+
+`call_tool` reports failure by returning an unsuccessful ToolCallResult
+rather than raising. A tool call is an expected part of an agent's
+reasoning loop, and a missing tool or a bad argument should be something
+the agent can read and recover from, not an exception that unwinds the
+run.
+
+NOTE: This is plain in-process registration. MCP server-based tools are
+not implemented yet.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
+from ..exceptions.tool_exceptions import ToolExecutionError, ToolNotFoundError
 from ..schemas.schemas import ToolCallRequest, ToolCallResult
 
 
@@ -22,10 +32,8 @@ class ToolRegistry:
     """
     Central registry for all tools available to agents.
 
-    Tools are plain Python callables registered under a unique string
-    name, stored in an internal dictionary, and can be looked up or
-    invoked by that name. This decouples agents from the concrete
-    implementation of each tool (GitHub API, filesystem access, etc).
+    Tools are registered under a unique string name, stored in an
+    internal dictionary, and can be looked up or invoked by that name.
     """
 
     def __init__(self) -> None:
@@ -42,9 +50,12 @@ class ToolRegistry:
             handler: Callable implementing the tool's behavior.
 
         Raises:
-            ValueError: If a tool is already registered under `name`.
+            ValueError: If `name` is empty, or a tool is already
+                registered under it.
             TypeError: If `handler` is not callable.
         """
+        if not name or not str(name).strip():
+            raise ValueError("Tool name must be a non-empty string.")
         if not callable(handler):
             raise TypeError(f"Tool handler for '{name}' must be callable.")
         if name in self._tools:
@@ -93,17 +104,66 @@ class ToolRegistry:
                 arguments.
 
         Returns:
-            A ToolCallResult with the (placeholder) outcome of the call.
-
-        TODO: Implement real dispatch (invoking the handler with
-        request.arguments), argument validation, error handling, and
-        result normalization. Not required yet — MCP-based tool
-        invocation will likely replace/extend this.
+            A ToolCallResult. On success, `result` carries the tool's
+            return value. On failure, `error` explains what went wrong --
+            an unknown tool lists the names that are available, and a
+            signature mismatch reports the argument error verbatim.
         """
-        # TODO: implement real tool dispatch logic
+        name = request.tool_name
+
+        try:
+            handler = self._require_tool(name)
+        except ToolNotFoundError as exc:
+            return ToolCallResult(
+                tool_name=name, success=False, result=None, error=str(exc)
+            )
+
+        arguments = request.arguments or {}
+
+        try:
+            result = handler(**arguments)
+        except TypeError as exc:
+            # Raised when the supplied arguments do not match the
+            # handler's signature, which is the most common caller error.
+            return ToolCallResult(
+                tool_name=name,
+                success=False,
+                result=None,
+                error=f"Invalid arguments for tool '{name}': {exc}",
+            )
+        except Exception as exc:
+            # Deliberately broad: any tool failure becomes a readable
+            # result rather than propagating out of the agent's loop.
+            wrapped = ToolExecutionError(
+                f"Tool '{name}' raised {type(exc).__name__}: {exc}"
+            )
+            return ToolCallResult(
+                tool_name=name, success=False, result=None, error=str(wrapped)
+            )
+
         return ToolCallResult(
-            tool_name=request.tool_name,
-            success=False,
-            result=None,
-            error="Not implemented",
+            tool_name=name, success=True, result=result, error=None
         )
+
+    def _require_tool(self, name: str) -> Callable[..., Any]:
+        """
+        Look up a tool, failing loudly when it is absent.
+
+        Args:
+            name: Name of the tool to retrieve.
+
+        Returns:
+            The registered handler.
+
+        Raises:
+            ToolNotFoundError: If no tool is registered under `name`.
+                The message lists the registered names, so a typo is
+                obvious from the error alone.
+        """
+        handler = self._tools.get(name)
+        if handler is None:
+            available = ", ".join(sorted(self._tools)) or "none"
+            raise ToolNotFoundError(
+                f"No tool registered under '{name}'. Available tools: {available}."
+            )
+        return handler
