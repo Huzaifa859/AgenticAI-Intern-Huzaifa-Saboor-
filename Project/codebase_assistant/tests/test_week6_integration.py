@@ -102,7 +102,16 @@ def test_week6_pipeline_produces_grounded_report(buggy_repository: Path) -> None
     """
     repo = str(buggy_repository.resolve())
 
-    supervisor = Supervisor(config=Config.load())
+    # Keep this test static-only even when a local .env provides an
+    # OpenRouter key or Ollama is running. Week 6 grounding coverage
+    # must stay deterministic.
+    config = Config.load()
+    config.openrouter_api_key = None
+    supervisor = Supervisor(config=config)
+    if supervisor.provider is not None:
+        supervisor.provider.api_key = None
+    supervisor.provider_manager.fallback = None
+    supervisor.provider_manager.mark_preferred_unavailable("week6_static_only")
     agent = supervisor.agents[AgentType.CODE_ANALYSIS]
     assert isinstance(agent, CodeAnalysisAgent)
 
@@ -127,7 +136,9 @@ def test_week6_pipeline_produces_grounded_report(buggy_repository: Path) -> None
     missing = REQUIRED_BUG_TYPES - found_types
     assert not missing, f"missing expected bug types: {sorted(missing)}"
 
-    checker = GroundingChecker(workspace_root=repo)
+    # Explicitly enable grounding for this regression check; production
+    # defaults keep grounding off.
+    checker = GroundingChecker(workspace_root=repo, enabled=True)
     verification = checker.verify_reports(report.findings)
     assert len(verification.grounded) == len(report.findings)
     assert verification.rejected == []

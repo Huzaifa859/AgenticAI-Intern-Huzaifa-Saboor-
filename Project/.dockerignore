@@ -1,0 +1,65 @@
+# Keep secrets and non-runtime junk out of the build context / image.
+
+# Secrets — never bake into the image (Compose loads .env at runtime).
+.env
+.env.*
+!.env.example
+
+# Virtualenvs / Python caches
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+**/.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# VCS / editor / OS
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local runtime stores / indexes (use the Compose volume instead)
+.codebase_assistant/
+**/.codebase_assistant/
+**/chroma_store/
+**/.chroma/
+**/chroma/
+*.sqlite3
+
+# Tests (not required to run the UI / agents)
+**/tests/
+app/test_*.py
+codebase_assistant/tests/
+
+# Docs / notebooks / benchmarks / scripts not needed at runtime
+docs/
+notebooks/
+benchmarks/
+Project.ipynb
+*.ipynb
+README.md
+codebase_assistant/README.md
+run_*.bat
+
+# Extra examples beyond the UI default demo_repo (copied explicitly in Dockerfile)
+examples/medium_repo/
+examples/demo1/
+examples/unsupported_repo/
+examples/run_demo.py
+
+# Local experiment / e2e / bench artifacts
+.bench_*/
+_bench*/
+_e2e*/
+_validate*/
+_rerun*/
+*.log

@@ -4,9 +4,6 @@ base.py
 
 Defines BaseHook, the abstract interface every lifecycle hook
 implements.
-
-TODO: Implement concrete hooks — timing/tracing, structured logging,
-and error reporting — and register them with the HookManager.
 """
 
 from __future__ import annotations
@@ -37,7 +34,7 @@ class BaseHook(ABC):
             context: Event-specific payload (e.g. agent type, tool
                 name, elapsed time, raised exception).
 
-        TODO: Implement in each concrete subclass. Hooks are intended
-        to be side-effect-only and must not alter control flow.
+        Hooks are side-effect-only and must not alter control flow.
+        Exceptions raised here are caught by HookManager.trigger.
         """
         raise NotImplementedError

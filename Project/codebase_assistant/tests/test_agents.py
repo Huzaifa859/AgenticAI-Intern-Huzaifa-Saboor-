@@ -7,11 +7,13 @@ Placeholder tests for the Supervisor and the three specialized agents.
 The Code Analysis Agent is the priority here — it is the proposal's
 primary feature and half of the Week 6 coverage target.
 
-TODO: Replace every skip below with real assertions as each agent is
-implemented.
+TODO: Replace remaining skips below with real assertions as each agent
+capability is finalized.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -31,9 +33,30 @@ def test_code_analysis_agent_returns_bug_reports() -> None:
     """Analysis should produce reports that passed the grounding check."""
 
 
-@pytest.mark.skip(reason="TODO: assert the agent abstains when retrieved context is insufficient")
-def test_code_analysis_agent_abstains_on_low_confidence() -> None:
-    """Insufficient context should abstain rather than guess."""
+def test_code_analysis_agent_abstains_on_low_confidence(tmp_path: Path) -> None:
+    """Insufficient grounded evidence should abstain rather than guess."""
+    from unittest.mock import MagicMock, patch
+
+    from codebase_assistant.agents.code_analysis_agent import CodeAnalysisAgent
+    from codebase_assistant.schemas.schemas import ModelResponse
+
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    client = MagicMock()
+    client.is_available.return_value = True
+    client.generate.return_value = ModelResponse(
+        content='{"answer": "", "findings": []}', usage={}, raw={}
+    )
+    retriever = MagicMock()
+    retriever.retrieve.return_value = []
+    agent = CodeAnalysisAgent(model_client=client, retriever=retriever)
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+    assert report.abstention is not None
+    assert report.findings == []
+    assert "No grounded evidence was found." in report.abstention.reason
 
 
 @pytest.mark.skip(reason="TODO: assert zero findings on the clean benchmark repo")
@@ -46,9 +69,30 @@ def test_documentation_agent_returns_valid_result() -> None:
     """Generated docs should satisfy the DocumentationResult schema."""
 
 
-@pytest.mark.skip(reason="TODO: assert generated tests are executed and real pass/fail is reported")
-def test_testing_agent_executes_generated_tests() -> None:
+def test_testing_agent_executes_generated_tests(tmp_path: Path) -> None:
     """Generated tests should actually run, not just be produced."""
+    from codebase_assistant.agents.testing_agent import TestingAgent
+
+    module = tmp_path / "math_utils.py"
+    module.write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    agent = TestingAgent(model_client=None, retriever=None)
+    generated = {
+        "test_math_utils.py": (
+            "from math_utils import add\n\n"
+            "def test_add():\n"
+            "    assert add(1, 1) == 2\n"
+        )
+    }
+    original = dict(generated)
+
+    summary = agent._execute_generated_tests(str(tmp_path), generated)
+
+    assert "Execution:" in summary
+    assert "1 passed" in summary
+    assert generated == original
 
 
 @pytest.mark.skip(reason="TODO: assert conversation memory carries context across turns")

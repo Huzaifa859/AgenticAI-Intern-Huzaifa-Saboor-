@@ -20,6 +20,7 @@ from .embeddings import EmbeddingGenerator
 from .indexer import Indexer
 from .ingest import Ingestor
 from .retriever import Retriever
+from .store_paths import vector_store_for_repository
 from .vectordb import VectorDB
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "Chunker",
     "EmbeddingGenerator",
     "VectorDB",
+    "vector_store_for_repository",
 ]

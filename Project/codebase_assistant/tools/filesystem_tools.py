@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from ..config import Config
 from ..exceptions.tool_exceptions import (
@@ -76,6 +76,15 @@ class FilesystemTools:
             raise ToolExecutionError(
                 f"Workspace root is not a directory: {self.workspace_root!r}"
             )
+
+        # Per-instance read cache keyed by resolved path, storing
+        # (mtime, size, content). A FilesystemTools instance lives for
+        # the duration of one Supervisor/pipeline run, so this avoids
+        # re-reading the same file from disk multiple times when the AST
+        # inventory scan and several per-symbol prompts all touch it.
+        # Invalidated automatically on mtime/size change and explicitly
+        # on write_file().
+        self._read_cache: Dict[Path, Tuple[float, int, str]] = {}
 
     # ------------------------------------------------------------------
     # Path validation
@@ -199,21 +208,28 @@ class FilesystemTools:
         if not target.is_file():
             raise ToolExecutionError(f"File not found: {path!r}")
 
-        size = target.stat().st_size
+        stat = target.stat()
+        size = stat.st_size
         limit = self.config.max_file_size_bytes
         if size > limit:
             raise FileTooLargeError(
                 f"File {path!r} is {size} bytes, exceeding the {limit} byte limit."
             )
 
-        try:
-            content = target.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise UnsupportedFileTypeError(
-                f"File {path!r} is not valid UTF-8 text and is likely binary."
-            ) from exc
-        except OSError as exc:
-            raise ToolExecutionError(f"Could not read {path!r}: {exc}") from exc
+        cached = self._read_cache.get(target)
+        if cached is not None and cached[0] == stat.st_mtime and cached[1] == size:
+            content = cached[2]
+        else:
+            try:
+                content = target.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise UnsupportedFileTypeError(
+                    f"File {path!r} is not valid UTF-8 text and is likely binary."
+                ) from exc
+            except OSError as exc:
+                raise ToolExecutionError(f"Could not read {path!r}: {exc}") from exc
+
+            self._read_cache[target] = (stat.st_mtime, size, content)
 
         if not allow_empty and not content.strip():
             raise EmptyFileError(f"File {path!r} is empty.")
@@ -241,6 +257,9 @@ class FilesystemTools:
             target.write_text(content, encoding="utf-8")
         except OSError as exc:
             raise ToolExecutionError(f"Could not write {path!r}: {exc}") from exc
+        # Drop any stale cached read so a later read_file() of this path
+        # sees the just-written content rather than a same-mtime cache hit.
+        self._read_cache.pop(target, None)
         return True
 
     def delete_file(self, path: str) -> bool:
@@ -271,6 +290,7 @@ class FilesystemTools:
             target.unlink()
         except OSError as exc:
             raise ToolExecutionError(f"Could not delete {path!r}: {exc}") from exc
+        self._read_cache.pop(target, None)
         return True
 
     # ------------------------------------------------------------------

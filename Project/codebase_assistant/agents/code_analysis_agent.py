@@ -16,27 +16,21 @@ left to rediscover it. Everything the model proposes then goes back
 through the same grounding gate the static findings passed, and anything
 that fails is dropped.
 
-The guarantee this module makes is narrow and absolute: **no finding
-reaches the caller without its evidence having been verified against the
-real source.** A model finding and a pyflakes finding are put through
-the identical check. That is why `CodeAnalysisReport.findings` can be
-trusted and `rejected` is kept separately rather than merged in with a
-lower score.
+Findings from static analysis and the model are both retained. Grounding
+classifies each finding as grounded or ungrounded without suppressing it.
+Matching static and LLM defects merge into one ``Static + LLM`` finding.
+`rejected` still records ungrounded classifications for metrics, but those
+findings remain in `findings` with attribution metadata.
 
 The agent degrades rather than fails. No provider configured, the model
 unreachable, an unparseable response, an empty index -- each of these
 costs the LLM half of the analysis and leaves the static half intact,
 because a partial answer built from verified findings is worth more than
 an exception.
-
-TODO: Emit each stage to the tracing layer once `tracing/` is
-implemented; the pipeline is currently observable only through logs.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
@@ -44,16 +38,32 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..analysis.finding_attribution import (
+    FOUND_BY_LLM,
+    FOUND_BY_STATIC,
+    GROUNDING_GROUNDED,
+    META_GROUNDING_STATUS,
+    annotate_batch_from_verification,
+    is_already_documented_in_source,
+    merge_attribution,
+    set_already_documented,
+    set_found_by,
+)
 from ..analysis.grounding_checker import GroundingChecker, GroundingResult
+from ..analysis.report_builder import ReportBuilder
 from ..analysis.static_analyzer import AnalysisReport as StaticAnalysisReport
 from ..analysis.static_analyzer import StaticAnalyzer
+from ..cache.output_cache import OutputCache
 from ..config import Config
 from ..exceptions.base import CodebaseAssistantError
+from ..hooks.events import HookEvent
+from ..hooks.manager import HookManager
 from ..memory.memory_store import MemoryStore
 from ..models.model_client import LLMClient
 from ..rag.indexer import IndexUpdate, Indexer
 from ..rag.retriever import Retriever
 from ..schemas.schemas import (
+    AbstentionResult,
     AgentRequest,
     AgentResponse,
     AgentType,
@@ -64,6 +74,13 @@ from ..schemas.schemas import (
 )
 from ..tools.filesystem_tools import FilesystemTools
 from ..tools.registry import ToolRegistry
+from ..tracing.events import TraceEventType
+from ..tracing.tracer import Tracer
+from ..utils.json_output import (
+    JSON_OBJECT_RESPONSE_FORMAT,
+    extract_json_value,
+    log_json_parse_outcome,
+)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -80,6 +97,41 @@ MAX_LLM_CONFIDENCE = 0.80
 #: Used when a caller asks for analysis without asking a question.
 DEFAULT_QUESTION = "Find likely bugs and correctness problems in this code."
 
+#: Appended only to the *retrieval* query (not the LLM prompt) so
+#: embedding search ranks executable bug-relevant code above overview
+#: docs that literally restate the user's bug-hunt wording.
+_ANALYSIS_RETRIEVAL_QUERY_EXPANSION = (
+    "executable Python source functions methods classes "
+    "logic bugs correctness off-by-one wrong comparison "
+    "authorization identity check cache key path traversal "
+    "integer division floating-point money"
+)
+
+#: Overview / package-export paths that must not consume Analysis
+#: retrieval slots when real source chunks are available. Still indexed.
+_LOW_VALUE_ANALYSIS_BASENAMES = frozenset({"readme.md", "__init__.py"})
+
+#: Preferred executable Python chunk counts that classify repository size
+#: for Analysis context sizing (not Documentation / Testing).
+_ANALYSIS_SMALL_PREFERRED_MAX = 40
+_ANALYSIS_MEDIUM_PREFERRED_MAX = 150
+
+#: Maximum chunks Analysis may send to the LLM by repository size.
+#: These are ceilings; fewer available chunks means fewer are sent.
+_ANALYSIS_SMALL_MAX_CHUNKS = 12
+_ANALYSIS_MEDIUM_MAX_CHUNKS = 20
+_ANALYSIS_LARGE_MAX_CHUNKS = 32
+
+_ANALYSIS_CONTEXT_LIMITS = {
+    "small": _ANALYSIS_SMALL_MAX_CHUNKS,
+    "medium": _ANALYSIS_MEDIUM_MAX_CHUNKS,
+    "large": _ANALYSIS_LARGE_MAX_CHUNKS,
+}
+
+#: Upper bound on the Analysis vector/rerank candidate pool so large
+#: indexes are not fully dumped into retrieval.
+_ANALYSIS_FETCH_POOL_CAP = 64
+
 #: How many static findings to show the model. Enough to stop it
 #: re-reporting what is already known, not so many that they crowd out
 #: the code itself.
@@ -89,12 +141,34 @@ MAX_STATIC_IN_PROMPT = 25
 #: model that copies it into its evidence can be forgiven.
 _GUTTER = re.compile(r"^\s*\d+\s*\|\s?")
 
-#: Fenced code block around a JSON payload.
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+#: Cap on raw output embedded in a single JSON-repair prompt.
+_MAX_JSON_REPAIR_RAW_CHARS = 6_000
+
+#: Bump this whenever the analysis prompt template or the cached
+#: (answer, proposed findings) shape changes, so previously cached LLM
+#: outputs are invalidated instead of being replayed against a stale
+#: format.
+_PROMPT_VERSION = "analysis-v1.3"
+
+_JSON_REPAIR_SYSTEM_PROMPT = """\
+You are repairing malformed code-analysis JSON.
+
+This is a JSON repair step, not a new analysis.
+Return ONLY the corrected JSON object.
+Do not add explanations, Markdown, or code fences.
+Do not invent findings that are not recoverable from the raw output.
+Preserve every valid field and finding you can recover.
+Do not add fields outside the required shape.
+"""
 
 SYSTEM_PROMPT = """\
 You are a precise code analysis assistant. You find real bugs in real \
 code, and you never invent them.
+
+Your job is independent bug discovery from the supplied repository code. \
+Downstream systems handle deduplication against static analysis and \
+annotation when a bug is already documented. Do not suppress a genuine \
+bug for either reason.
 
 You will be given code from a repository. Every line is shown with its \
 real line number in a left gutter, like:
@@ -105,19 +179,37 @@ The `42 | ` gutter is NOT part of the code. Never include it in evidence.
 
 Rules you must follow exactly:
 
-1. Only report problems visible in the CODE CONTEXT you are given. If \
-you cannot see it, it does not exist.
-2. `evidence` must be copied character for character from the code \
-shown. Do not re-indent it, do not reformat it, do not fix it, do not \
-abbreviate it. It is a quotation, not a description.
-3. `line_start` and `line_end` must be the real line numbers from the \
-gutter, and `evidence` must be exactly the lines in that range.
-4. Do not repeat anything listed under KNOWN STATIC FINDINGS. Those are \
-already confirmed.
-5. If the context is not enough to answer, say so in `answer` and return \
-an empty `findings` list. Abstaining is a correct answer. Guessing is \
-not.
-6. Reply with ONE JSON object and nothing else -- no prose before it, no \
+1. Report only findings supported by the repository code shown in \
+CODE CONTEXT. If you cannot see it, it does not exist.
+
+2. Prefer including `evidence` as the exact code snippet that supports \
+the finding, copied character for character from the code shown. Do not \
+re-indent it, do not reformat it, do not fix it, do not abbreviate it. \
+If you omit evidence, still provide accurate `file_path`, `line_start`, \
+and `line_end`.
+
+3. `file_path` must be the accurate path from the CODE CONTEXT header \
+(for example `path/as/shown/in/the/header.py`). Never invent files.
+
+4. `line_start` and `line_end` must be the most accurate real line \
+numbers from the gutter for the buggy lines.
+
+5. Never invent files, functions, variables, or evidence. Never guess \
+symbols that are not visible in CODE CONTEXT.
+
+6. Report every genuine implementation bug you can verify in CODE \
+CONTEXT, even when:
+   - the same bug also appears under KNOWN STATIC FINDINGS,
+   - Static Analysis has already found it, or
+   - a docstring, comment, or README already describes it.
+Do not omit a finding to avoid duplicates or because it is already \
+documented. Still report it with accurate path, lines, and evidence.
+
+7. If you are uncertain, omit the finding. If the context is not enough \
+to answer, say so in `answer` and return an empty `findings` list. \
+Abstaining is a correct answer. Guessing is not.
+
+8. Reply with ONE JSON object and nothing else -- no prose before it, no \
 prose after it.
 
 Reply in exactly this shape:
@@ -129,7 +221,7 @@ Reply in exactly this shape:
       "bug_type": "short_snake_case_category",
       "description": "What is wrong and why it matters.",
       "severity": "low | medium | high",
-      "confidence": 0.0,
+      "confidence": 0.7,
       "file_path": "path/as/shown/in/the/header.py",
       "function_name": "enclosing_function_or_<module>",
       "line_start": 1,
@@ -140,9 +232,8 @@ Reply in exactly this shape:
   ]
 }
 
-Every finding you return is checked against the real file. Any finding \
-whose evidence does not match the source exactly is discarded, and a \
-discarded finding helps no one."""
+Incorrect file paths or line numbers make a finding useless. Evidence \
+is preferred but optional when path and lines are accurate."""
 
 
 @dataclass
@@ -159,12 +250,13 @@ class CodeAnalysisReport:
     Attributes:
         repository_path: Repository that was analyzed.
         question: The question that drove the run.
-        findings: Verified findings, deduplicated, most severe first.
-            Every one has had its evidence checked against the source.
+        findings: Verified and attributed findings, deduplicated, most
+            severe first. Ungrounded LLM findings remain here with
+            grounding status metadata rather than being dropped.
         answer: The model's prose answer, empty when no model ran.
-        rejected: Verdicts on findings that failed grounding. Kept so
-            the hallucination rate is measurable; never merged into
-            `findings`.
+        rejected: Grounding classifications that failed evidence match.
+            Kept for hallucination metrics; the same findings also remain
+            in `findings` with an ``ungrounded`` annotation.
         context: Chunks retrieved and shown to the model.
         static_report: The deterministic pass's own result, including
             files it skipped.
@@ -175,6 +267,14 @@ class CodeAnalysisReport:
             index, unparseable response. Read this before trusting an
             empty result.
         duration_seconds: Wall-clock duration.
+        abstention: Explicit "cannot determine" outcome when grounded
+            evidence is insufficient. Distinct from an empty findings
+            list on a clean repository.
+        llm_proposed_count: How many findings the model proposed before
+            grounding (internal signal for abstention decisions).
+        llm_grounded_count: How many model findings survived grounding.
+        llm_parse_failed: True when the model response could not be
+            parsed as structured findings JSON.
     """
 
     repository_path: str = ""
@@ -189,16 +289,32 @@ class CodeAnalysisReport:
     duplicates_removed: int = 0
     notes: List[str] = field(default_factory=list)
     duration_seconds: float = 0.0
+    abstention: Optional[AbstentionResult] = None
+    llm_proposed_count: int = 0
+    llm_grounded_count: int = 0
+    llm_parse_failed: bool = False
 
     @property
     def static_findings(self) -> List[BugReport]:
-        """Verified findings that came from the deterministic pass."""
-        return [f for f in self.findings if f.detection_method == "static"]
+        """Findings that include a static-analysis source."""
+        return [
+            f
+            for f in self.findings
+            if f.detection_method in ("static", "hybrid")
+            or str((f.metadata or {}).get("found_by") or "")
+            in ("Static Analysis", "Static + LLM")
+        ]
 
     @property
     def llm_findings(self) -> List[BugReport]:
-        """Verified findings that came from the model."""
-        return [f for f in self.findings if f.detection_method == "llm"]
+        """Findings that include an LLM source."""
+        return [
+            f
+            for f in self.findings
+            if f.detection_method in ("llm", "hybrid")
+            or str((f.metadata or {}).get("found_by") or "")
+            in ("LLM", "Static + LLM")
+        ]
 
     def by_severity(self) -> Dict[str, int]:
         """
@@ -222,13 +338,25 @@ class CodeAnalysisReport:
             A readable summary suitable for logs, a notebook cell, or
             the Supervisor's `run` payload.
         """
+        if self.abstention is not None:
+            return f"abstained: {self.abstention.reason}"
+        static_only = sum(1 for f in self.findings if f.detection_method == "static")
+        llm_only = sum(1 for f in self.findings if f.detection_method == "llm")
+        hybrid = sum(1 for f in self.findings if f.detection_method == "hybrid")
+        ungrounded = sum(
+            1
+            for f in self.findings
+            if str((f.metadata or {}).get(META_GROUNDING_STATUS) or "") == "ungrounded"
+        )
         parts = [
-            f"{len(self.findings)} verified finding(s)",
-            f"{len(self.static_findings)} static",
-            f"{len(self.llm_findings)} llm",
+            f"{len(self.findings)} finding(s)",
+            f"{static_only} static",
+            f"{llm_only} llm",
         ]
-        if self.rejected:
-            parts.append(f"{len(self.rejected)} rejected as ungrounded")
+        if hybrid:
+            parts.append(f"{hybrid} static+llm")
+        if ungrounded:
+            parts.append(f"{ungrounded} ungrounded")
         if self.duplicates_removed:
             parts.append(f"{self.duplicates_removed} duplicate(s) merged")
         if not self.model_used:
@@ -277,6 +405,9 @@ class CodeAnalysisAgent(BaseAgent):
         static_analyzer: Optional[StaticAnalyzer] = None,
         grounding_checker: Optional[GroundingChecker] = None,
         filesystem: Optional[FilesystemTools] = None,
+        tracer: Optional[Tracer] = None,
+        hook_manager: Optional[HookManager] = None,
+        index_reuse_cache: Optional[Dict[str, float]] = None,
     ) -> None:
         """
         Initialize the agent and record its collaborators.
@@ -305,12 +436,22 @@ class CodeAnalysisAgent(BaseAgent):
                 repository when omitted.
             filesystem: Sandboxed file access. Built per repository when
                 omitted.
+            tracer: Optional shared Tracer for lifecycle events.
+            hook_manager: Optional HookManager for lifecycle hooks.
+            index_reuse_cache: Optional dict shared with the other
+                agents built by the same Supervisor, letting a fresh
+                index built by one agent be reused by the others for a
+                short window within one `--agent all` run. See
+                `BaseAgent.__init__`.
         """
         super().__init__(
             model_client=model_client,
             tool_registry=tool_registry,
             retriever=retriever,
             memory_store=memory_store,
+            tracer=tracer,
+            hook_manager=hook_manager,
+            index_reuse_cache=index_reuse_cache,
         )
         self.config = config or Config.load()
         self._indexer = indexer
@@ -358,8 +499,8 @@ class CodeAnalysisAgent(BaseAgent):
             use_rag: When False, indexing and retrieval are skipped
                 entirely. The model still runs, with static findings but
                 no retrieved code.
-            top_k: Chunks to retrieve. Defaults to
-                `Config.retrieval_top_k`.
+            top_k: Optional hard override for Analysis chunk count.
+                When omitted, size-based limits apply (12 / 20 / 32).
 
         Returns:
             The verified findings and everything about how they were
@@ -379,6 +520,13 @@ class CodeAnalysisAgent(BaseAgent):
         )
         pipeline = self._bind(repository_path)
         scope = self._scope(pipeline, repository_path)
+
+        self._trace(
+            "analysis_started",
+            repository_path=pipeline.root,
+            question=question,
+            use_rag=use_rag,
+        )
 
         # Retrieval exists to fill the prompt. With no model to prompt,
         # indexing a repository would be minutes of embedding work whose
@@ -409,11 +557,34 @@ class CodeAnalysisAgent(BaseAgent):
             pipeline, question, report.context, static_findings, report
         )
 
-        # 11-13. One ordered, deduplicated set.
+        # 11-13. One ordered, deduplicated set with attribution.
         merged, removed = self._merge(static_findings, llm_findings)
+        merged = self._annotate_documentation(merged, pipeline.root)
         report.findings = merged
         report.duplicates_removed = removed
+        self._apply_abstention(
+            report,
+            used_rag=use_rag,
+            grounding_enabled=bool(getattr(pipeline.checker, "enabled", False)),
+        )
         report.duration_seconds = time.time() - started
+
+        self._trace(
+            "merge_completed",
+            findings=len(report.findings),
+            duplicates_removed=removed,
+            static_findings=len(static_findings),
+            llm_findings=len(llm_findings),
+            duration_ms=report.duration_seconds * 1000.0,
+            abstained=report.abstention is not None,
+        )
+        self._trace(
+            "analysis_finished",
+            findings=len(report.findings),
+            duration_ms=report.duration_seconds * 1000.0,
+            success=True,
+            abstained=report.abstention is not None,
+        )
 
         logger.info("Analysis complete: %s", report.summary())
         return report
@@ -441,8 +612,8 @@ class CodeAnalysisAgent(BaseAgent):
         Args:
             repository_path: Repository to analyze.
             question: The natural language question.
-            top_k: Chunks to retrieve. Defaults to
-                `Config.retrieval_top_k`.
+            top_k: Optional hard override for Analysis chunk count.
+                When omitted, size-based limits apply (12 / 20 / 32).
 
         Returns:
             The answer, plus any verified findings the question turned
@@ -582,20 +753,29 @@ class CodeAnalysisAgent(BaseAgent):
             )
 
         verified = pipeline.checker.verify_reports(findings)
-        counts: Dict[str, Any] = {"findings": len(verified.grounded)}
-        for finding in verified.grounded:
+        annotated = annotate_batch_from_verification(
+            findings,
+            verified.results,
+            found_by=FOUND_BY_STATIC,
+        )
+        counts: Dict[str, Any] = {"findings": len(annotated)}
+        for finding in annotated:
             key = f"severity_{finding.severity}"
             counts[key] = counts.get(key, 0) + 1
+            status = str(finding.metadata.get(META_GROUNDING_STATUS) or "")
+            if status:
+                counts[f"grounding_{status}"] = counts.get(f"grounding_{status}", 0) + 1
 
         return CodeAnalysisResult(
             summary=(
-                f"{len(verified.grounded)} verified issue(s) in {file_path}."
-                if verified.grounded
+                f"{len(annotated)} issue(s) in {file_path}."
+                if annotated
                 else f"No issues detected in {file_path}."
             ),
             issues=[
-                f"L{f.line_start}: [{f.severity}] {f.bug_type} - {f.description}"
-                for f in verified.grounded
+                f"[{f.severity}] {f.bug_type} at {f.line_start}-{f.line_end}: "
+                f"{f.description}"
+                for f in annotated
             ],
             metrics=counts,
         )
@@ -642,14 +822,393 @@ class CodeAnalysisAgent(BaseAgent):
             return []
 
         try:
-            return self.retriever.retrieve(query)
+            return self._retrieve_for_analysis(self.retriever, query, top_k=None)
         except CodebaseAssistantError as exc:
             logger.warning("Retrieval failed for %r: %s", query, exc)
             return []
 
     # ------------------------------------------------------------------
+    # Analysis-specific retrieval (does not change shared Retriever API)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _analysis_retrieval_query(question: str) -> str:
+        """
+        Build the embedding query used for Analysis retrieval only.
+
+        The user-facing QUESTION section of the prompt keeps ``question``
+        unchanged; this expansion only steers vector search toward
+        executable code that typically hosts the defects Analysis hunts.
+        """
+        base = (question or "").strip() or DEFAULT_QUESTION
+        return f"{base}\n{_ANALYSIS_RETRIEVAL_QUERY_EXPANSION}"
+
+    @staticmethod
+    def _is_low_value_overview_chunk(chunk: RetrievedChunk) -> bool:
+        """
+        True for README / package ``__init__`` / non-code overview chunks.
+
+        These stay in the index for Documentation and other agents; Analysis
+        only avoids spending scarce top-k slots on them when source exists.
+        """
+        source = (chunk.source or "").replace("\\", "/")
+        basename = source.rsplit("/", 1)[-1].lower()
+        if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
+            return True
+        lower = source.lower()
+        if lower.endswith((".md", ".txt", ".rst")):
+            return True
+        language = (chunk.metadata or {}).get("language")
+        if language and str(language).lower() not in {"python", "py"}:
+            return True
+        return False
+
+    @staticmethod
+    def _chunk_identity(chunk: RetrievedChunk) -> str:
+        """Stable dedupe key for merged retrieval candidates."""
+        metadata = chunk.metadata or {}
+        chunk_id = metadata.get("chunk_id")
+        if chunk_id:
+            return str(chunk_id)
+        start = metadata.get("line_start")
+        end = metadata.get("line_end")
+        return f"{chunk.source}:{start}:{end}:{hash(chunk.content)}"
+
+    @classmethod
+    def _select_analysis_chunks(
+        cls,
+        candidates: Sequence[RetrievedChunk],
+        limit: int,
+    ) -> List[RetrievedChunk]:
+        """
+        Prefer executable source; only fill leftover slots with overviews.
+        """
+        if limit <= 0:
+            return []
+
+        preferred: List[RetrievedChunk] = []
+        deferred: List[RetrievedChunk] = []
+        seen: set[str] = set()
+
+        for chunk in candidates:
+            key = cls._chunk_identity(chunk)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cls._is_low_value_overview_chunk(chunk):
+                deferred.append(chunk)
+            else:
+                preferred.append(chunk)
+
+        selected = preferred[:limit]
+        if len(selected) < limit:
+            selected.extend(deferred[: limit - len(selected)])
+        return selected
+
+    def _preferred_code_chunk_count(self, retriever: Retriever) -> Optional[int]:
+        """
+        Count indexed Python chunks that are not low-value overviews.
+
+        Returns:
+            The count, or None when the store cannot be inspected.
+        """
+        try:
+            where = Retriever.build_filter(language="python")
+            chunks = retriever.vector_db.list_chunks(where=where)
+        except Exception as exc:
+            logger.debug(
+                "Could not count preferred Analysis code chunks: %s", exc
+            )
+            return None
+
+        count = 0
+        for chunk in chunks:
+            path = (chunk.file_path or "").replace("\\", "/")
+            basename = path.rsplit("/", 1)[-1].lower()
+            if basename in _LOW_VALUE_ANALYSIS_BASENAMES:
+                continue
+            count += 1
+        return count
+
+    @classmethod
+    def _analysis_repo_size_bucket(cls, preferred: Optional[int]) -> str:
+        """
+        Classify repository size from preferred executable chunk count.
+
+        Returns:
+            ``"small"``, ``"medium"``, or ``"large"``.
+        """
+        if preferred is None or preferred <= 0:
+            # Unknown / empty index: medium keeps prompts bounded.
+            return "medium"
+        if preferred <= _ANALYSIS_SMALL_PREFERRED_MAX:
+            return "small"
+        if preferred <= _ANALYSIS_MEDIUM_PREFERRED_MAX:
+            return "medium"
+        return "large"
+
+    def _analysis_retrieval_limit(
+        self,
+        retriever: Retriever,
+        top_k: Optional[int],
+    ) -> int:
+        """
+        Effective Analysis ``retrieval_top_k`` / final keep ceiling.
+
+        Size-based maxima (12 / 20 / 32). An explicit ``top_k`` overrides
+        for tests and callers; ``Config.retrieval_top_k`` is not used so
+        Documentation / Testing defaults cannot silently cap Analysis.
+        """
+        if top_k is not None:
+            return max(1, int(top_k))
+
+        preferred = self._preferred_code_chunk_count(retriever)
+        bucket = self._analysis_repo_size_bucket(preferred)
+        return int(_ANALYSIS_CONTEXT_LIMITS[bucket])
+
+    def _analysis_fetch_k(
+        self,
+        limit: int,
+        preferred_n: Optional[int],
+    ) -> int:
+        """
+        Candidate pool size for Analysis retrieve → select/rerank.
+
+        Must be at least ``limit`` (and usually larger) so overview
+        demotion cannot silently prevent reaching 12 / 20 / 32.
+        """
+        configured = int(getattr(self.config, "rerank_candidates", 0) or 0)
+        # At least 2x the keep limit so preferred slots survive filtering.
+        fetch_k = max(limit, configured, limit * 2)
+        if preferred_n is not None and preferred_n > 0:
+            fetch_k = max(fetch_k, min(preferred_n, _ANALYSIS_FETCH_POOL_CAP))
+        return min(max(fetch_k, limit), _ANALYSIS_FETCH_POOL_CAP)
+
+    def _retrieve_for_analysis(
+        self,
+        retriever: Retriever,
+        question: str,
+        top_k: Optional[int],
+    ) -> List[RetrievedChunk]:
+        """
+        Analysis retrieval: expanded query, code preference, size-based keep.
+        """
+        limit = self._analysis_retrieval_limit(retriever, top_k)
+        retrieval_query = self._analysis_retrieval_query(question)
+        preferred_n = self._preferred_code_chunk_count(retriever)
+        fetch_k = self._analysis_fetch_k(limit, preferred_n)
+
+        python_filter = Retriever.build_filter(language="python")
+        candidates = retriever.retrieve(
+            retrieval_query, top_k=fetch_k, where=python_filter
+        )
+        selected = self._select_analysis_chunks(candidates, limit)
+
+        # Top up only if Python-filtered search under-filled (e.g. empty
+        # language metadata on older indexes). Prefer code first.
+        if len(selected) < limit:
+            extra = retriever.retrieve(retrieval_query, top_k=fetch_k)
+            selected = self._select_analysis_chunks(
+                list(selected) + list(extra), limit
+            )
+
+        return selected
+
+    # ------------------------------------------------------------------
     # Pipeline stages
     # ------------------------------------------------------------------
+
+    def _apply_abstention(
+        self,
+        report: CodeAnalysisReport,
+        *,
+        used_rag: bool,
+        grounding_enabled: bool = False,
+    ) -> None:
+        """
+        Attach an explicit abstention when grounded evidence is insufficient.
+
+        Clean repositories with supported files and zero verified findings
+        do not abstain — that is a successful empty result. Abstention is
+        reserved for missing inputs, unverifiable LLM claims, empty
+        retrieval with no static support, or only-too-uncertain findings.
+
+        When grounding is disabled, keep parsed LLM findings without
+        confidence gating — a copied schema ``confidence: 0.0`` must not
+        wipe the report after a successful stream.
+        """
+        builder = ReportBuilder()
+        files_analyzed = 0
+        if report.static_report is not None:
+            files_analyzed = int(getattr(report.static_report, "files_analyzed", 0) or 0)
+
+        evidence: List[str] = []
+        if files_analyzed:
+            evidence.append(f"{files_analyzed} Python file(s) analyzed")
+        if report.context:
+            evidence.append(f"{len(report.context)} retrieved chunk(s)")
+        if report.rejected:
+            evidence.append(
+                f"{len(report.rejected)} ungrounded claim(s) annotated"
+            )
+        if report.llm_proposed_count:
+            evidence.append(
+                f"{report.llm_proposed_count} model finding(s) proposed"
+            )
+
+        # Only abstain for an empty/unsupported tree when the static pass
+        # actually ran and reported zero analyzable files. A missing
+        # static_report (or a successful LLM-only annotation pass) must
+        # not wipe attributed findings.
+        if report.static_report is not None and files_analyzed == 0:
+            report.abstention = builder.abstain(
+                "Repository contains no supported Python files.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Provide a repository that includes .py source files.",
+                    "Confirm ignore rules are not excluding the entire tree.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        if not grounding_enabled:
+            if report.findings:
+                return
+            if report.model_used and report.llm_parse_failed:
+                report.abstention = builder.abstain(
+                    "LLM response could not be verified.",
+                    confidence=1.0,
+                    evidence_available=evidence,
+                    recommended_next_steps=[
+                        "Inspect the retrieved source for the claimed lines.",
+                        "Ask a narrower question tied to a concrete file.",
+                    ],
+                )
+                report.answer = ""
+                report.notes.append(f"Abstained: {report.abstention.reason}")
+                self._trace(
+                    "abstention",
+                    success=True,
+                    reason=report.abstention.reason,
+                )
+                return
+            if (
+                used_rag
+                and report.model_used
+                and not report.context
+                and report.llm_proposed_count == 0
+                and not str(report.answer or "").strip()
+            ):
+                report.abstention = builder.abstain(
+                    "No grounded evidence was found.",
+                    confidence=1.0,
+                    evidence_available=evidence,
+                    recommended_next_steps=[
+                        "Ensure the repository was indexed successfully.",
+                        "Ask about a concrete module that exists in the repo.",
+                    ],
+                )
+                report.findings = []
+                report.answer = ""
+                report.notes.append(f"Abstained: {report.abstention.reason}")
+                self._trace(
+                    "abstention",
+                    success=True,
+                    reason=report.abstention.reason,
+                )
+            return
+
+        confident = builder.filter_confident(report.findings)
+        uncertain = [
+            finding
+            for finding in report.findings
+            if finding not in confident
+        ]
+        report.findings = confident
+
+        if confident:
+            return
+
+        if uncertain:
+            report.abstention = builder.abstain(
+                "Model output is too uncertain to report grounded findings.",
+                confidence=max(
+                    (float(item.confidence) for item in uncertain),
+                    default=0.0,
+                ),
+                evidence_available=evidence
+                + [f"{len(uncertain)} low-confidence finding(s) withheld"],
+                recommended_next_steps=[
+                    "Ask about a specific file or function.",
+                    "Re-run after indexing the repository with a model available.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        if report.model_used and report.llm_parse_failed and not report.findings:
+            report.abstention = builder.abstain(
+                "LLM response could not be verified.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Inspect the retrieved source for the claimed lines.",
+                    "Ask a narrower question tied to a concrete file.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
+
+        # Empty retrieval with no model findings/answer is insufficient
+        # evidence — not the same as a clean static pass.
+        if (
+            used_rag
+            and report.model_used
+            and not report.context
+            and report.llm_proposed_count == 0
+            and not str(report.answer or "").strip()
+        ):
+            report.abstention = builder.abstain(
+                "No grounded evidence was found.",
+                confidence=1.0,
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Ensure the repository was indexed successfully.",
+                    "Ask about a concrete module that exists in the repo.",
+                ],
+            )
+            report.findings = []
+            report.answer = ""
+            report.notes.append(f"Abstained: {report.abstention.reason}")
+            self._trace(
+                "abstention",
+                success=True,
+                reason=report.abstention.reason,
+            )
+            return
 
     def _sync_index(
         self, pipeline: _Pipeline, scope: str, report: CodeAnalysisReport
@@ -672,6 +1231,33 @@ class CodeAnalysisAgent(BaseAgent):
         if pipeline.indexer is None:
             return None
 
+        if self._recently_indexed(pipeline.root):
+            # Another agent sharing this Supervisor's index_reuse_cache
+            # already brought this exact workspace's index up to date
+            # moments ago (e.g. code analysis just before documentation
+            # in a `--agent all` run). The vector store is persistent and
+            # this pipeline already points at the same path, so a fresh
+            # walk-and-hash pass here would just re-confirm nothing
+            # changed -- skip it and retrieve from what is already there.
+            logger.info(
+                "Index: reusing recent index for %s (indexed moments ago "
+                "by another agent in this run).",
+                pipeline.root,
+            )
+            return None
+
+        self._trace(
+            "indexing_started",
+            event_type=TraceEventType.INGESTION,
+            repository_path=pipeline.root,
+            scope=scope,
+        )
+        self._hook(
+            HookEvent.BEFORE_INGEST,
+            workspace=pipeline.root,
+            scope=scope,
+        )
+        index_started = time.perf_counter()
         try:
             update = pipeline.indexer.update_index(scope)
         except CodebaseAssistantError as exc:
@@ -681,9 +1267,49 @@ class CodeAnalysisAgent(BaseAgent):
             note = f"Indexing failed, continuing without retrieval: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            duration_ms = (time.perf_counter() - index_started) * 1000.0
+            self._trace(
+                "indexing_finished",
+                event_type=TraceEventType.INGESTION,
+                success=False,
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=pipeline.root,
+                scope=scope,
+                success=False,
+                error=str(exc),
+                duration_ms=duration_ms,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                workspace=pipeline.root,
+                error=str(exc),
+                success=False,
+                stage="indexing",
+            )
             return None
 
         logger.info("Index: %s", update.summary())
+        self._mark_indexed(pipeline.root)
+        duration_ms = (time.perf_counter() - index_started) * 1000.0
+        self._trace(
+            "indexing_finished",
+            event_type=TraceEventType.INGESTION,
+            success=True,
+            duration_ms=duration_ms,
+            summary=update.summary(),
+        )
+        self._hook(
+            HookEvent.AFTER_INGEST,
+            workspace=pipeline.root,
+            scope=scope,
+            success=True,
+            duration_ms=duration_ms,
+            summary=update.summary(),
+        )
         return update
 
     def _run_static(
@@ -704,7 +1330,8 @@ class CodeAnalysisAgent(BaseAgent):
             report: Report to record the static result and notes on.
 
         Returns:
-            The grounded static findings.
+            Static findings with Found-by / grounding annotations. Ungrounded
+            static findings are kept and classified, never dropped.
         """
         static = pipeline.analyzer.analyze_repository_detailed(scope)
         report.static_report = static
@@ -713,21 +1340,44 @@ class CodeAnalysisAgent(BaseAgent):
         if not static.findings:
             return []
 
+        findings = list(static.findings)
+        for finding in findings:
+            set_found_by(finding, FOUND_BY_STATIC)
+
+        if not getattr(pipeline.checker, "enabled", False):
+            return findings
+
         # Hash the cited files now, so an edit between this point and
         # verification is detected rather than silently tolerated.
-        pipeline.checker.snapshot_reports(static.findings)
-        verified = pipeline.checker.verify_reports(static.findings)
+        self._trace("grounding_started", findings=len(findings), source="static")
+        ground_started = time.perf_counter()
+        pipeline.checker.snapshot_reports(findings)
+        verified = pipeline.checker.verify_reports(findings)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        annotated = annotate_batch_from_verification(
+            findings,
+            verified.results,
+            found_by=FOUND_BY_STATIC,
+        )
+        self._trace(
+            "grounding_finished",
+            success=True,
+            duration_ms=(time.perf_counter() - ground_started) * 1000.0,
+            grounded=len(verified.grounded),
+            rejected=len(verified.rejected),
+            source="static",
+            annotate_only=True,
+        )
 
         if verified.rejected:
             note = (
-                f"{len(verified.rejected)} static finding(s) failed grounding; "
-                f"the source may have changed mid-run."
+                f"{len(verified.rejected)} static finding(s) annotated as "
+                f"ungrounded; the source may have changed mid-run."
             )
             logger.warning(note)
             report.notes.append(note)
 
-        return verified.grounded
+        return annotated
 
     def _gather(
         self,
@@ -754,12 +1404,29 @@ class CodeAnalysisAgent(BaseAgent):
         if pipeline.retriever is None:
             return []
 
+        self._trace(
+            "retrieval_started",
+            event_type=TraceEventType.RETRIEVAL,
+            question=question,
+            scope=scope,
+        )
+        retrieval_started = time.perf_counter()
         try:
-            chunks = pipeline.retriever.retrieve(question, top_k=top_k)
+            chunks = self._retrieve_for_analysis(
+                pipeline.retriever, question, top_k
+            )
         except CodebaseAssistantError as exc:
             note = f"Retrieval failed, prompting without code context: {exc}"
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "retrieval_finished",
+                event_type=TraceEventType.RETRIEVAL,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+                chunks=0,
+            )
             return []
 
         if not chunks:
@@ -769,9 +1436,23 @@ class CodeAnalysisAgent(BaseAgent):
             )
             logger.warning(note)
             report.notes.append(note)
+            self._trace(
+                "retrieval_finished",
+                event_type=TraceEventType.RETRIEVAL,
+                success=True,
+                duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+                chunks=0,
+            )
             return []
 
         logger.info("Retrieved %d chunk(s) for %r in %s", len(chunks), question, scope)
+        self._trace(
+            "retrieval_finished",
+            event_type=TraceEventType.RETRIEVAL,
+            success=True,
+            duration_ms=(time.perf_counter() - retrieval_started) * 1000.0,
+            chunks=len(chunks),
+        )
         return chunks
 
     def _model_will_run(self) -> bool:
@@ -836,28 +1517,167 @@ class CodeAnalysisAgent(BaseAgent):
 
         prompt = self.build_prompt(question, context, static_findings)
 
-        try:
-            response = self.model_client.generate(
-                [
-                    ModelMessage(role="system", content=SYSTEM_PROMPT),
-                    ModelMessage(role="user", content=prompt),
-                ]
+        output_cache = self._build_output_cache(pipeline.root, "analysis")
+        cache_key = (
+            OutputCache.make_key(
+                question,
+                sorted(
+                    f"{c.source}:{c.content}" for c in context
+                ),
+                sorted(
+                    f"{f.file_path}:{f.line_start}-{f.line_end}:{f.bug_type}"
+                    for f in static_findings
+                ),
+                getattr(self.model_client, "model_name", ""),
+                _PROMPT_VERSION,
             )
-        except Exception as exc:
-            # Deliberately broad. A provider talks to the network and can
-            # raise anything its transport raises, and no failure out
-            # there is worth discarding verified static findings over.
-            note = f"Model call failed, keeping static findings only: {exc}"
-            logger.warning(note)
-            report.notes.append(note)
-            return []
+            if output_cache is not None
+            else ""
+        )
+        cached = output_cache.get(cache_key) if output_cache is not None else None
+        if cached is not None:
+            try:
+                answer = str(cached.get("answer") or "")
+                proposed = [
+                    BugReport.model_validate(item)
+                    for item in cached.get("proposed") or []
+                ]
+                self._trace("analysis_output_cache_hit", proposed=len(proposed))
+                report.model_used = True
+                report.llm_parse_failed = False
+                report.answer = answer
+                report.llm_proposed_count = len(proposed)
+            except Exception as exc:
+                logger.warning("Discarding invalid cached analysis output: %s", exc)
+                cached = None
 
-        report.model_used = True
-        answer, proposed = self.parse_response(response.content)
-        report.answer = answer
+        if cached is None:
+            self._trace(
+                "model_request",
+                event_type=TraceEventType.MODEL_CALL,
+                chunks=len(context),
+                static_findings=len(static_findings),
+            )
+            model_started = time.perf_counter()
+
+            def _on_chunk(text: str) -> None:
+                chunk = str(text or "")
+                if not chunk:
+                    return
+                self._trace(
+                    "analysis_stream_delta",
+                    text=chunk,
+                )
+
+            try:
+                # Stream tokens for the live UI. OpenRouter drops
+                # response_format on stream; the system prompt still asks
+                # for JSON and we parse the full reply afterward.
+                generate_stream = getattr(self.model_client, "generate_stream", None)
+                if callable(generate_stream):
+                    response = generate_stream(
+                        [
+                            ModelMessage(role="system", content=SYSTEM_PROMPT),
+                            ModelMessage(role="user", content=prompt),
+                        ],
+                        on_chunk=_on_chunk,
+                    )
+                else:
+                    response = self.model_client.generate(
+                        [
+                            ModelMessage(role="system", content=SYSTEM_PROMPT),
+                            ModelMessage(role="user", content=prompt),
+                        ],
+                        response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                    )
+                    _on_chunk(getattr(response, "content", "") or "")
+            except Exception as exc:
+                # Deliberately broad. A provider talks to the network and can
+                # raise anything its transport raises, and no failure out
+                # there is worth discarding verified static findings over.
+                note = f"Model call failed, keeping static findings only: {exc}"
+                logger.warning(note)
+                report.notes.append(note)
+                self._trace(
+                    "model_response",
+                    event_type=TraceEventType.MODEL_CALL,
+                    success=False,
+                    error=str(exc),
+                    duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                )
+                return []
+
+            self._trace(
+                "model_response",
+                event_type=TraceEventType.MODEL_CALL,
+                success=True,
+                duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                content_chars=len(response.content or ""),
+            )
+
+            report.model_used = True
+            raw_content = response.content or ""
+            payload, extract_error = extract_json_value(raw_content)
+            if payload is None and raw_content.strip():
+                log_json_parse_outcome(
+                    agent="code_analysis",
+                    stage="initial",
+                    success=False,
+                    error=extract_error,
+                )
+                repaired = self._retry_json_repair(
+                    raw_output=raw_content,
+                    parse_error=extract_error,
+                )
+                if repaired is not None:
+                    raw_content = repaired
+                    payload, extract_error = extract_json_value(raw_content)
+                    log_json_parse_outcome(
+                        agent="code_analysis",
+                        stage="repair",
+                        success=payload is not None,
+                        error=extract_error,
+                    )
+                else:
+                    log_json_parse_outcome(
+                        agent="code_analysis",
+                        stage="repair",
+                        success=False,
+                        error="repair call failed or returned empty",
+                    )
+            else:
+                log_json_parse_outcome(
+                    agent="code_analysis",
+                    stage="initial",
+                    success=payload is not None,
+                    error=extract_error,
+                )
+
+            report.llm_parse_failed = payload is None
+            answer, proposed = self.parse_response(
+                raw_content,
+                workspace_root=pipeline.root,
+            )
+            report.answer = answer
+            report.llm_proposed_count = len(proposed)
+
+            if proposed and output_cache is not None:
+                try:
+                    output_cache.set(
+                        cache_key,
+                        {
+                            "answer": answer,
+                            "proposed": [p.model_dump() for p in proposed],
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist analysis output cache entry: %s", exc
+                    )
 
         if not proposed:
-            if not answer:
+            report.llm_grounded_count = 0
+            if report.llm_parse_failed or not answer:
                 note = (
                     "The model's response could not be parsed into findings; "
                     "keeping static findings only."
@@ -868,13 +1688,45 @@ class CodeAnalysisAgent(BaseAgent):
                 logger.info("Model proposed no findings.")
             return []
 
+        if not getattr(pipeline.checker, "enabled", False):
+            for finding in proposed:
+                set_found_by(finding, FOUND_BY_LLM)
+            report.llm_grounded_count = len(proposed)
+            logger.info(
+                "Model findings: %d proposed (grounding disabled).",
+                len(proposed),
+            )
+            return list(proposed)
+
+        self._trace("grounding_started", findings=len(proposed), source="llm")
+        ground_started = time.perf_counter()
         verified = pipeline.checker.verify_reports(proposed)
         report.rejected.extend(r for r in verified.results if not r.grounded)
+        annotated = annotate_batch_from_verification(
+            proposed,
+            verified.results,
+            found_by=FOUND_BY_LLM,
+        )
+        report.llm_grounded_count = sum(
+            1
+            for finding in annotated
+            if str(finding.metadata.get(META_GROUNDING_STATUS) or "")
+            == GROUNDING_GROUNDED
+        )
+        self._trace(
+            "grounding_finished",
+            success=True,
+            duration_ms=(time.perf_counter() - ground_started) * 1000.0,
+            grounded=len(verified.grounded),
+            rejected=len(verified.rejected),
+            source="llm",
+            annotate_only=True,
+        )
 
         for result in verified.results:
             if not result.grounded:
                 logger.warning(
-                    "Discarded ungrounded model finding at %s:%d-%d (%s): %s",
+                    "Annotated ungrounded model finding at %s:%d-%d (%s): %s",
                     result.file_path,
                     result.line_start,
                     result.line_end,
@@ -885,16 +1737,17 @@ class CodeAnalysisAgent(BaseAgent):
         if verified.rejected:
             note = (
                 f"{len(verified.rejected)} of {len(proposed)} model finding(s) "
-                f"were discarded as ungrounded."
+                f"annotated as ungrounded (still included in findings)."
             )
             report.notes.append(note)
 
         logger.info(
-            "Model findings: %d proposed, %d grounded.",
+            "Model findings: %d proposed, %d grounded, %d kept.",
             len(proposed),
-            len(verified.grounded),
+            report.llm_grounded_count,
+            len(annotated),
         )
-        return verified.grounded
+        return annotated
 
     # ------------------------------------------------------------------
     # Prompting
@@ -937,7 +1790,7 @@ class CodeAnalysisAgent(BaseAgent):
             if len(static_findings) > len(shown):
                 lines.append(f"- ... and {len(static_findings) - len(shown)} more")
             sections.append(
-                "KNOWN STATIC FINDINGS (already confirmed -- do not repeat these)\n"
+                "KNOWN STATIC FINDINGS (from Static Analysis; for context only)\n"
                 + "\n".join(lines)
             )
 
@@ -950,8 +1803,8 @@ class CodeAnalysisAgent(BaseAgent):
             )
 
         sections.append(
-            "Answer the question, and report any bug you can see in the code "
-            "above that is not already listed. Reply with one JSON object."
+            "Answer the question, and report every genuine bug you can "
+            "verify in the code above. Reply with one JSON object."
         )
         return "\n\n".join(sections)
 
@@ -989,22 +1842,28 @@ class CodeAnalysisAgent(BaseAgent):
     # Response parsing
     # ------------------------------------------------------------------
 
-    def parse_response(self, content: str) -> Tuple[str, List[BugReport]]:
+    def parse_response(
+        self,
+        content: str,
+        *,
+        workspace_root: str = "",
+    ) -> Tuple[str, List[BugReport]]:
         """
         Turn a model response into an answer and candidate findings.
 
         Tolerant by design. Models wrap JSON in fences, prefix it with
         "Here is the analysis:", and occasionally return a bare array.
-        None of that is worth failing over, and none of it can smuggle
-        an unverified finding through -- everything parsed here still
-        has to survive grounding.
+        None of that is worth failing over.
 
         A finding with missing or malformed fields is dropped
         individually with a log line, so one bad entry does not cost the
-        rest.
+        rest. Evidence is preferred but optional: when omitted, lines are
+        sliced from disk for the UI when possible (grounding is off by
+        default, so empty evidence must not discard a cited finding).
 
         Args:
             content: Raw text from the model.
+            workspace_root: Repository root used to fill missing evidence.
 
         Returns:
             The prose answer and the candidate BugReports.
@@ -1031,19 +1890,30 @@ class CodeAnalysisAgent(BaseAgent):
 
         findings: List[BugReport] = []
         for index, entry in enumerate(raw):
-            report = self._to_bug_report(entry, index)
+            report = self._to_bug_report(
+                entry,
+                index,
+                workspace_root=workspace_root,
+            )
             if report is not None:
                 findings.append(report)
 
         return answer, findings
 
-    def _to_bug_report(self, entry: Any, index: int) -> Optional[BugReport]:
+    def _to_bug_report(
+        self,
+        entry: Any,
+        index: int,
+        *,
+        workspace_root: str = "",
+    ) -> Optional[BugReport]:
         """
         Convert one parsed entry into a BugReport.
 
         Args:
             entry: A single item from the model's `findings` list.
             index: Its position, for the log line.
+            workspace_root: Repo root for optional evidence fill.
 
         Returns:
             The BugReport, or None if the entry is unusable.
@@ -1053,11 +1923,17 @@ class CodeAnalysisAgent(BaseAgent):
             return None
 
         try:
-            line_start = int(entry.get("line_start", 0))
-            line_end = int(entry.get("line_end", line_start))
+            raw_start = entry.get("line_start", 1)
+            line_start = int(1 if raw_start in (None, "") else raw_start)
+            raw_end = entry.get("line_end", line_start)
+            line_end = int(line_start if raw_end in (None, "") else raw_end)
         except (TypeError, ValueError):
             logger.warning("findings[%d] has non-numeric line numbers; dropped.", index)
             return None
+
+        if line_start < 1:
+            line_start = 1
+        line_end = max(line_end, line_start)
 
         severity = str(entry.get("severity", "medium")).strip().lower()
         if severity not in SEVERITY_RANK:
@@ -1067,18 +1943,38 @@ class CodeAnalysisAgent(BaseAgent):
             confidence = float(entry.get("confidence", 0.5))
         except (TypeError, ValueError):
             confidence = 0.5
+        # Models often copy the schema example ``0.0`` literally; that
+        # would be wiped by ReportBuilder.min_confidence (0.4).
+        if confidence <= 0.0:
+            confidence = 0.5
 
-        file_path = str(entry.get("file_path") or "").strip()
-        evidence = self._strip_gutter(str(entry.get("evidence") or ""))
-
-        if not file_path or not evidence.strip():
-            # Grounding would reject these anyway; dropping them here
-            # keeps the rejection log about hallucinations rather than
-            # about malformed output.
+        file_path = str(
+            entry.get("file_path")
+            or entry.get("file")
+            or entry.get("path")
+            or entry.get("filename")
+            or ""
+        ).strip()
+        if not file_path:
             logger.warning(
-                "findings[%d] has no file path or no evidence; dropped.", index
+                "findings[%d] has no file path (keys=%s); dropped.",
+                index,
+                sorted(str(key) for key in entry.keys()),
             )
             return None
+
+        evidence = self._strip_gutter(str(entry.get("evidence") or ""))
+        if not evidence.strip():
+            evidence = self._evidence_from_file(
+                workspace_root,
+                file_path,
+                line_start,
+                line_end,
+            )
+
+        function_name = str(entry.get("function_name") or "<module>").strip()
+        if not function_name:
+            function_name = "<module>"
 
         try:
             return BugReport(
@@ -1088,9 +1984,9 @@ class CodeAnalysisAgent(BaseAgent):
                 severity=severity,  # type: ignore[arg-type]
                 confidence=min(max(confidence, 0.0), MAX_LLM_CONFIDENCE),
                 file_path=file_path,
-                function_name=str(entry.get("function_name") or "<module>").strip(),
+                function_name=function_name,
                 line_start=line_start,
-                line_end=max(line_end, line_start),
+                line_end=line_end,
                 evidence=evidence,
                 suggested_fix=(
                     str(entry["suggested_fix"]).strip()
@@ -1102,6 +1998,44 @@ class CodeAnalysisAgent(BaseAgent):
         except Exception as exc:
             logger.warning("findings[%d] could not be built: %s", index, exc)
             return None
+
+    @staticmethod
+    def _evidence_from_file(
+        workspace_root: str,
+        file_path: str,
+        line_start: int,
+        line_end: int,
+    ) -> str:
+        """
+        Best-effort read of ``file_path`` lines for the findings UI.
+
+        Returns an empty string when the file cannot be read; callers
+        must not drop the finding solely for that reason.
+        """
+        root = (workspace_root or "").strip()
+        relative = (file_path or "").strip()
+        if not root or not relative or line_start < 1:
+            return ""
+
+        candidate = (
+            relative
+            if os.path.isabs(relative)
+            else os.path.normpath(os.path.join(root, relative))
+        )
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return ""
+
+        start = line_start - 1
+        end = max(line_end, line_start)
+        if start >= len(lines):
+            return ""
+        sliced = lines[start:end]
+        if not sliced:
+            return ""
+        return "".join(sliced).rstrip("\n")
 
     @staticmethod
     def _strip_gutter(evidence: str) -> str:
@@ -1136,8 +2070,8 @@ class CodeAnalysisAgent(BaseAgent):
         """
         Pull a JSON value out of a model response.
 
-        Tries the whole string, then a fenced block, then the first
-        balanced object or array found in the text.
+        Strips Markdown fences deterministically, then decodes a JSON
+        object or array. Does not invent missing fields.
 
         Args:
             content: Raw text from the model.
@@ -1145,50 +2079,72 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             The decoded value, or None if there is no JSON in it.
         """
-        text = (content or "").strip()
-        if not text:
+        value, _error = extract_json_value(content)
+        return value
+
+    def _retry_json_repair(
+        self,
+        *,
+        raw_output: str,
+        parse_error: str,
+    ) -> Optional[str]:
+        """
+        Perform exactly one surgical JSON-repair model call.
+
+        Returns the repaired raw text when the provider responds, or
+        ``None`` when the call fails. Parsing success is checked by the
+        caller.
+        """
+        if self.model_client is None:
             return None
 
-        for candidate in [text] + [m.strip() for m in _FENCE.findall(text)]:
-            try:
-                return json.loads(candidate)
-            except (ValueError, TypeError):
-                continue
+        raw_text = (raw_output or "").strip() or "(empty)"
+        if len(raw_text) > _MAX_JSON_REPAIR_RAW_CHARS:
+            raw_text = raw_text[:_MAX_JSON_REPAIR_RAW_CHARS] + "\n...[truncated]"
 
-        for opener, closer in (("{", "}"), ("[", "]")):
-            start = text.find(opener)
-            if start == -1:
-                continue
+        retry_prompt = (
+            "CODE ANALYSIS JSON REPAIR MODE\n"
+            "Return ONLY the corrected JSON object.\n"
+            "No Markdown, no code fences, no explanation.\n"
+            "Preserve recoverable information; do not invent findings.\n\n"
+            f"PARSER ERROR\n{parse_error or 'unknown'}\n\n"
+            f"RAW MODEL OUTPUT\n{raw_text}\n\n"
+            "Required shape:\n"
+            '{"answer": "...", "findings": []}\n'
+        )
+        self._trace(
+            "analysis_json_repair_started",
+            parse_error=parse_error,
+            raw_chars=len(raw_output or ""),
+        )
+        started = time.perf_counter()
+        try:
+            response = self.model_client.generate(
+                [
+                    ModelMessage(role="system", content=_JSON_REPAIR_SYSTEM_PROMPT),
+                    ModelMessage(role="user", content=retry_prompt),
+                ],
+                temperature=0.0,
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+            )
+        except Exception as exc:
+            logger.warning("Code analysis JSON repair call failed: %s", exc)
+            self._trace(
+                "analysis_json_repair_failed",
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return None
 
-            depth = 0
-            in_string = False
-            escaped = False
-
-            for position in range(start, len(text)):
-                char = text[position]
-
-                if in_string:
-                    if escaped:
-                        escaped = False
-                    elif char == "\\":
-                        escaped = True
-                    elif char == '"':
-                        in_string = False
-                    continue
-
-                if char == '"':
-                    in_string = True
-                elif char == opener:
-                    depth += 1
-                elif char == closer:
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(text[start : position + 1])
-                        except (ValueError, TypeError):
-                            break
-
-        return None
+        content = response.content or ""
+        self._trace(
+            "analysis_json_repair_finished",
+            success=bool(content.strip()),
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            content_chars=len(content),
+        )
+        return content if content.strip() else None
 
     # ------------------------------------------------------------------
     # Merging
@@ -1200,12 +2156,11 @@ class CodeAnalysisAgent(BaseAgent):
         llm_findings: Sequence[BugReport],
     ) -> Tuple[List[BugReport], int]:
         """
-        Combine both halves into one ordered, deduplicated set.
+        Combine both halves into one ordered, attributed set.
 
         Static findings are seeded first so that when the two halves
-        describe the same defect, the deterministic account survives.
-        Its category and line range come from the AST rather than from
-        a model's reading of it.
+        describe the same defect, the deterministic account survives as
+        the base finding and attribution becomes ``Static + LLM``.
 
         Two findings are the same defect when they cite the same file
         and the same bug type over overlapping lines. Requiring the bug
@@ -1213,17 +2168,22 @@ class CodeAnalysisAgent(BaseAgent):
         line from being swallowed.
 
         Args:
-            static_findings: Grounded findings from the static pass.
-            llm_findings: Grounded findings from the model.
+            static_findings: Annotated findings from the static pass.
+            llm_findings: Annotated findings from the model.
 
         Returns:
-            The merged findings and how many were dropped as
-            duplicates.
+            The merged findings and how many were folded as duplicates.
         """
         kept: List[BugReport] = []
         removed = 0
 
         for finding in list(static_findings) + list(llm_findings):
+            if not str((finding.metadata or {}).get("found_by") or "").strip():
+                if finding.detection_method == "static":
+                    set_found_by(finding, FOUND_BY_STATIC)
+                elif finding.detection_method == "llm":
+                    set_found_by(finding, FOUND_BY_LLM)
+
             duplicate = next(
                 (other for other in kept if self._same_defect(other, finding)), None
             )
@@ -1231,13 +2191,13 @@ class CodeAnalysisAgent(BaseAgent):
                 kept.append(finding)
                 continue
 
+            merge_attribution(duplicate, finding)
             removed += 1
             logger.debug(
-                "Merged duplicate %s at %s:%d into the %s finding.",
+                "Merged duplicate %s at %s:%d into Static + LLM attribution.",
                 finding.bug_type,
                 finding.file_path,
                 finding.line_start,
-                duplicate.detection_method,
             )
 
         kept.sort(
@@ -1249,6 +2209,54 @@ class CodeAnalysisAgent(BaseAgent):
             )
         )
         return kept, removed
+
+    def _annotate_documentation(
+        self,
+        findings: Sequence[BugReport],
+        workspace_root: str,
+    ) -> List[BugReport]:
+        """
+        Mark findings already called out in docstrings/comments.
+
+        Documentation status is an annotation only — findings are never
+        removed because they are already documented.
+        """
+        annotated: List[BugReport] = []
+        source_cache: Dict[str, str] = {}
+
+        for finding in findings:
+            relative = (finding.file_path or "").strip()
+            if relative and relative not in source_cache:
+                source_cache[relative] = self._read_source_file(
+                    workspace_root, relative
+                )
+            source = source_cache.get(relative, "")
+            documented = bool(source) and is_already_documented_in_source(
+                source,
+                description=finding.description,
+                bug_type=finding.bug_type,
+            )
+            set_already_documented(finding, documented)
+            annotated.append(finding)
+        return annotated
+
+    @staticmethod
+    def _read_source_file(workspace_root: str, file_path: str) -> str:
+        """Best-effort whole-file read for documentation annotations."""
+        root = (workspace_root or "").strip()
+        relative = (file_path or "").strip()
+        if not root or not relative:
+            return ""
+        candidate = (
+            relative
+            if os.path.isabs(relative)
+            else os.path.normpath(os.path.join(root, relative))
+        )
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            return ""
 
     @staticmethod
     def _same_defect(left: BugReport, right: BugReport) -> bool:
@@ -1304,8 +2312,8 @@ class CodeAnalysisAgent(BaseAgent):
         if cached is not None:
             return cached
 
-        filesystem = self._filesystem or FilesystemTools(
-            workspace_root=root, config=self.config
+        filesystem = self._filesystem or self._filesystem_tools(
+            root, config=self.config
         )
         pipeline = _Pipeline(
             root=root,
@@ -1316,7 +2324,13 @@ class CodeAnalysisAgent(BaseAgent):
             ),
             checker=self._grounding_checker
             or GroundingChecker(
-                workspace_root=root, config=self.config, filesystem=filesystem
+                workspace_root=root,
+                config=self.config,
+                filesystem=filesystem,
+                tracer=self.tracer,
+                # Analysis always runs grounding as an annotation layer.
+                # Other agents still honour Config.grounding_enabled.
+                enabled=True,
             ),
             indexer=self._indexer
             or Indexer(
@@ -1382,8 +2396,11 @@ class CodeAnalysisAgent(BaseAgent):
         Returns:
             The directory the index for this repository lives in.
         """
-        digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:12]
-        return os.path.join(self.config.chroma_persist_directory, digest)
+        from ..rag.store_paths import vector_store_for_repository
+
+        return vector_store_for_repository(
+            self.config.chroma_persist_directory, root
+        )
 
     @staticmethod
     def _scope(pipeline: _Pipeline, repository_path: str) -> str:

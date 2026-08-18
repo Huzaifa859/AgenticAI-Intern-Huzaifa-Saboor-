@@ -17,7 +17,11 @@ import textwrap
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from codebase_assistant.agents.code_analysis_agent import CodeAnalysisReport
-from codebase_assistant.schemas.schemas import BugReport
+from codebase_assistant.analysis.finding_attribution import attribution_lines
+from codebase_assistant.schemas.schemas import BugReport, DocumentationResult, TestingResult
+
+# Avoid pytest collecting TestingResult when this module is imported in tests.
+TestingResult.__test__ = False
 
 BANNER_WIDTH = 65
 SEVERITY_ORDER: Tuple[str, ...] = ("high", "medium", "low")
@@ -317,7 +321,7 @@ def format_finding(
         f"{indent}[{index}] "
         f"{style(finding.bug_type, 'bold', use_color=use_color)}  "
         f"{finding.file_path}:{lines}  "
-        f"{finding.detection_method}  "
+        f"{attribution_lines(finding)[0].replace('Found by: ', '', 1)}  "
         f"conf={finding.confidence:.2f}"
     )
 
@@ -325,10 +329,17 @@ def format_finding(
         ("File", finding.file_path),
         ("Lines", lines),
         ("Type", finding.bug_type),
-        ("Method", finding.detection_method),
+        ("Found by", attribution_lines(finding)[0].replace("Found by: ", "", 1)),
         ("Confidence", f"{finding.confidence:.2f}"),
         ("Function", finding.function_name),
     ]
+    for line in attribution_lines(finding)[1:]:
+        if line == "Grounded evidence":
+            fields.append(("Grounding", "Grounded evidence"))
+        elif line == "Ungrounded evidence":
+            fields.append(("Grounding", "Ungrounded evidence"))
+        elif line == "Already documented in the code.":
+            fields.append(("Docs", "Already documented in the code."))
 
     body: List[str] = [header, ""]
     for label, value in fields:
@@ -519,6 +530,40 @@ def format_summary_table(
     return f"\n{banner('Summary Statistics')}\n\n{body}"
 
 
+def format_ungrounded_section(report: CodeAnalysisReport) -> str:
+    """
+    Format rejected grounding candidates for terminal display.
+
+    These are never mixed into verified findings.
+    """
+    if not report.rejected:
+        return ""
+    lines = [
+        banner("Unverified (failed grounding)"),
+        "",
+        "These candidates were discarded by grounding and are NOT verified bugs.",
+        "",
+    ]
+    for index, result in enumerate(report.rejected, start=1):
+        nested = result.report
+        bug_type = getattr(nested, "bug_type", None) or "candidate"
+        severity = getattr(nested, "severity", None) or "?"
+        method = getattr(nested, "detection_method", None) or "?"
+        description = getattr(nested, "description", None) or "(no description)"
+        status = getattr(result.status, "value", result.status)
+        lines.extend(
+            [
+                f"{index}. [{severity}] {bug_type} — "
+                f"{result.file_path}:{result.line_start}-{result.line_end}",
+                f"   Method: {method} · Status: {status}",
+                f"   Why: {result.reason}",
+                f"   {description}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip()
+
+
 def format_report(
     report: CodeAnalysisReport,
     *,
@@ -546,6 +591,17 @@ def format_report(
         format_findings_section(report, width=term_width, use_color=use_color),
         format_summary_table(report, rejected_llm),
     ]
+    show_ungrounded = False
+    try:
+        from codebase_assistant.config import Config
+
+        show_ungrounded = bool(Config.load().analysis_show_ungrounded)
+    except Exception:
+        show_ungrounded = False
+    if show_ungrounded:
+        ungrounded = format_ungrounded_section(report)
+        if ungrounded:
+            sections.append(ungrounded)
     return "\n".join(part for part in sections if part)
 
 
@@ -564,3 +620,123 @@ def print_report(
         color: Optional color override. None means auto-detect.
     """
     print(format_report(report, width=width, color=color))
+
+
+def format_documentation_result(result: DocumentationResult) -> str:
+    """
+    Format a DocumentationResult for terminal display.
+
+    Args:
+        result: Documentation agent output.
+
+    Returns:
+        A readable multi-section string.
+    """
+    lines = [
+        "=" * BANNER_WIDTH,
+        "Documentation Result",
+        "=" * BANNER_WIDTH,
+        "",
+        "Summary",
+        "-" * BANNER_WIDTH,
+        (result.summary or "(empty)").strip() or "(empty)",
+        "",
+        "Function / Module",
+        "-" * BANNER_WIDTH,
+        f"File:      {result.file_path or '(none)'}",
+        f"Name:      {result.function_name or '(none)'}",
+        "",
+        "Parameters",
+        "-" * BANNER_WIDTH,
+    ]
+
+    if result.parameters:
+        for index, param in enumerate(result.parameters, start=1):
+            if not isinstance(param, dict):
+                lines.append(f"  [{index}] {param}")
+                continue
+            name = str(param.get("name") or "")
+            ptype = str(param.get("type") or "")
+            description = str(param.get("description") or "")
+            label = name or f"param_{index}"
+            type_part = f" ({ptype})" if ptype else ""
+            desc_part = f": {description}" if description else ""
+            lines.append(f"  [{index}] {label}{type_part}{desc_part}")
+    else:
+        lines.append("  (none)")
+
+    lines.extend(
+        [
+            "",
+            "Returns",
+            "-" * BANNER_WIDTH,
+            (result.returns or "(none)").strip() or "(none)",
+            "",
+            "Example usage",
+            "-" * BANNER_WIDTH,
+            (result.example_usage or "(none)").strip() or "(none)",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def print_documentation_result(result: DocumentationResult) -> None:
+    """Print a formatted DocumentationResult to stdout."""
+    print(format_documentation_result(result))
+
+
+def format_testing_result(
+    result: TestingResult, *, include_source: bool = False
+) -> str:
+    """
+    Format a TestingResult for terminal display.
+
+    Args:
+        result: Testing agent output.
+        include_source: When True, append full generated test modules.
+
+    Returns:
+        A readable multi-section string.
+    """
+    lines = [
+        "=" * BANNER_WIDTH,
+        "Testing Result",
+        "=" * BANNER_WIDTH,
+        "",
+        "Summary",
+        "-" * BANNER_WIDTH,
+        (result.summary or "(empty)").strip() or "(empty)",
+        "",
+        "Coverage estimate",
+        "-" * BANNER_WIDTH,
+        f"{float(result.coverage_estimate):.2f}",
+        "",
+        "Generated test filenames",
+        "-" * BANNER_WIDTH,
+    ]
+
+    filenames = sorted(result.generated_tests.keys())
+    if filenames:
+        for name in filenames:
+            lines.append(f"  - {name}")
+    else:
+        lines.append("  (none)")
+
+    if include_source and result.generated_tests:
+        lines.extend(["", "Generated test source", "-" * BANNER_WIDTH])
+        for name in filenames:
+            code = result.generated_tests.get(name) or ""
+            lines.append(f"\n--- {name} ---")
+            lines.append(code.rstrip() or "(empty file)")
+            lines.append("")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def print_testing_result(
+    result: TestingResult, *, include_source: bool = False
+) -> None:
+    """Print a formatted TestingResult to stdout."""
+    print(format_testing_result(result, include_source=include_source))

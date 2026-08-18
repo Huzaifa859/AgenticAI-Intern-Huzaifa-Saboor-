@@ -20,8 +20,52 @@ overrides implemented below.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional at install time
+    load_dotenv = None  # type: ignore[assignment]
+
+
+#: Local UI/CLI runtime data root when ``CODEBASE_ASSISTANT_DATA_DIR`` is unset.
+#: Kept in sync with ``app.ui_paths.streamlit_data_dir`` so Chroma bases match.
+_DEFAULT_RUNTIME_DATA_DIRNAME = "codebase_assistant_streamlit"
+
+
+def default_runtime_data_dir() -> str:
+    """
+    Canonical on-disk runtime data root for local app entry points.
+
+    Precedence:
+    1. ``CODEBASE_ASSISTANT_DATA_DIR`` when set
+    2. ``{temp}/codebase_assistant_streamlit``
+    """
+    override = (os.environ.get("CODEBASE_ASSISTANT_DATA_DIR") or "").strip()
+    if override:
+        return override
+    return os.path.join(tempfile.gettempdir(), _DEFAULT_RUNTIME_DATA_DIRNAME)
+
+
+def default_chroma_persist_directory() -> str:
+    """
+    Canonical Chroma persistence base for the application.
+
+    Precedence:
+    1. ``CHROMA_PERSIST_DIR`` when set (explicit override always wins)
+    2. ``{CODEBASE_ASSISTANT_DATA_DIR}/chroma`` when the data dir is set
+    3. ``{temp}/codebase_assistant_streamlit/chroma`` (Streamlit/worker default)
+
+    ``Config()``, ``Config.load()``, and ``app.ui_paths.chroma_persist_dir``
+    all resolve through this helper so CLI and Streamlit share one store.
+    """
+    override = (os.environ.get("CHROMA_PERSIST_DIR") or "").strip()
+    if override:
+        return override
+    return os.path.join(default_runtime_data_dir(), "chroma")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -76,6 +120,57 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_model_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """
+    Read a comma-separated list of OpenRouter model slugs.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is unset or empty.
+
+    Returns:
+        Parsed non-empty model slugs, or ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    parsed = tuple(part.strip() for part in str(raw).split(",") if part.strip())
+    return parsed or default
+
+
+def _dedupe_model_chain(*parts: str) -> Tuple[str, ...]:
+    """Return ordered unique model slugs, dropping blanks."""
+    chain: list[str] = []
+    for part in parts:
+        slug = str(part or "").strip()
+        if slug and slug not in chain:
+            chain.append(slug)
+    return tuple(chain)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """
+    Read a boolean setting from the environment.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is unset or unparseable.
+
+    Returns:
+        True for 1/true/yes/on (case-insensitive), False for
+        0/false/no/off, otherwise ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass
 class Config:
     """
@@ -93,27 +188,44 @@ class Config:
             skipped.
         ignore_directories: Directory names excluded from ingestion.
 
-        chroma_persist_directory: Directory ChromaDB persists to.
+        chroma_persist_directory: Directory ChromaDB persists to. Defaults
+            to the Streamlit/worker canonical base
+            (``{temp}/codebase_assistant_streamlit/chroma``) unless
+            ``CHROMA_PERSIST_DIR`` or ``CODEBASE_ASSISTANT_DATA_DIR`` is set.
         chroma_collection_name: Name of the ChromaDB collection holding
             code chunks.
         embedding_model_name: sentence-transformers model used to embed
             chunks.
         retrieval_top_k: Number of chunks retrieved per query.
+        rerank_enabled: When True, Retriever applies an optional
+            cross-encoder pass after the vector search.
+        rerank_model_name: sentence-transformers CrossEncoder model
+            used for reranking.
+        rerank_candidates: Candidate pool size fetched before
+            reranking. Must be >= retrieval_top_k.
 
         openrouter_base_url: Base URL of the OpenRouter API.
         openrouter_api_key: OpenRouter API key. Sourced from the
             environment; never commit a value here.
         openrouter_model: Default model slug requested through
             OpenRouter.
-        claude_model: Claude slug used for code analysis and
-            bug-finding. Reached via OpenRouter, hence the same slug
-            namespace.
+        claude_model: Legacy alias for the primary OpenRouter analysis
+            model. Kept because existing callers still read it.
         ollama_base_url: Base URL of the local Ollama service.
         ollama_model: Local model used for documentation generation.
         max_tokens: Default maximum tokens per model call.
         model_name: Legacy single-model identifier, superseded by
-            `claude_model` and `ollama_model`. Retained because existing
-            callers still read it.
+            `openrouter_model` and `ollama_model`. Retained because
+            existing callers still read it.
+        preferred_provider: Primary LLM backend name (default openrouter).
+        fallback_provider: Secondary LLM backend name (default ollama).
+        provider_cache_seconds: TTL for preferred-provider availability
+            caching before re-probing.
+        output_cache_enabled: When True, Documentation/Testing/Analysis
+            reuse a persistent cross-run cache of LLM output instead of
+            recalling the model for inputs already seen.
+        output_cache_directory: Directory the output cache is persisted
+            under, one JSON file per repository.
 
         github_token: Optional GitHub token. Not required for the MVP,
             which clones public repositories only.
@@ -140,20 +252,68 @@ class Config:
     )
 
     # --- RAG / vector store (proposal: Indexing Design) ---------------
-    chroma_persist_directory: str = "./.codebase_assistant/chroma"
+    # default_factory keeps CLI / Config.load / Streamlit on one base.
+    chroma_persist_directory: str = field(
+        default_factory=default_chroma_persist_directory
+    )
     chroma_collection_name: str = "codebase_chunks"
     embedding_model_name: str = "all-mpnet-base-v2"
     retrieval_top_k: int = 8
+    rerank_enabled: bool = False
+    rerank_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = 24
 
     # --- Models (proposal: Tech Stack) --------------------------------
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_api_key: Optional[str] = None
-    openrouter_model: str = "anthropic/claude-3.5-sonnet"
-    claude_model: str = "anthropic/claude-3.5-sonnet"
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    claude_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
     max_tokens: int = 4096
-    model_name: str = "anthropic/claude-3.5-sonnet"
+    model_name: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    preferred_provider: str = "openrouter"
+    fallback_provider: str = "ollama"
+    provider_cache_seconds: int = 60
+    # Per-agent OpenRouter model routing (primary + ordered fallbacks).
+    # Each agent's dedicated OpenRouterProvider uses only its own chain;
+    # Ollama is not part of these agent fallback lists.
+    analysis_model: str = "anthropic/claude-sonnet-4.5"
+    analysis_fallback_models: Tuple[str, ...] = (
+        "qwen/qwen3-coder-plus",
+        "qwen/qwen3-coder",
+    )
+    documentation_model: str = "google/gemini-2.5-flash"
+    documentation_fallback_models: Tuple[str, ...] = (
+        "qwen/qwen3-coder-flash",
+        "google/gemini-2.5-flash-lite",
+    )
+    testing_model: str = "google/gemini-2.5-flash"
+    testing_fallback_models: Tuple[str, ...] = (
+        "anthropic/claude-sonnet-4.5",
+        "qwen/qwen3-coder-plus",
+    )
+    # When True, DocumentationAgent keeps imperfect LLM text (invalid JSON
+    # salvage / soft grounding) with warnings instead of emptying results.
+    # Best for demos; set DOCUMENTATION_LENIENT=false for strict abstention.
+    documentation_lenient: bool = True
+    # When True, TestingAgent salvages pytest source from non-JSON model
+    # output instead of abstaining with an empty suite.
+    testing_lenient: bool = True
+    # When True, analysis UIs/CLI also surface findings that failed
+    # grounding as "unverified candidates" (never mixed into verified).
+    analysis_show_ungrounded: bool = False
+    # When False (default), documentation/testing skip evidence grounding.
+    # Code Analysis enables annotate-only grounding in CodeAnalysisAgent._bind.
+    # Set GROUNDING_ENABLED=true to turn grounding on for other agents.
+    grounding_enabled: bool = False
+    # When True (default), Documentation/Testing/Analysis reuse a
+    # persistent cross-run cache of LLM output keyed by a hash of the
+    # inputs, skipping the model call entirely on a hit. Set
+    # OUTPUT_CACHE_ENABLED=false (or pass --no-cache on the CLI) to force
+    # regeneration.
+    output_cache_enabled: bool = True
+    output_cache_directory: str = "./.codebase_assistant/output_cache"
 
     # --- Filesystem ---------------------------------------------------
     github_token: Optional[str] = None
@@ -190,6 +350,10 @@ class Config:
         out of source control are overridable: credentials, service
         URLs, storage locations, and the log level.
 
+        Precedence, highest first: the project `.env`, then variables
+        already present in the environment, then a `.env` found by
+        walking up from the working directory, then the defaults.
+
         Args:
             path: Optional path to a config file. Not yet honored.
 
@@ -200,12 +364,26 @@ class Config:
         defaults and the environment overrides.
         """
         # TODO: load settings from `path` before applying env overrides
+        # Load local `.env` into os.environ. The project `.env` overrides
+        # pre-existing process variables: a stale or placeholder key
+        # inherited from the parent shell must not silently shadow the
+        # credentials the developer actually configured. Credentials stay
+        # out of source and are never logged here.
+        if load_dotenv is not None:
+            project_env = Path(__file__).resolve().parent.parent / ".env"
+            load_dotenv(project_env, override=True)
+            load_dotenv(override=False)
+
         defaults = cls()
         return cls(
             openrouter_api_key=_env_optional_str("OPENROUTER_API_KEY"),
             openrouter_base_url=_env_str(
                 "OPENROUTER_BASE_URL", defaults.openrouter_base_url
             ),
+            openrouter_model=_env_str(
+                "OPENROUTER_MODEL", defaults.openrouter_model
+            ),
+            max_tokens=_env_int("CA_MAX_TOKENS", defaults.max_tokens),
             ollama_base_url=_env_str("OLLAMA_BASE_URL", defaults.ollama_base_url),
             github_token=_env_optional_str("GITHUB_TOKEN"),
             workspace_root=_env_str("WORKSPACE_ROOT", defaults.workspace_root),
@@ -216,5 +394,81 @@ class Config:
                 "MEMORY_STORE_PATH", defaults.memory_store_path
             ),
             retrieval_top_k=_env_int("RETRIEVAL_TOP_K", defaults.retrieval_top_k),
+            rerank_enabled=_env_bool("RERANK_ENABLED", defaults.rerank_enabled),
+            rerank_model_name=_env_str(
+                "RERANK_MODEL_NAME", defaults.rerank_model_name
+            ),
+            rerank_candidates=_env_int(
+                "RERANK_CANDIDATES", defaults.rerank_candidates
+            ),
             log_level=_env_str("LOG_LEVEL", defaults.log_level),
+            preferred_provider=_env_str(
+                "PREFERRED_PROVIDER", defaults.preferred_provider
+            ),
+            fallback_provider=_env_str(
+                "FALLBACK_PROVIDER", defaults.fallback_provider
+            ),
+            provider_cache_seconds=_env_int(
+                "PROVIDER_CACHE_SECONDS", defaults.provider_cache_seconds
+            ),
+            documentation_lenient=_env_bool(
+                "DOCUMENTATION_LENIENT", defaults.documentation_lenient
+            ),
+            testing_lenient=_env_bool(
+                "TESTING_LENIENT", defaults.testing_lenient
+            ),
+            analysis_show_ungrounded=_env_bool(
+                "ANALYSIS_SHOW_UNGROUNDED",
+                defaults.analysis_show_ungrounded,
+            ),
+            grounding_enabled=_env_bool(
+                "GROUNDING_ENABLED",
+                defaults.grounding_enabled,
+            ),
+            output_cache_enabled=_env_bool(
+                "OUTPUT_CACHE_ENABLED",
+                defaults.output_cache_enabled,
+            ),
+            output_cache_directory=_env_str(
+                "OUTPUT_CACHE_DIR", defaults.output_cache_directory
+            ),
+            analysis_model=_env_str(
+                "ANALYSIS_MODEL", defaults.analysis_model
+            ),
+            analysis_fallback_models=_env_model_list(
+                "ANALYSIS_FALLBACK_MODELS",
+                defaults.analysis_fallback_models,
+            ),
+            testing_model=_env_str(
+                "TESTING_MODEL", defaults.testing_model
+            ),
+            testing_fallback_models=_env_model_list(
+                "TESTING_FALLBACK_MODELS",
+                defaults.testing_fallback_models,
+            ),
+            documentation_model=_env_str(
+                "DOCUMENTATION_MODEL", defaults.documentation_model
+            ),
+            documentation_fallback_models=_env_model_list(
+                "DOCUMENTATION_FALLBACK_MODELS",
+                defaults.documentation_fallback_models,
+            ),
+        )
+
+    def analysis_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Code Analysis OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.analysis_model, *self.analysis_fallback_models
+        )
+
+    def documentation_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Documentation OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.documentation_model, *self.documentation_fallback_models
+        )
+
+    def testing_model_chain(self) -> Tuple[str, ...]:
+        """Primary + fallbacks for Testing OpenRouter calls."""
+        return _dedupe_model_chain(
+            self.testing_model, *self.testing_fallback_models
         )

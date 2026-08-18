@@ -4,20 +4,23 @@ mcp
 
 Model Context Protocol (MCP) integration layer.
 
-The proposal exposes the filesystem tools (`read_file`, `list_files`,
-`search_codebase`) to agents as MCP tools/resources rather than only as
-in-process callables, so the same capabilities are reachable by any
-MCP-speaking client.
+Exposes Supervisor ToolRegistry tools through:
 
-Contains:
-- MCPServer: publishes Codebase Assistant tools/resources over MCP.
-- MCPClient: consumes tools/resources exposed by an MCP server.
+- MCPServer / MCPClient: local in-process transport (tests, notebook)
+- stdio FastMCP bridge: official MCP protocol for external hosts
 
-NOTE: Placeholder only. No transport, handshake, protocol handling, or
-tool advertisement is implemented yet.
+Agent and routing logic stay in the Supervisor.
 """
 
 from .client import MCPClient
-from .server import MCPServer
+from .server import MCPServer, get_running_server
+from .stdio_server import build_fastmcp, main, run_stdio
 
-__all__ = ["MCPServer", "MCPClient"]
+__all__ = [
+    "MCPServer",
+    "MCPClient",
+    "get_running_server",
+    "build_fastmcp",
+    "run_stdio",
+    "main",
+]

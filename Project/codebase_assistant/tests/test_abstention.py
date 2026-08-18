@@ -1,0 +1,301 @@
+"""
+test_abstention.py
+===================
+
+Explicit abstention when agents lack grounded evidence.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import List, Optional
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from codebase_assistant.agents.code_analysis_agent import CodeAnalysisAgent
+from codebase_assistant.agents.documentation_agent import DocumentationAgent
+from codebase_assistant.agents.testing_agent import TestingAgent
+from codebase_assistant.config import Config
+from codebase_assistant.schemas.schemas import (
+    AgentRequest,
+    AgentType,
+    ModelResponse,
+    RetrievedChunk,
+)
+
+
+def _mock_client(available: bool = True, content: str = "") -> MagicMock:
+    client = MagicMock()
+    client.is_available.return_value = available
+    response = ModelResponse(content=content, usage={}, raw={})
+    client.generate.return_value = response
+
+    def _stream(_messages, on_chunk=None, **_kwargs):
+        if on_chunk is not None and content:
+            on_chunk(content)
+        return response
+
+    client.generate_stream.side_effect = _stream
+    return client
+
+
+def _mock_retriever(chunks: Optional[List[RetrievedChunk]] = None) -> MagicMock:
+    retriever = MagicMock()
+    retriever.retrieve.return_value = list(chunks or [])
+    retriever.vector_store_path = "./.codebase_assistant/chroma"
+    retriever.config = MagicMock()
+    retriever.vector_db = MagicMock()
+    return retriever
+
+
+def test_analysis_abstains_on_empty_repository(tmp_path: Path) -> None:
+    """An empty repository has no supported Python files to analyze."""
+    agent = CodeAnalysisAgent(model_client=None, retriever=None)
+    report = agent.analyze_repository(str(tmp_path), use_rag=False)
+
+    assert report.abstention is not None
+    assert report.findings == []
+    assert "no supported Python files" in report.abstention.reason
+    assert report.abstention.recommended_next_steps
+
+
+def test_analysis_abstains_on_unsupported_repository(tmp_path: Path) -> None:
+    """Non-Python repositories are unsupported for bug detection."""
+    (tmp_path / "notes.md").write_text("# docs only\n", encoding="utf-8")
+    (tmp_path / "data.txt").write_text("hello\n", encoding="utf-8")
+    agent = CodeAnalysisAgent(model_client=None, retriever=None)
+    report = agent.analyze_repository(str(tmp_path), use_rag=False)
+
+    assert report.abstention is not None
+    assert report.findings == []
+    assert "no supported Python files" in report.abstention.reason
+
+
+def test_analysis_abstains_when_retrieval_returns_nothing(tmp_path: Path) -> None:
+    """Empty retrieval plus an empty model response yields abstention."""
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    # Valid empty JSON so this is not a parse failure; retrieval itself
+    # produced no grounded context and the model offered no answer.
+    client = _mock_client(content='{"answer": "", "findings": []}')
+    retriever = _mock_retriever([])
+    agent = CodeAnalysisAgent(model_client=client, retriever=retriever)
+
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+
+    assert report.abstention is not None
+    assert report.findings == []
+    assert report.abstention.reason == "No grounded evidence was found."
+    assert report.context == []
+
+
+def test_analysis_keeps_findings_when_grounding_annotates_mismatch(tmp_path: Path) -> None:
+    """Ungrounded LLM findings remain visible when grounding is enabled."""
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    hallucinated = {
+        "answer": "Found a bug.",
+        "findings": [
+            {
+                "bug_type": "undefined_variable",
+                "description": "Invented issue",
+                "severity": "high",
+                "confidence": 0.9,
+                "file_path": "math_utils.py",
+                "function_name": "add",
+                "line_start": 1,
+                "line_end": 1,
+                "evidence": "this evidence does not exist in the file",
+                "detection_method": "llm",
+            }
+        ],
+    }
+    client = _mock_client(content=json.dumps(hallucinated))
+    chunk = RetrievedChunk(
+        source="math_utils.py",
+        content="def add(a, b):\n    return a + b\n",
+        score=0.9,
+        metadata={"file_path": "math_utils.py"},
+    )
+    retriever = _mock_retriever([chunk])
+    agent = CodeAnalysisAgent(
+        model_client=client,
+        retriever=retriever,
+        config=Config(grounding_enabled=True, output_cache_enabled=False),
+    )
+
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+
+    assert report.abstention is None
+    assert len(report.findings) >= 1
+    assert report.llm_proposed_count >= 1
+    mismatched = next(f for f in report.findings if f.bug_type == "undefined_variable")
+    assert mismatched.metadata.get("grounding_status") == "ungrounded"
+
+
+def test_parse_response_keeps_finding_without_model_evidence(tmp_path: Path) -> None:
+    """Missing evidence must not drop a finding that has a file path."""
+    (tmp_path / "wallet.py").write_text(
+        "def withdraw(amount):\n    balance = balance - amount\n    return balance\n",
+        encoding="utf-8",
+    )
+    agent = CodeAnalysisAgent(model_client=_mock_client(content="{}"))
+    _answer, findings = agent.parse_response(
+        json.dumps(
+            {
+                "answer": "Balance is used before assignment.",
+                "findings": [
+                    {
+                        "bug_type": "undefined_variable",
+                        "description": "balance is read before it is set",
+                        "severity": "high",
+                        "file_path": "wallet.py",
+                        "line_start": 2,
+                        "line_end": 2,
+                        "confidence": 0.0,
+                    }
+                ],
+            }
+        ),
+        workspace_root=str(tmp_path),
+    )
+
+    assert len(findings) == 1
+    assert findings[0].file_path == "wallet.py"
+    assert findings[0].confidence == 0.5
+    assert findings[0].evidence == "    balance = balance - amount"
+
+
+def test_analysis_keeps_streamed_findings_when_grounding_off(tmp_path: Path) -> None:
+    """End-to-end: slim streamed findings must reach report.findings."""
+    (tmp_path / "wallet.py").write_text(
+        "def withdraw(amount):\n    balance = balance - amount\n    return balance\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "answer": "Found an undefined variable.",
+        "findings": [
+            {
+                "bug_type": "undefined_variable",
+                "description": "balance used before assignment",
+                "severity": "high",
+                "file_path": "wallet.py",
+                "line_start": 2,
+                "line_end": 2,
+                "confidence": 0.0,
+            }
+        ],
+    }
+    client = _mock_client(content=json.dumps(payload))
+    chunk = RetrievedChunk(
+        source="wallet.py",
+        content="def withdraw(amount):\n    balance = balance - amount\n",
+        score=0.9,
+        metadata={"file_path": "wallet.py"},
+    )
+    agent = CodeAnalysisAgent(model_client=client, retriever=_mock_retriever([chunk]))
+
+    with patch.object(agent, "_sync_index", return_value=None):
+        report = agent.analyze_repository(str(tmp_path), use_rag=True)
+
+    assert report.abstention is None
+    assert len(report.findings) >= 1
+    assert any(f.bug_type == "undefined_variable" for f in report.findings)
+    assert report.llm_proposed_count >= 1
+
+
+def test_documentation_abstains_without_evidence(tmp_path: Path) -> None:
+    """Documentation abstains when the repository has no usable source."""
+    client = _mock_client(content=json.dumps({"summary": "should not be used"}))
+    retriever = _mock_retriever([])
+    agent = DocumentationAgent(model_client=client, retriever=retriever)
+
+    with patch.object(agent, "_ensure_index"):
+        response = agent.handle(
+            AgentRequest(
+                task_id="doc-abs",
+                agent_type=AgentType.DOCUMENTATION,
+                instruction="Generate a README summary.",
+                context={"repo_path": str(tmp_path), "doc_type": "readme"},
+            )
+        )
+
+    assert response.success is False
+    assert response.output is not None
+    assert response.output.abstention is not None
+    assert "no supported python files" in response.output.abstention.reason.lower()
+    assert client.generate.call_count == 0
+
+
+def test_testing_abstains_without_evidence(tmp_path: Path) -> None:
+    """Testing abstains when there is no grounded source to test."""
+    client = _mock_client(
+        content=json.dumps(
+            {
+                "summary": "should not be used",
+                "generated_tests": {"test_x.py": "def test_x():\n    assert True\n"},
+                "coverage_estimate": 0.1,
+            }
+        )
+    )
+    retriever = _mock_retriever([])
+    agent = TestingAgent(model_client=client, retriever=retriever)
+
+    with patch.object(agent, "_ensure_index"):
+        response = agent.handle(
+            AgentRequest(
+                task_id="test-abs",
+                agent_type=AgentType.TESTING,
+                instruction="Generate tests.",
+                context={"repo_path": str(tmp_path)},
+            )
+        )
+
+    assert response.success is False
+    assert response.output is not None
+    assert response.output.abstention is not None
+    assert "no supported python files" in response.output.abstention.reason.lower()
+    assert client.generate.call_count == 0
+
+
+def test_documentation_abstains_on_unverifiable_model_output(tmp_path: Path) -> None:
+    """Empty documentation model output becomes an explicit abstention."""
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    client = _mock_client(content="")
+    retriever = _mock_retriever([])
+    agent = DocumentationAgent(model_client=client, retriever=retriever)
+
+    with patch.object(agent, "_ensure_index"):
+        result = agent.generate_readme(str(tmp_path))
+
+    assert result.abstention is not None
+    assert result.summary == ""
+
+
+def test_testing_abstains_on_unverifiable_model_output(tmp_path: Path) -> None:
+    """Bad testing JSON becomes an explicit abstention."""
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    client = _mock_client(content="not-json")
+    retriever = _mock_retriever([])
+    agent = TestingAgent(model_client=client, retriever=retriever)
+
+    with patch.object(agent, "_ensure_index"):
+        result = agent.generate_unit_tests(str(tmp_path))
+
+    assert result.abstention is not None
+    assert result.abstention.reason == "LLM response could not be verified."
+    assert result.generated_tests == {}

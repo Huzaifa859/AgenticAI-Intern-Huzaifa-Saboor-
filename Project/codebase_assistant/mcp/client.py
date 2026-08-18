@@ -2,77 +2,129 @@
 client.py
 =========
 
-Placeholder for the MCP client used to consume tools and resources
-exposed by an MCP server.
+Local MCP client for Codebase Assistant.
 
-This is the seam through which the ToolRegistry will eventually be able
-to register MCP-hosted tools alongside its in-process ones, so agents
-call both through a single interface.
-
-TODO: Implement real MCP client support — connection/transport,
-handshake, tool discovery, invocation, and resource reads.
+Talks only to an in-process MCPServer registered at a host:port
+address. This foundation matches the server's local transport so tests
+and the notebook can exercise tool discovery/invocation without a
+network stack.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+from .server import _err, _normalize_address, _ok, get_running_server
+
+logger = logging.getLogger(__name__)
 
 
 class MCPClient:
     """
-    Connects to an MCP server and invokes its tools/resources.
+    Connects to a local MCP server and invokes its tools.
 
-    Intended to let Codebase Assistant consume capabilities hosted by
-    external MCP servers, not just its own.
+    Intended to consume capabilities published by ``MCPServer``, which
+    itself mirrors the Supervisor ToolRegistry.
     """
 
-    def __init__(self, server_url: str = "", timeout: float = 30.0) -> None:
+    def __init__(self, server_url: str = "localhost:8000", timeout: float = 30.0) -> None:
         """
         Initialize the MCP client.
 
         Args:
-            server_url: URL/address of the MCP server to connect to.
-            timeout: Per-request timeout in seconds.
+            server_url: Address of the MCP server (``host:port`` or URL).
+            timeout: Per-request timeout in seconds (reserved for future
+                remote transports; local calls are in-process).
         """
-        self.server_url = server_url
-        self.timeout = timeout
+        self.server_url = server_url or "localhost:8000"
+        self.timeout = float(timeout)
         self.connected = False
+        self._server = None
 
-    def connect(self) -> bool:
+    def connect(self) -> Dict[str, Any]:
         """
-        Establish a connection to the configured MCP server.
+        Establish a connection to the configured local MCP server.
 
         Returns:
-            True if the connection succeeded (placeholder always
-            returns False).
-
-        TODO: Implement real connection and protocol handshake.
+            Structured success/error payload. Sets ``connected`` only on
+            success.
         """
-        # TODO: implement real connection handshake
-        return False
+        try:
+            address = _normalize_address(self.server_url)
+            server = get_running_server(address)
+            if server is None or not server.running:
+                self.connected = False
+                self._server = None
+                return _err(
+                    "connection_failure",
+                    f"No running MCP server at {address}.",
+                    address=address,
+                )
+            self._server = server
+            self.connected = True
+            return _ok({"address": address, "connected": True})
+        except Exception as exc:
+            logger.warning("MCPClient.connect failed: %s", exc)
+            self.connected = False
+            self._server = None
+            return _err("connection_failure", str(exc))
 
-    def disconnect(self) -> None:
+    def disconnect(self) -> Dict[str, Any]:
         """
         Close the connection to the MCP server.
 
-        TODO: Implement real disconnect and cleanup.
+        Returns:
+            Structured success payload. Safe to call when not connected.
         """
-        # TODO: implement real disconnect
-        pass
+        try:
+            self._server = None
+            self.connected = False
+            return _ok({"connected": False})
+        except Exception as exc:
+            logger.warning("MCPClient.disconnect failed: %s", exc)
+            self.connected = False
+            self._server = None
+            return _err("disconnect_failed", str(exc))
+
+    def health(self) -> Dict[str, Any]:
+        """
+        Query the connected server's health endpoint.
+
+        Returns:
+            Structured health payload, or a connection error.
+        """
+        try:
+            server = self._require_server()
+            if isinstance(server, dict):
+                return server
+            return server.health()
+        except Exception as exc:
+            logger.warning("MCPClient.health failed: %s", exc)
+            return _err("health_failed", str(exc))
 
     def list_tools(self) -> List[Dict[str, Any]]:
         """
         Discover the tools advertised by the connected server.
 
         Returns:
-            A list of tool descriptors (placeholder empty list).
-
-        TODO: Implement real tool discovery.
+            A list of tool descriptors. Connection failures yield ``[]``.
         """
-        # TODO: implement real tool discovery
-        return []
+        try:
+            server = self._require_server()
+            if isinstance(server, dict):
+                return []
+            tools = server.list_tools()
+            return list(tools or [])
+        except Exception as exc:
+            logger.warning("MCPClient.list_tools failed: %s", exc)
+            return []
 
-    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
+    def call_tool(
+        self,
+        name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Invoke a tool on the connected MCP server.
 
@@ -81,15 +133,18 @@ class MCPClient:
             arguments: Keyword arguments to pass to the tool.
 
         Returns:
-            The tool's result (placeholder None).
-
-        TODO: Implement real remote invocation, including argument
-        serialization and error propagation.
+            Structured success/error payload from the server.
         """
-        # TODO: implement real remote tool invocation
-        return None
+        try:
+            server = self._require_server()
+            if isinstance(server, dict):
+                return server
+            return server.invoke_tool(name, arguments)
+        except Exception as exc:
+            logger.warning("MCPClient.call_tool failed: %s", exc)
+            return _err("call_failed", str(exc), tool_name=name)
 
-    def read_resource(self, uri: str) -> str:
+    def read_resource(self, uri: str) -> Dict[str, Any]:
         """
         Read a resource exposed by the connected MCP server.
 
@@ -97,9 +152,35 @@ class MCPClient:
             uri: URI of the resource to read.
 
         Returns:
-            The resource contents (placeholder empty string).
-
-        TODO: Implement real resource reads.
+            Structured payload. Foundation resources are descriptors
+            only; missing URIs return an error.
         """
-        # TODO: implement real resource read
-        return ""
+        try:
+            server = self._require_server()
+            if isinstance(server, dict):
+                return server
+            resources = getattr(server, "_resources", {}) or {}
+            if uri not in resources:
+                return _err("not_found", f"Resource not found: {uri}", uri=uri)
+            return _ok({"uri": uri, "description": resources.get(uri, "")})
+        except Exception as exc:
+            logger.warning("MCPClient.read_resource failed: %s", exc)
+            return _err("read_failed", str(exc), uri=uri)
+
+    def _require_server(self):
+        """
+        Return the connected server or a structured connection error.
+        """
+        if not self.connected or self._server is None:
+            return _err(
+                "not_connected",
+                "MCP client is not connected. Call connect() first.",
+            )
+        if not getattr(self._server, "running", False):
+            self.connected = False
+            self._server = None
+            return _err(
+                "connection_failure",
+                "Connected MCP server is no longer running.",
+            )
+        return self._server

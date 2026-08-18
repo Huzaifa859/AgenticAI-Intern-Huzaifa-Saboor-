@@ -7,29 +7,76 @@ Assistant. The Supervisor receives high-level user goals, breaks them
 down into tasks, routes those tasks to the appropriate specialized
 agent (Code Analysis, Documentation, Testing), and aggregates results.
 
-TODO: Implement real task planning/decomposition (likely LLM-driven),
-routing logic, and result aggregation.
+Goal routing is deterministic keyword matching: a goal selects one or
+more agents, which always run in pipeline order (code analysis →
+documentation → testing).
+
+TODO: Replace keyword routing with LLM-driven task decomposition.
 """
 
 from __future__ import annotations
 
+import inspect
+import logging
+import re
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
 from .agents.base import BaseAgent
 from .agents.code_analysis_agent import CodeAnalysisAgent
 from .agents.documentation_agent import DocumentationAgent
 from .agents.testing_agent import TestingAgent
 from .config import Config
+from .hooks.defaults import install_default_hooks
+from .hooks.events import HookEvent
+from .hooks.manager import HookManager
 from .memory.conversation_memory import ConversationMemory
 from .memory.memory_store import MemoryStore
 from .models.model_client import LLMClient
+from .models.providers.base import BaseProvider
+from .models.providers.ollama_provider import OllamaProvider
+from .models.providers.openrouter_provider import OpenRouterProvider
+from .models.providers.provider_manager import ProviderManager
 from .rag.indexer import Indexer
 from .rag.retriever import Retriever
 from .schemas.schemas import AgentRequest, AgentResponse, AgentType
 from .tools.filesystem_tools import FilesystemTools
 from .tools.github_tools import GitHubTools
 from .tools.registry import ToolRegistry
+from .tracing.events import TraceEventType
+from .tracing.tracer import Tracer
+
+logger = logging.getLogger(__name__)
+
+#: Goal keywords that select each agent, listed in execution order:
+#: code analysis, then documentation, then testing. Matching is on whole
+#: words so "latest" does not select testing and "documented" does.
+_GOAL_KEYWORDS: List[Tuple[AgentType, Pattern[str]]] = [
+    (
+        AgentType.CODE_ANALYSIS,
+        re.compile(
+            r"\b(analy[sz]e[sd]?|analy[sz]ing|analysis|review|inspect|"
+            r"examine|audit|bugs?|smells?|complexity|quality|security|lint)\b"
+        ),
+    ),
+    (
+        AgentType.DOCUMENTATION,
+        re.compile(
+            r"\b(document|documents|documented|documenting|documentation|"
+            r"docs?|docstrings?|readme|api reference)\b"
+        ),
+    ),
+    (
+        AgentType.TESTING,
+        re.compile(
+            r"\b(test|tests|tested|testing|pytest|unittest|unit tests?|coverage)\b"
+        ),
+    ),
+]
+
+#: Narrower documentation wordings, checked before defaulting to README.
+_DOCSTRING_PATTERN = re.compile(r"\bdocstrings?\b")
+_API_REFERENCE_PATTERN = re.compile(r"\b(api reference|api docs?)\b")
 
 
 class Supervisor:
@@ -49,64 +96,643 @@ class Supervisor:
         """
         self.config = config or Config.load()
 
-        # Shared subsystems.
+        # Shared run tracer — never aborts startup if construction fails.
+        try:
+            self.tracer = Tracer(run_id=str(uuid.uuid4()))
+        except Exception as exc:
+            logger.warning("Tracer construction failed; continuing without tracing: %s", exc)
+            self.tracer = Tracer(enabled=False)
+
+        # Lifecycle hooks (logging + tracer bridge). Safe if install fails.
+        self.hook_manager = HookManager()
+        try:
+            install_default_hooks(self.hook_manager, tracer=self.tracer)
+        except Exception as exc:
+            logger.warning("Default hook installation failed: %s", exc)
+
+        # Shared OpenRouter + Ollama providers. Construction failures
+        # never abort startup; static-only mode still works.
+        self.provider: Optional[BaseProvider] = self._init_openrouter_provider()
+        self.ollama_provider: Optional[BaseProvider] = self._init_ollama_provider()
+        # Shared across this ProviderManager and every dedicated one built
+        # in _make_agent_client, keyed by endpoint base URL. Without this,
+        # each of the 3 agents (+ this shared client) probes OpenRouter's
+        # /models endpoint independently even though they all resolve to
+        # the same base URL and answer the same question.
+        self._provider_availability_cache: Dict[str, Tuple[bool, float]] = {}
+        # Transparent OpenRouter → Ollama failover behind one client.
+        self.provider_manager = ProviderManager(
+            preferred=self.provider,
+            fallback=self.ollama_provider,
+            preferred_name=self.config.preferred_provider,
+            fallback_name=self.config.fallback_provider,
+            cache_seconds=self.config.provider_cache_seconds,
+            tracer=self.tracer,
+            availability_cache=self._provider_availability_cache,
+        )
         self.model_client = LLMClient(
             model_name=self.config.model_name,
             max_tokens=self.config.max_tokens,
+            provider=self.provider_manager,
+            config=self.config,
+            hook_manager=self.hook_manager,
+        )
+        # Direct Ollama client for local-model experiments. Agents use
+        # model_client (with failover), not this handle.
+        self.ollama_model_client = LLMClient(
+            model_name=self.config.ollama_model,
+            max_tokens=self.config.max_tokens,
+            provider=self.ollama_provider,
+            config=self.config,
+            hook_manager=self.hook_manager,
         )
         self.tool_registry = ToolRegistry()
         self.indexer = Indexer(vector_store_path=self.config.vector_store_path)
         self.retriever = Retriever(vector_store_path=self.config.vector_store_path)
-        self.memory_store = MemoryStore(storage_path=self.config.memory_store_path)
-        self.conversation_memory = ConversationMemory()
+        self.memory_store = MemoryStore(
+            storage_path=self.config.memory_store_path,
+            tracer=self.tracer,
+        )
+        # Short-term session history. Uses the OpenRouter-backed client
+        # for summarization and the shared MemoryStore so conversations
+        # reload across runs.
+        self.conversation_memory = ConversationMemory(
+            model_client=self.model_client,
+            memory_store=self.memory_store,
+            tracer=self.tracer,
+        )
 
         # Tools.
         self.github_tools = GitHubTools(token=self.config.github_token)
         self.filesystem_tools = FilesystemTools(workspace_root=self.config.workspace_root)
+        self._register_tools()
 
         # Agents.
         self.agents: Dict[AgentType, BaseAgent] = self._init_agents()
 
-        # TODO: register GitHub/Filesystem tool methods into self.tool_registry
         # TODO: register MCP-based tools once MCP integration is implemented
+
+    def _trace(self, name: str, *, success: Optional[bool] = True, **metadata: object) -> None:
+        """Record a Supervisor lifecycle event; never raises."""
+        try:
+            self.tracer.record(
+                TraceEventType.LIFECYCLE,
+                name,
+                component="Supervisor",
+                success=success,
+                **metadata,
+            )
+        except Exception as exc:
+            logger.warning("Supervisor tracing failed for %r: %s", name, exc)
+
+    def _hook(self, event: HookEvent, **context: object) -> None:
+        """Fire a lifecycle hook; never raises into orchestration."""
+        try:
+            payload = dict(context)
+            payload.setdefault("component", "Supervisor")
+            self.hook_manager.trigger(event, payload)
+        except Exception as exc:
+            logger.warning(
+                "Supervisor hook %s failed: %s",
+                getattr(event, "value", event),
+                exc,
+            )
+
+    def provider_status_message(self) -> str:
+        """
+        One-line CLI summary of the active LLM provider.
+
+        Returns:
+            Status such as ``Using OpenRouter (Nemotron 3 Ultra)`` or an
+            Ollama fallback / static-only message.
+        """
+        try:
+            return self.provider_manager.status_message()
+        except Exception as exc:
+            logger.warning("Provider status message failed: %s", exc)
+            return "LLM provider status unavailable"
+
+    def _register_tools(self) -> None:
+        """
+        Expose the shared tool instances through the ToolRegistry.
+
+        Bound methods of the already-constructed FilesystemTools and
+        GitHubTools are registered, so the registry is a lookup table
+        over the existing instances rather than a second implementation.
+        Names are namespaced (`filesystem.read_file`, `github.clone_repository`)
+        because both classes expose similarly named operations.
+
+        A tool that is already registered is skipped with a warning:
+        double registration is a wiring mistake, not a reason to abort
+        Supervisor startup.
+        """
+        for namespace, instance in (
+            ("filesystem", self.filesystem_tools),
+            ("github", self.github_tools),
+        ):
+            for name, handler in self._public_methods(instance):
+                qualified = f"{namespace}.{name}"
+                try:
+                    self.tool_registry.register_tool(qualified, handler)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("Could not register tool %s: %s", qualified, exc)
+
+        registered = self.tool_registry.list_tools()
+        logger.info(
+            "Registered %d tool(s) in the ToolRegistry: %s",
+            len(registered),
+            ", ".join(registered),
+        )
+
+    @staticmethod
+    def _public_methods(instance: object) -> List[Tuple[str, Callable[..., object]]]:
+        """
+        Collect the public callables a tool instance exposes.
+
+        Args:
+            instance: Tool instance to introspect.
+
+        Returns:
+            (name, bound callable) pairs for every public method, sorted
+            by name. Underscore-prefixed helpers are internal to the tool
+            and stay out of the registry.
+        """
+        return [
+            (name, member)
+            for name, member in inspect.getmembers(instance)
+            if not name.startswith("_")
+            and (inspect.ismethod(member) or inspect.isfunction(member))
+        ]
+
+    def _init_openrouter_provider(self) -> Optional[BaseProvider]:
+        """
+        Construct the shared OpenRouterProvider from Config.
+
+        A missing API key or probe failure does not prevent construction;
+        the provider simply reports itself unavailable. Only unexpected
+        construction errors are swallowed so Supervisor startup never
+        crashes because of the model layer.
+
+        Returns:
+            The OpenRouterProvider instance, or None if construction
+            itself failed.
+        """
+        try:
+            provider = OpenRouterProvider(
+                model=self.config.openrouter_model or self.config.claude_model,
+                api_key=self.config.openrouter_api_key,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.openrouter_base_url,
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OpenRouterProvider initialization failed; continuing without "
+                "a model provider: %s",
+                exc,
+            )
+            return None
+
+        if not provider.is_available():
+            logger.info(
+                "OpenRouterProvider is configured but unavailable; "
+                "analysis will run in static-only mode until a valid "
+                "OPENROUTER_API_KEY and network path are present."
+            )
+        else:
+            logger.info(
+                "OpenRouterProvider is available (model=%s).",
+                provider.model,
+            )
+        return provider
+
+    def _init_ollama_provider(self) -> Optional[BaseProvider]:
+        """
+        Construct the shared OllamaProvider from Config.
+
+        Held on the Supervisor and used as the failover target behind
+        ProviderManager. Construction or availability failures never
+        abort startup.
+
+        Returns:
+            The OllamaProvider instance, or None if construction itself
+            failed.
+        """
+        try:
+            provider = OllamaProvider(
+                model=self.config.ollama_model,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.ollama_base_url,
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "OllamaProvider initialization failed; continuing without "
+                "an Ollama provider: %s",
+                exc,
+            )
+            return None
+
+        logger.info(
+            "OllamaProvider initialized (model=%s, base_url=%s).",
+            provider.model,
+            provider.base_url,
+        )
+        if not provider.is_available():
+            logger.info(
+                "Ollama unavailable; local-model calls will fail until "
+                "Ollama is running."
+            )
+        else:
+            logger.info(
+                "Ollama available (model=%s).",
+                provider.model,
+            )
+        return provider
+
+    def _make_agent_client(
+        self,
+        model: str,
+        fallback_models: Sequence[str],
+    ) -> LLMClient:
+        """
+        Build a dedicated LLMClient for one agent backed by its own
+        OpenRouterProvider pinned to ``model`` with agent-specific
+        OpenRouter fallbacks.
+
+        Agent clients do not attach Ollama as a ProviderManager fallback;
+        failover stays inside the OpenRouter model chain from Config.
+
+        If provider construction fails (e.g. bad key), falls back to the
+        shared ``self.provider_manager`` so the agent still works.
+
+        Args:
+            model: The OpenRouter model slug the agent should use.
+            fallback_models: Ordered OpenRouter fallbacks for this agent.
+
+        Returns:
+            An LLMClient whose primary model is ``model``.
+        """
+        try:
+            dedicated_provider = OpenRouterProvider(
+                model=model,
+                api_key=self.config.openrouter_api_key,
+                max_tokens=self.config.max_tokens,
+                base_url=self.config.openrouter_base_url,
+                config=self.config,
+                fallback_models=fallback_models,
+            )
+            dedicated_manager = ProviderManager(
+                preferred=dedicated_provider,
+                fallback=None,
+                preferred_name=self.config.preferred_provider,
+                fallback_name=self.config.fallback_provider,
+                cache_seconds=self.config.provider_cache_seconds,
+                tracer=self.tracer,
+                availability_cache=self._provider_availability_cache,
+            )
+            return LLMClient(
+                model_name=model,
+                max_tokens=self.config.max_tokens,
+                provider=dedicated_manager,
+                config=self.config,
+                hook_manager=self.hook_manager,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not build dedicated client for model %s; falling back "
+                "to shared provider: %s",
+                model,
+                exc,
+            )
+            return self.model_client
 
     def _init_agents(self) -> Dict[AgentType, BaseAgent]:
         """
         Construct and wire up the specialized agents.
 
+        Each agent receives a dedicated LLMClient backed by a model
+        optimised for its specific task:
+          - CodeAnalysisAgent  → config.analysis_model_chain()
+          - DocumentationAgent → config.documentation_model_chain()
+          - TestingAgent       → config.testing_model_chain()
+
         Returns:
             A mapping from AgentType to the corresponding agent instance.
         """
-        shared_kwargs = dict(
-            model_client=self.model_client,
+        # Shared across the 3 agents below so that whichever one indexes
+        # a workspace first in a `--agent all` run, the others reuse
+        # that result for a short window instead of each re-walking and
+        # re-hashing the same repository moments apart.
+        index_reuse_cache: Dict[str, float] = {}
+        # Shared between Documentation and Testing so the second of the
+        # two to scan a given file in one pipeline run reuses the
+        # first's parsed AST instead of re-parsing the same source.
+        ast_cache: Dict[Tuple[str, float], Any] = {}
+
+        # Build one dedicated client per agent so each uses its own
+        # OpenRouter primary + fallback chain from Config.
+        analysis_client = self._make_agent_client(
+            self.config.analysis_model,
+            self.config.analysis_fallback_models,
+        )
+        docs_client = self._make_agent_client(
+            self.config.documentation_model,
+            self.config.documentation_fallback_models,
+        )
+        testing_client = self._make_agent_client(
+            self.config.testing_model,
+            self.config.testing_fallback_models,
+        )
+
+        logger.info(
+            "Agent model routing — analysis=%s | docs=%s | testing=%s",
+            " → ".join(self.config.analysis_model_chain()),
+            " → ".join(self.config.documentation_model_chain()),
+            " → ".join(self.config.testing_model_chain()),
+        )
+
+        # CodeAnalysisAgent builds a per-repository Indexer under
+        # chroma/<repo-hash>/. Injecting the Supervisor's default
+        # Retriever would point retrieval at a different store than the
+        # agent just indexed, so leave retriever unset and let _bind()
+        # attach a Retriever to that Indexer.
+        #
+        # DocumentationAgent / TestingAgent receive the Supervisor
+        # Retriever but rebind it in _ensure_index to the same
+        # chroma/<repo-hash>/ path Analysis uses, so incremental
+        # manifests are shared across agents on the warm worker.
+        documentation_agent = DocumentationAgent(
+            model_client=docs_client,
             tool_registry=self.tool_registry,
             retriever=self.retriever,
             memory_store=self.memory_store,
+            tracer=self.tracer,
+            hook_manager=self.hook_manager,
+            index_reuse_cache=index_reuse_cache,
+            ast_cache=ast_cache,
         )
+        logger.info(
+            "DocumentationAgent using dedicated client (model=%s).",
+            self.config.documentation_model,
+        )
+
         return {
-            AgentType.CODE_ANALYSIS: CodeAnalysisAgent(**shared_kwargs),
-            AgentType.DOCUMENTATION: DocumentationAgent(**shared_kwargs),
-            AgentType.TESTING: TestingAgent(**shared_kwargs),
+            AgentType.CODE_ANALYSIS: CodeAnalysisAgent(
+                model_client=analysis_client,
+                tool_registry=self.tool_registry,
+                memory_store=self.memory_store,
+                tracer=self.tracer,
+                hook_manager=self.hook_manager,
+                index_reuse_cache=index_reuse_cache,
+            ),
+            AgentType.DOCUMENTATION: documentation_agent,
+            AgentType.TESTING: TestingAgent(
+                model_client=testing_client,
+                tool_registry=self.tool_registry,
+                retriever=self.retriever,
+                memory_store=self.memory_store,
+                tracer=self.tracer,
+                hook_manager=self.hook_manager,
+                index_reuse_cache=index_reuse_cache,
+                ast_cache=ast_cache,
+            ),
         }
 
-    def handle_goal(self, goal: str) -> List[AgentResponse]:
+    def handle_goal(
+        self, goal: str, repo_path: Optional[str] = None
+    ) -> List[AgentResponse]:
         """
-        Handle a high-level user goal by decomposing it into tasks,
-        routing them to the appropriate agents, and collecting results.
+        Handle a high-level user goal by routing it to the agents whose
+        keywords it mentions and collecting their responses.
+
+        Routing is deterministic keyword matching, not model-driven
+        planning. A goal can select several agents ("analyze and
+        document"), and selected agents always run in pipeline order:
+        code analysis, then documentation, then testing. A goal that
+        matches nothing falls back to code analysis, matching
+        `route_task`.
 
         Args:
             goal: Natural language description of what the user wants
                 accomplished.
+            repo_path: Repository the agents should operate on. Defaults
+                to the configured workspace root.
 
         Returns:
-            A list of AgentResponse objects from all dispatched tasks
-            (placeholder empty list).
-
-        TODO: Implement real goal decomposition (likely via the model
-        client), task routing, and aggregation of agent responses.
+            One AgentResponse per selected agent, in execution order.
+            Responses are aggregated verbatim: each agent's own success,
+            output, and errors are passed through untouched. A failing
+            agent is recorded as a failed response and the remaining
+            agents still run, so a partial pipeline still returns every
+            result it managed to produce.
         """
-        # TODO: implement real goal decomposition and orchestration
-        return []
+        target = str(repo_path or self.config.workspace_root or ".")
+        self._trace("goal_received", goal=goal, repo_path=target)
+        agent_types = self._select_agent_types(goal)
+        self._trace(
+            "routing_decision",
+            goal=goal,
+            agents=[agent_type.value for agent_type in agent_types],
+        )
+
+        logger.info(
+            "Goal routed to %d agent(s): %s",
+            len(agent_types),
+            ", ".join(agent_type.value for agent_type in agent_types),
+        )
+
+        responses: List[AgentResponse] = []
+        for agent_type in agent_types:
+            request = self._build_request(agent_type, goal, target)
+            logger.info("Dispatching %s for goal.", agent_type.value)
+            self._trace(
+                "dispatch_start",
+                agent=agent_type.value,
+                task_id=request.task_id,
+            )
+            response = self._dispatch_safely(request)
+            self._trace(
+                "dispatch_finish",
+                agent=agent_type.value,
+                task_id=request.task_id,
+                success=response.success,
+                errors=list(response.errors or []),
+            )
+            if not response.success:
+                logger.warning(
+                    "%s reported failure; continuing with the remaining agents.",
+                    agent_type.value,
+                )
+            responses.append(response)
+
+        self._log_aggregate(responses)
+        self._trace(
+            "aggregation_complete",
+            agents=[r.agent_type.value for r in responses],
+            succeeded=sum(1 for r in responses if r.success),
+            failed=sum(1 for r in responses if not r.success),
+        )
+        return responses
+
+    @staticmethod
+    def _log_aggregate(responses: List[AgentResponse]) -> None:
+        """
+        Log the outcome of an aggregated multi-agent run.
+
+        Args:
+            responses: The collected responses, in execution order.
+        """
+        succeeded = [r.agent_type.value for r in responses if r.success]
+        failed = [r.agent_type.value for r in responses if not r.success]
+        logger.info(
+            "Goal complete: %d/%d agent(s) succeeded (ok: %s; failed: %s).",
+            len(succeeded),
+            len(responses),
+            ", ".join(succeeded) or "none",
+            ", ".join(failed) or "none",
+        )
+
+    def _dispatch_safely(self, request: AgentRequest) -> AgentResponse:
+        """
+        Dispatch one request, converting a raised error into a response.
+
+        Orchestration reports failures as data so one broken agent never
+        discards the results of the others or aborts the caller.
+
+        Args:
+            request: The request to dispatch.
+
+        Returns:
+            The agent's AgentResponse, or a failed AgentResponse
+            describing the exception it raised.
+        """
+        self._hook(
+            HookEvent.BEFORE_AGENT_RUN,
+            agent_type=request.agent_type.value,
+            task_id=request.task_id,
+        )
+        try:
+            response = self.dispatch(request)
+        except Exception as exc:
+            logger.warning(
+                "%s failed while handling a request: %s",
+                request.agent_type.value,
+                exc,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                error=str(exc),
+                success=False,
+            )
+            self._hook(
+                HookEvent.AFTER_AGENT_RUN,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                success=False,
+                error=str(exc),
+            )
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=request.agent_type,
+                success=False,
+                output=None,
+                errors=[str(exc)],
+            )
+
+        self._hook(
+            HookEvent.AFTER_AGENT_RUN,
+            agent_type=request.agent_type.value,
+            task_id=request.task_id,
+            success=response.success,
+            errors=list(response.errors or []),
+        )
+        if not response.success:
+            self._hook(
+                HookEvent.ON_ERROR,
+                agent_type=request.agent_type.value,
+                task_id=request.task_id,
+                success=False,
+                errors=list(response.errors or []),
+            )
+        return response
+
+    def _select_agent_types(self, goal: str) -> List[AgentType]:
+        """
+        Choose which agents a goal asks for, in execution order.
+
+        Args:
+            goal: The user's natural language goal.
+
+        Returns:
+            The matching AgentTypes ordered code analysis → documentation
+            → testing. Defaults to code analysis when nothing matches.
+        """
+        normalized = (goal or "").lower()
+        selected = [
+            agent_type
+            for agent_type, pattern in _GOAL_KEYWORDS
+            if pattern.search(normalized)
+        ]
+        if not selected:
+            logger.info(
+                "Goal matched no routing keywords; defaulting to code analysis."
+            )
+            return [AgentType.CODE_ANALYSIS]
+        return selected
+
+    def _build_request(
+        self, agent_type: AgentType, goal: str, repo_path: str
+    ) -> AgentRequest:
+        """
+        Build the AgentRequest for one agent selected by a goal or task.
+
+        Args:
+            agent_type: Agent the request is for.
+            goal: The original goal or task name, passed through as the
+                instruction so agents keep their own interpretation.
+            repo_path: Repository to operate on.
+
+        Returns:
+            An AgentRequest carrying the repository under both key names
+            the agents accept.
+        """
+        context: Dict[str, object] = {
+            "repo_path": repo_path,
+            "repository_path": repo_path,
+        }
+        if agent_type is AgentType.DOCUMENTATION:
+            context["doc_type"] = self._documentation_type(goal)
+        return AgentRequest(
+            task_id=self.new_task_id(),
+            agent_type=agent_type,
+            instruction=goal,
+            context=context,
+        )
+
+    @staticmethod
+    def _documentation_type(goal: str) -> str:
+        """
+        Pick the documentation mode a goal is asking for.
+
+        A repository-level goal wants a README overview, so that is the
+        default; narrower wordings select the narrower modes the
+        DocumentationAgent already supports.
+
+        Args:
+            goal: The user's natural language goal.
+
+        Returns:
+            One of "docstring", "api_reference", or "readme".
+        """
+        normalized = (goal or "").lower()
+        if _DOCSTRING_PATTERN.search(normalized):
+            return "docstring"
+        if _API_REFERENCE_PATTERN.search(normalized):
+            return "api_reference"
+        return "readme"
 
     def route_task(self, task_name: str) -> AgentType:
         """
@@ -132,22 +758,123 @@ class Supervisor:
             return AgentType.DOCUMENTATION
         return AgentType.CODE_ANALYSIS
 
-    def handle_task(self, task_name: str, repo_path: str) -> Dict[str, str]:
+    def handle_task(self, task_name: str, repo_path: str) -> AgentResponse:
         """
-        Route a task to the appropriate agent's simple `run` method and
-        return its (currently fake) result.
+        Route one task to the real pipeline of the matching agent.
+
+        The task name selects an agent by keyword and is passed through
+        as the instruction, so the agent runs its full `handle()`
+        pipeline (retrieval, prompting, grounding) rather than the
+        placeholder `run()` entry point.
 
         Args:
             task_name: Name/description of the task, used for routing.
             repo_path: Path to the repository the agent should operate on.
 
         Returns:
-            A dict with "status" and "message" keys produced by the
-            selected agent.
+            The AgentResponse produced by the selected agent. A task name
+            matching no agent returns a failed AgentResponse naming the
+            supported task types; nothing is raised.
         """
-        agent_type = self.route_task(task_name)
-        agent = self.agents[agent_type]
-        return agent.run(repo_path)
+        agent_type = self._route_task_strict(task_name)
+        self._trace(
+            "task_received",
+            task_name=task_name,
+            repo_path=str(repo_path or ""),
+        )
+        if agent_type is None:
+            self._trace(
+                "routing_decision",
+                task_name=task_name,
+                agents=[],
+                success=False,
+            )
+            response = self._unknown_task_response(task_name)
+            self._trace(
+                "aggregation_complete",
+                agents=[],
+                succeeded=0,
+                failed=1,
+            )
+            return response
+
+        target = str(repo_path or self.config.workspace_root or ".")
+        request = self._build_request(agent_type, task_name, target)
+        self._trace(
+            "routing_decision",
+            task_name=task_name,
+            agents=[agent_type.value],
+        )
+        logger.info("Dispatching %s for task %r.", agent_type.value, task_name)
+        self._trace(
+            "dispatch_start",
+            agent=agent_type.value,
+            task_id=request.task_id,
+        )
+        response = self._dispatch_safely(request)
+        self._trace(
+            "dispatch_finish",
+            agent=agent_type.value,
+            task_id=request.task_id,
+            success=response.success,
+            errors=list(response.errors or []),
+        )
+        self._trace(
+            "aggregation_complete",
+            agents=[response.agent_type.value],
+            succeeded=1 if response.success else 0,
+            failed=0 if response.success else 1,
+        )
+        return response
+
+    @staticmethod
+    def _route_task_strict(task_name: str) -> Optional[AgentType]:
+        """
+        Route a task name to one agent, or to nothing when unrecognized.
+
+        Unlike `route_task`, which treats code analysis as a catch-all,
+        this reports an unmatched task so the caller can explain what it
+        supports instead of silently running the wrong pipeline. A name
+        mentioning several agents takes the earliest in pipeline order.
+
+        Args:
+            task_name: Name/description of the task.
+
+        Returns:
+            The matching AgentType, or None when no keyword matches.
+        """
+        normalized = (task_name or "").lower()
+        for agent_type, pattern in _GOAL_KEYWORDS:
+            if pattern.search(normalized):
+                return agent_type
+        return None
+
+    def _unknown_task_response(self, task_name: str) -> AgentResponse:
+        """
+        Build the failed response for a task that matched no agent.
+
+        Args:
+            task_name: The unrecognized task name.
+
+        Returns:
+            A failed AgentResponse naming the supported task types.
+        """
+        logger.warning("Task %r matched no agent; returning a failed response.", task_name)
+        # AgentType has no "none" member and schemas are fixed, so the
+        # response is attributed to the codebase-wide default agent. The
+        # failure itself is carried by success=False and errors.
+        return AgentResponse(
+            task_id=self.new_task_id(),
+            agent_type=AgentType.CODE_ANALYSIS,
+            success=False,
+            output=None,
+            errors=[
+                f"Unknown task {task_name!r}. Supported tasks mention "
+                f"analysis (analyze, review, bugs), documentation "
+                f"(document, readme, docstrings), or testing (tests, "
+                f"pytest, coverage)."
+            ],
+        )
 
     def dispatch(self, request: AgentRequest) -> AgentResponse:
         """

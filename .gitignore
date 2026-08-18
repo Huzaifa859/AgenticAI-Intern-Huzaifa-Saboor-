@@ -23,11 +23,24 @@ __pycache__/
 .codebase_assistant/
 **/.codebase_assistant/
 **/chroma_store/
+**/.chroma/
+**/chroma/
+*.sqlite3
 
-# Environment variables
+# Benchmark run outputs (keep directory via .gitkeep)
+Project/benchmarks/results/*
+!Project/benchmarks/results/.gitkeep
+
+# Local validation / e2e / bench artifacts (scratch outputs under Project/)
+.bench_*/
+_bench*/
+_e2e*/
+_validate*/
+_rerun*/
+
+# Environment variables (keep committed templates)
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
 
 # Python packaging
@@ -46,6 +59,7 @@ Thumbs.db
 *.log
 .coverage
 htmlcov/
+coverage.xml
 
 # MCP / Claude Code local state
 .claude/
@@ -53,7 +67,6 @@ htmlcov/
 
 # If any part of your MCP server persists data locally
 *.db
-*.sqlite3
 
 # If you end up with a JS/TS MCP server or client anywhere
 node_modules/

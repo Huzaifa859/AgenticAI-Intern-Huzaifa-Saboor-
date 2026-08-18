@@ -5,16 +5,425 @@ testing_agent.py
 Defines TestingAgent, responsible for generating unit tests, estimating
 coverage, and suggesting testing strategies for a codebase.
 
-TODO: Implement real test generation using the model client, and real
-coverage analysis (e.g. via coverage.py integration).
+Uses the injected OpenRouter-backed LLMClient, Retriever for RAG
+context, and ToolRegistry-resolved FilesystemTools for reading
+repository source. After generation succeeds, tests are written to a
+temporary directory and executed via pytest's Python API; pass/fail
+counts are appended to TestingResult.summary without changing schemas
+or mutating generated_tests.
+
+Failing pytest runs are reported as-is: the agent does not call the
+model again to repair or regenerate tests.
+
+Test generation is symbol-scoped: the agent scans the repository with
+AST, then prompts once per public function or public class (with its
+public methods) before merging modules and entering the execution
+pipeline.
+
+After pytest execution, the agent measures real line coverage with
+pytest-cov (JSON report preferred) and stores that value in
+``coverage_estimate``, falling back to the model estimate only when
+coverage tooling is unavailable.
+
+Before pytest runs, generated modules are AST-parsed and their imports
+are validated against the repository inventory, the Python stdlib, and
+installed third-party packages. Unused invalid imports are removed;
+modules with used invalid imports are skipped for the current run so
+remaining tests can still execute.
 """
 
 from __future__ import annotations
 
-from typing import Dict
+import ast
+import contextlib
+import importlib.util
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from ..schemas.schemas import AgentRequest, AgentResponse, AgentType, TestingResult
+from ..analysis.report_builder import ReportBuilder
+from ..cache.output_cache import OutputCache
+from ..rag.indexer import Indexer
+from ..schemas.schemas import (
+    AbstentionResult,
+    AgentRequest,
+    AgentResponse,
+    AgentType,
+    ModelMessage,
+    RetrievedChunk,
+    TestingResult,
+)
+from ..tools.filesystem_tools import FilesystemTools
+from ..tracing.events import TraceEventType
+from ..utils.json_output import (
+    JSON_OBJECT_RESPONSE_FORMAT,
+    extract_json_object,
+    log_json_parse_outcome,
+)
 from .base import BaseAgent
+
+logger = logging.getLogger(__name__)
+
+#: Serialize testing stream deltas so concurrent per-symbol generation
+#: does not interleave token fragments in the live UI progress file.
+_STREAM_EMIT_LOCK = threading.Lock()
+
+#: Cap on source files read into the prompt when building repository context.
+_MAX_SOURCE_FILES = 6
+
+#: Cap on characters taken from each source file (fallback when no RAG).
+_MAX_FILE_CHARS = 2000
+
+#: Cap on retrieved chunks rendered into the prompt.
+_MAX_CONTEXT_CHUNKS = 5
+
+#: Cap on characters per retrieved chunk in the prompt.
+_MAX_CHUNK_CHARS = 900
+
+#: Soft ceiling on the assembled user-prompt size (chars).
+_MAX_PROMPT_CHARS = 12_000
+
+#: Generation ceiling for test-generation calls. Raised from 1536 so
+#: JSON output for classes with several methods is less likely to be
+#: cut off mid-object and trigger the JSON-repair retry path.
+_TEST_MAX_TOKENS = 2560
+
+#: Bump this whenever the test-generation prompt template or the
+#: normalized-result shape changes, so previously cached LLM outputs
+#: are invalidated instead of being replayed against a stale format.
+_PROMPT_VERSION = "test-v1"
+
+#: Soft cap on public symbols prompted in one pipeline run.
+_MAX_SYMBOLS_TO_TEST = 20
+
+#: Cap on Python files scanned during the AST inventory pass.
+_MAX_AST_FILES = 40
+
+#: Directory names excluded from the testing inventory.
+_SKIP_DIR_NAMES = frozenset(
+    {
+        "__pycache__",
+        "tests",
+        ".git",
+        ".venv",
+        "venv",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        "site-packages",
+        "node_modules",
+        "generated",
+    }
+)
+
+#: Import roots always permitted in generated tests.
+_ALWAYS_ALLOWED_IMPORT_ROOTS = frozenset(
+    {
+        "pytest",
+        "_pytest",
+        "typing",
+        "typing_extensions",
+        "__future__",
+        "builtins",
+    }
+)
+
+_PYTHON_FENCE = re.compile(
+    r"```(?:python)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE
+)
+_TEST_DEF = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.MULTILINE)
+
+#: Cap on raw output embedded in a single JSON-repair prompt.
+_MAX_JSON_REPAIR_RAW_CHARS = 6_000
+
+_JSON_REPAIR_SYSTEM_PROMPT = """\
+You are repairing malformed TestingResult JSON.
+
+This is a JSON repair step, not a new test-generation or pytest fix.
+Return ONLY the corrected TestingResult JSON object.
+Do not add explanations, Markdown, or code fences.
+Do not add fields outside the TestingResult schema.
+Preserve all recoverable test source and summary text from the raw output.
+
+Required shape:
+
+{
+  "summary": "What was tested.",
+  "generated_tests": {
+    "test_module_name.py": "complete pytest module source as a string"
+  },
+  "coverage_estimate": 0.0
+}
+"""
+
+_SYSTEM_PROMPT = """\
+You are a senior Python test engineer writing executable pytest modules.
+
+Your job is to emit clean, runnable pytest source grounded ONLY in the \
+code evidence supplied in the user message. Quality over quantity.
+
+Hard rules (follow exactly):
+1. Test ONLY symbols that appear in RETRIEVED CONTEXT or REPOSITORY \
+CONTENTS. Never invent functions, classes, methods, modules, constants, \
+exceptions, or return values.
+2. Prefer RETRIEVED CONTEXT first. Use REPOSITORY CONTENTS only to fill \
+gaps (imports, signatures, helpers) that the chunks omit.
+3. If a symbol is not clearly present in the evidence, do not test it.
+4. Write real pytest code: imports, `def test_...`, plain `assert`, and \
+`pytest.raises` / `pytest.approx` where appropriate. No pseudo-code, \
+no placeholders like `...` or `# TODO`.
+5. Assertions must check meaningful observable behavior (return values, \
+state changes, exceptions, types) - not tautologies (`assert True`) \
+and not copies of the implementation under a different name.
+6. For each public function/method you can see, prefer a small focused \
+set: one happy path, one edge case, one invalid-input / failure case. \
+Skip a category when the code gives no basis for it.
+7. Do not emit duplicate or near-duplicate tests (same call pattern and \
+same assertion intent under different names).
+8. Prefer testing public APIs. Skip private helpers (`_name`) unless \
+they are the only symbols available.
+9. Keep modules minimal and idiomatic: one test file per source module \
+when practical; use clear `test_<behavior>` names.
+10. If evidence is thin, return fewer tests (or an empty \
+`generated_tests` object) rather than guessing.
+
+Return ONE JSON object only - no markdown fences, no commentary:
+
+{
+  "summary": "What was tested and which behaviors were covered.",
+  "generated_tests": {
+    "test_module_name.py": "complete pytest module source as a string"
+  },
+  "coverage_estimate": 0.0
+}
+
+`generated_tests` values must be complete pytest modules (imports \
+included) that a developer could save and run. \
+`coverage_estimate` is a float in [0.0, 1.0] for the visible public \
+surface you actually wrote tests for - be conservative.
+"""
+
+_WRITING_INSTRUCTIONS = """\
+Generate executable pytest unit tests for the TARGET.
+
+Priority of evidence:
+1) RETRIEVED CONTEXT - primary; write tests from these symbols first.
+2) REPOSITORY CONTENTS - secondary; use only to complete signatures, \
+imports, or adjacent helpers missing from retrieval.
+
+Coverage goals (only when justified by evidence):
+- happy-path behavior with meaningful asserts
+- edge cases (empty inputs, boundaries, None if relevant)
+- invalid inputs / failure paths (use pytest.raises when the code \
+clearly raises or documents that behavior)
+
+Style:
+- clean, deterministic pytest (no network, no sleeps, no randomness)
+- one behavior per test function; no duplicate scenarios
+- import only modules/symbols that exist in the evidence
+- never invent APIs"""
+
+
+@dataclass
+class _PytestExecutionStats:
+    """Counters collected from one pytest.main run."""
+
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    duration_seconds: float = 0.0
+    exit_code: int = 0
+    detail: str = ""
+    output: str = ""
+
+
+@dataclass
+class _CoverageMeasurement:
+    """Result of one pytest-cov measurement attempt."""
+
+    available: bool
+    measured: bool = False
+    percent: float = 0.0  # 0-100 line coverage
+    files_measured: int = 0
+    statements: int = 0
+    missing: int = 0
+    summary: str = ""
+    error: str = ""
+
+    @property
+    def ratio(self) -> float:
+        """Coverage as a 0.0-1.0 ratio for ``TestingResult.coverage_estimate``."""
+        return min(max(self.percent / 100.0, 0.0), 1.0)
+
+
+@dataclass
+class _ExecutionOutcome:
+    """Internal result of writing and running generated tests."""
+
+    summary: str
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    output: str = ""
+    skipped_execution: bool = False
+    coverage: Optional["_CoverageMeasurement"] = None
+
+    @property
+    def needs_repair(self) -> bool:
+        """True when pytest ran and reported failures or errors."""
+        if self.skipped_execution:
+            return False
+        return self.failed > 0 or self.errors > 0
+
+
+@dataclass
+class _ImportIssue:
+    """One invalid import discovered in a generated test module."""
+
+    file: str
+    module: str
+    symbol: str = ""
+    reason: str = ""
+    used: bool = False
+    bound_names: List[str] = field(default_factory=list)
+    node_id: int = 0
+
+
+@dataclass
+class _ImportValidationReport:
+    """Outcome of validating imports across generated test modules."""
+
+    cleaned_tests: Dict[str, str] = field(default_factory=dict)
+    executable_tests: Dict[str, str] = field(default_factory=dict)
+    invalid_imports: List[_ImportIssue] = field(default_factory=list)
+    removed_imports: List[str] = field(default_factory=list)
+    rejected_files: List[str] = field(default_factory=list)
+
+    @property
+    def has_issues(self) -> bool:
+        return bool(self.invalid_imports)
+
+
+@dataclass
+class _ImportCatalog:
+    """Repository modules/packages/symbols used to validate imports."""
+
+    modules: Set[str] = field(default_factory=set)
+    packages: Set[str] = field(default_factory=set)
+    symbols: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def has_module(self, dotted: str) -> bool:
+        name = (dotted or "").strip(".")
+        if not name:
+            return False
+        return name in self.modules or name in self.packages
+
+    def has_symbol(self, dotted_module: str, symbol: str) -> bool:
+        module = (dotted_module or "").strip(".")
+        name = (symbol or "").strip()
+        if not module or not name:
+            return False
+        if name in self.symbols.get(module, set()):
+            return True
+        # ``from pkg import sub`` where ``sub`` is a submodule.
+        return self.has_module(f"{module}.{name}")
+
+
+@dataclass
+class _MethodInfo:
+    """One public method discovered on a class."""
+
+    name: str
+    signature: str
+    docstring: str
+    source: str
+
+
+@dataclass
+class _TestableSymbol:
+    """A public function or class selected for focused test generation."""
+
+    kind: str  # "function" | "class"
+    name: str
+    qualname: str
+    module_path: str
+    signature: str
+    docstring: str
+    source: str
+    methods: List[_MethodInfo] = field(default_factory=list)
+
+    @property
+    def focus_instruction(self) -> str:
+        """Human-readable focus line used in the symbol prompt."""
+        module = os.path.basename(self.module_path) or self.module_path
+        if self.kind == "class":
+            method_names = ", ".join(m.name for m in self.methods) or "(none)"
+            return (
+                f"Generate pytest tests for the public methods of "
+                f"{self.name} defined in {module}. "
+                f"Public methods: {method_names}."
+            )
+        return (
+            f"Generate pytest tests for the function {self.name}() "
+            f"defined in {module}."
+        )
+
+
+class _PytestStatsPlugin:
+    """
+    Minimal pytest plugin that records pass/fail/skip/error counts.
+
+    Kept private to TestingAgent execution — not part of the public API.
+    """
+
+    def __init__(self) -> None:
+        self.stats = _PytestExecutionStats()
+        self._failure_messages: List[str] = []
+
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        """Accumulate per-phase test reports into ``self.stats``."""
+        if report.when == "call":
+            if report.passed:
+                self.stats.passed += 1
+            elif report.failed:
+                self.stats.failed += 1
+                self._capture_failure(report)
+            elif report.skipped:
+                self.stats.skipped += 1
+            return
+
+        # Setup/teardown failures count as errors; skipped setup as skipped.
+        if report.failed:
+            self.stats.errors += 1
+            self._capture_failure(report)
+        elif report.skipped:
+            self.stats.skipped += 1
+
+    def pytest_collectreport(self, report: Any) -> None:
+        """Count collection failures (e.g. syntax errors) as errors."""
+        if report.failed:
+            self.stats.errors += 1
+            self._capture_failure(report)
+
+    def _capture_failure(self, report: Any) -> None:
+        """Keep a short human-readable failure snippet for the summary."""
+        if self.stats.detail:
+            return
+        longrepr = getattr(report, "longrepr", None)
+        text = str(longrepr or "").strip()
+        if text:
+            self.stats.detail = text
 
 
 class TestingAgent(BaseAgent):
@@ -23,24 +432,49 @@ class TestingAgent(BaseAgent):
     and suggesting testing strategies for a codebase.
     """
 
+    # Prevent pytest from treating this agent class as a test container.
+    __test__ = False
+
     agent_type: AgentType = AgentType.TESTING
+
+    def _lenient(self) -> bool:
+        """
+        Whether to salvage imperfect LLM test output for demos.
+
+        Uses ``Config.testing_lenient`` when the model client carries a
+        real Config. Mock clients stay strict so unit tests remain stable.
+        """
+        from ..config import Config
+
+        client = self.model_client
+        cfg = getattr(client, "config", None) if client is not None else None
+        if not isinstance(cfg, Config):
+            return False
+        return bool(cfg.testing_lenient)
 
     def run(self, repo_path: str) -> Dict[str, str]:
         """
         Simple entry point used by the Supervisor for direct routing.
 
         Args:
-            repo_path: Path to the repository to (fake) test.
+            repo_path: Path to the repository to generate tests for.
 
         Returns:
-            A fake success dict. No real tests are generated yet.
-
-        TODO: Replace with a call into the real generation pipeline
-        (generate_unit_tests) once implemented.
+            A dict with "status" and "message" keys summarizing the run.
         """
+        result = self.generate_unit_tests(repo_path)
+        if result.generated_tests or (result.summary and result.summary.strip()):
+            files = ", ".join(sorted(result.generated_tests.keys())) or "none"
+            return {
+                "status": "success",
+                "message": (
+                    f"{result.summary[:400]} "
+                    f"[files={files}; coverage≈{result.coverage_estimate:.2f}]"
+                ).strip(),
+            }
         return {
-            "status": "success",
-            "message": "Placeholder testing completed.",
+            "status": "error",
+            "message": "Test generation failed or produced no tests.",
         }
 
     def handle(self, request: AgentRequest) -> AgentResponse:
@@ -51,20 +485,87 @@ class TestingAgent(BaseAgent):
             request: The AgentRequest describing what to test.
 
         Returns:
-            An AgentResponse wrapping a placeholder TestingResult.
-
-        TODO: Implement the real testing pipeline: gather context via
-        RAG, read source files, and use the model client to draft
-        test cases.
+            An AgentResponse wrapping a TestingResult. Failures return
+            success=False with an empty TestingResult and errors.
         """
-        # TODO: implement real testing pipeline
-        result = self.generate_unit_tests(request.context.get("file_path", ""))
+        context = request.context or {}
+        instruction = (request.instruction or "").strip()
+        repo_path = str(
+            context.get("repo_path") or context.get("repository_path") or "."
+        )
+        file_path = str(context.get("file_path") or "")
+        function_name = str(context.get("function_name") or "")
+        target = file_path or repo_path
+
+        if not self._model_available():
+            logger.info("Calling OpenRouter... unavailable; returning failed response.")
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=self.agent_type,
+                success=False,
+                output=self._empty_result(),
+                errors=[
+                    "OpenRouter model provider is unavailable; "
+                    "tests were not generated."
+                ],
+            )
+
+        try:
+            if function_name and file_path:
+                default_instruction = (
+                    f"Generate pytest unit tests for function {function_name} "
+                    f"in {file_path}, covering happy paths, edge cases, "
+                    "invalid inputs, and common failure scenarios."
+                )
+            elif file_path:
+                default_instruction = (
+                    f"Generate pytest unit tests for {file_path}, covering "
+                    "functions, methods, edge cases, invalid inputs, and "
+                    "common failure scenarios."
+                )
+            else:
+                default_instruction = (
+                    f"Generate pytest unit tests for {target}, covering "
+                    "functions, methods, edge cases, invalid inputs, and "
+                    "common failure scenarios."
+                )
+            result = self._run_pipeline(
+                # Index against the repository root so Testing shares the
+                # same Chroma store / manifest as Analysis and Documentation.
+                workspace=self._workspace_for(repo_path or target),
+                target_path=target,
+                instruction=instruction or default_instruction,
+                focus_function=function_name,
+            )
+        except Exception as exc:
+            logger.warning("TestingAgent.handle failed: %s", exc)
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=self.agent_type,
+                success=False,
+                output=self._empty_result(),
+                errors=[str(exc)],
+            )
+
+        if result.abstention is not None:
+            return AgentResponse(
+                task_id=request.task_id,
+                agent_type=self.agent_type,
+                success=False,
+                output=result,
+                errors=[result.abstention.reason],
+            )
+        success = bool(result.generated_tests) or bool(
+            result.summary and result.summary.strip()
+        )
         return AgentResponse(
             task_id=request.task_id,
             agent_type=self.agent_type,
-            success=False,
+            success=success,
             output=result,
-            errors=["Not implemented"],
+            errors=[]
+            if success
+            else ["Test generation produced no usable tests or summary."],
         )
 
     def generate_unit_tests(self, file_path: str) -> TestingResult:
@@ -72,16 +573,23 @@ class TestingAgent(BaseAgent):
         Generate unit tests for a given file.
 
         Args:
-            file_path: Path to the file to generate tests for.
+            file_path: Path to the file (or repository) to generate tests for.
 
         Returns:
-            A placeholder TestingResult.
-
-        TODO: Implement real unit test generation using the model
-        client, informed by the target file's contents.
+            A populated TestingResult, or an empty result when the model
+            is unavailable or generation fails.
         """
-        # TODO: implement real unit test generation
-        return TestingResult(summary="", generated_tests={}, coverage_estimate=0.0)
+        workspace = self._workspace_for(file_path)
+        return self._run_pipeline(
+            workspace=workspace,
+            target_path=file_path or workspace,
+            instruction=(
+                f"Generate pytest unit tests for {file_path}. "
+                "Cover public functions and methods, edge cases, invalid "
+                "inputs, and common failure scenarios. Stay grounded in "
+                "the provided source."
+            ),
+        )
 
     def estimate_coverage(self, repo_path: str) -> float:
         """
@@ -91,13 +599,15 @@ class TestingAgent(BaseAgent):
             repo_path: Path to the repository root.
 
         Returns:
-            A placeholder coverage estimate between 0.0 and 1.0.
-
-        TODO: Implement real coverage estimation (e.g. via coverage.py
-        or parsing existing coverage reports).
+            A coverage estimate between 0.0 and 1.0 from the model when
+            available, otherwise 0.0.
         """
-        # TODO: implement real coverage estimation
-        return 0.0
+        result = self.generate_unit_tests(repo_path)
+        try:
+            value = float(result.coverage_estimate)
+        except (TypeError, ValueError):
+            return 0.0
+        return min(max(value, 0.0), 1.0)
 
     def suggest_test_cases(self, file_path: str) -> list:
         """
@@ -107,10 +617,2937 @@ class TestingAgent(BaseAgent):
             file_path: Path to the file to analyze.
 
         Returns:
-            A list of suggested test case descriptions (placeholder
-            empty list).
-
-        TODO: Implement real test case suggestion logic.
+            A list of suggested test case descriptions derived from
+            generated pytest test function names when available.
         """
-        # TODO: implement real test case suggestion
-        return []
+        result = self.generate_unit_tests(file_path)
+        suggestions: List[str] = []
+        for test_path, code in result.generated_tests.items():
+            for match in _TEST_DEF.finditer(code or ""):
+                suggestions.append(f"{match.group(1)} (in {test_path})")
+        if not suggestions and result.summary:
+            suggestions.append(result.summary.strip())
+        return suggestions
+
+    # ------------------------------------------------------------------
+    # Pipeline
+    # ------------------------------------------------------------------
+
+    def _run_pipeline(
+        self,
+        workspace: str,
+        target_path: str,
+        instruction: str,
+        focus_function: str = "",
+    ) -> TestingResult:
+        """
+        Run the testing pipeline for one request.
+
+        Stages: index → AST inventory/symbol scan → per-symbol generation →
+        merge → import validation → execute pytest → report coverage.
+        """
+        empty = self._empty_result()
+
+        if not self._model_available():
+            logger.info("Calling OpenRouter... unavailable.")
+            return empty
+
+        self._trace(
+            "testing_started",
+            workspace=workspace,
+            target_path=target_path,
+            focus_function=focus_function or "",
+        )
+
+        logger.info("Indexing repository for testing retrieval...")
+        self._trace("indexing", event_type=TraceEventType.INGESTION, phase="started")
+        index_started = time.perf_counter()
+        self._ensure_index(workspace)
+        self._trace(
+            "indexing",
+            event_type=TraceEventType.INGESTION,
+            success=True,
+            duration_ms=(time.perf_counter() - index_started) * 1000.0,
+            phase="finished",
+        )
+
+        logger.info("Scanning repository symbols with AST...")
+        filesystem = self._filesystem_tools(workspace)
+        inventory = self._list_python_inventory(filesystem, target_path)
+        self._trace(
+            "testing_ast_scan_started",
+            files=len(inventory),
+            target_path=target_path,
+        )
+        scan_started = time.perf_counter()
+        symbols, skipped_symbols = self._collect_testable_symbols(
+            filesystem, inventory
+        )
+        focus = (focus_function or "").strip()
+        if focus:
+            focused = [
+                symbol
+                for symbol in symbols
+                if symbol.name == focus
+                or symbol.qualname == focus
+                or focus in symbol.qualname
+            ]
+            if focused:
+                symbols = focused
+            else:
+                skipped_symbols = list(skipped_symbols) + [
+                    f"{focus}:not_found_in_inventory"
+                ]
+                symbols = []
+        self._trace(
+            "testing_ast_scan_finished",
+            success=True,
+            duration_ms=(time.perf_counter() - scan_started) * 1000.0,
+            files_scanned=len(inventory),
+            symbols_discovered=len(symbols),
+            symbols_skipped=len(skipped_symbols),
+            focus_function=focus,
+        )
+
+        if not inventory:
+            abstained = self._abstain_result(
+                reason="Repository contains no supported Python files.",
+                evidence_available=[],
+                recommended_next_steps=[
+                    "Provide a repository that includes .py source files.",
+                    "Confirm ignore rules are not excluding the entire tree.",
+                ],
+            )
+            self._trace(
+                "testing_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
+        if not symbols:
+            abstained = self._abstain_result(
+                reason="No public symbols were found to test.",
+                evidence_available=[f"{len(inventory)} inventoried Python file(s)"],
+                recommended_next_steps=[
+                    "Point testing at a module with public functions or classes.",
+                    "Confirm private-only modules are not the only targets.",
+                ],
+            )
+            self._trace(
+                "testing_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
+        selected = symbols[:_MAX_SYMBOLS_TO_TEST]
+        partial_results: List[TestingResult] = []
+
+        # Run per-symbol LLM calls concurrently. Each call is fully independent
+        # (separate prompt, no shared mutable state between symbols).
+        # ThreadPoolExecutor is preferred over asyncio: it reuses the existing
+        # synchronous provider without any provider rewrites, and network-bound
+        # work releases the GIL so threads are truly concurrent.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        _MAX_TEST_WORKERS = 20
+        output_cache = self._build_output_cache(workspace, "testing")
+
+        def _run_one_symbol(symbol):  # type: ignore[no-untyped-def]
+            """Generate tests for one symbol; returns all data needed by caller."""
+            self._trace(
+                "testing_symbol_generation_started",
+                kind=symbol.kind,
+                symbol=symbol.qualname,
+                module_path=symbol.module_path,
+            )
+            t0 = time.perf_counter()
+            cache_key = (
+                OutputCache.make_key(
+                    symbol.source,
+                    instruction,
+                    getattr(self.model_client, "model_name", ""),
+                    _PROMPT_VERSION,
+                )
+                if output_cache is not None
+                else ""
+            )
+            if output_cache is not None:
+                cached = output_cache.get(cache_key)
+                if cached is not None:
+                    try:
+                        normalized = TestingResult.model_validate(cached)
+                        self._trace(
+                            "testing_output_cache_hit",
+                            symbol=symbol.qualname,
+                        )
+                        self._trace(
+                            "testing_symbol_generation_finished",
+                            success=bool(normalized.generated_tests),
+                            symbol=symbol.qualname,
+                            files=len(normalized.generated_tests),
+                            duration_ms=(time.perf_counter() - t0) * 1000.0,
+                            cache_hit=True,
+                        )
+                        return normalized
+                    except Exception as exc:
+                        logger.warning(
+                            "Discarding invalid cached test output for %s: %s",
+                            symbol.qualname,
+                            exc,
+                        )
+            query = " ".join(
+                part
+                for part in (
+                    instruction,
+                    symbol.focus_instruction,
+                    symbol.qualname,
+                    symbol.module_path,
+                    "pytest unit tests edge cases invalid inputs",
+                )
+                if part
+            )
+            chunks = self._retrieve_context(query, symbol.module_path)
+
+            excerpt = self._format_file_excerpt(
+                symbol.module_path,
+                symbol.source,
+                max_chars=_MAX_FILE_CHARS,
+            )
+            source_excerpts = [excerpt]
+
+            prompt = self._build_symbol_prompt(
+                instruction=instruction,
+                symbol=symbol,
+                chunks=chunks,
+                source_excerpts=source_excerpts,
+            )
+            self._trace(
+                "model_request",
+                event_type=TraceEventType.MODEL_CALL,
+                symbol=symbol.qualname,
+                chunks=len(chunks),
+            )
+            model_started = time.perf_counter()
+            try:
+                response = self._generate_with_stream(
+                    system_prompt=_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    stream_label=f"Generating tests for `{symbol.qualname}`",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "OpenRouter testing call failed for %s: %s",
+                    symbol.qualname,
+                    exc,
+                )
+                self._trace(
+                    "model_response",
+                    event_type=TraceEventType.MODEL_CALL,
+                    success=False,
+                    error=str(exc),
+                    symbol=symbol.qualname,
+                    duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                )
+                self._trace(
+                    "testing_symbol_generation_finished",
+                    success=False,
+                    symbol=symbol.qualname,
+                    error=str(exc),
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                )
+                return None
+
+            self._trace(
+                "model_response",
+                event_type=TraceEventType.MODEL_CALL,
+                success=True,
+                duration_ms=(time.perf_counter() - model_started) * 1000.0,
+                content_chars=len(response.content or ""),
+                symbol=symbol.qualname,
+            )
+            parsed, parse_error = self._parse_response_with_status(response.content)
+            if parse_error is None:
+                log_json_parse_outcome(
+                    agent="testing", stage="initial", success=True
+                )
+            else:
+                log_json_parse_outcome(
+                    agent="testing",
+                    stage="initial",
+                    success=False,
+                    error=parse_error,
+                )
+                # Try lenient salvage first — no extra LLM call, immediate result.
+                if self._lenient() and not parsed.generated_tests:
+                    salvaged = self._salvage_raw_testing(
+                        response.content or "",
+                        symbol=symbol,
+                    )
+                    if salvaged.generated_tests:
+                        self._trace(
+                            "testing_json_salvaged",
+                            success=True,
+                            symbol=symbol.qualname,
+                            files=len(salvaged.generated_tests),
+                        )
+                        parsed = salvaged
+                # Salvage failed or lenient mode off — try one JSON repair call.
+                if not parsed.generated_tests:
+                    repaired = self._retry_json_repair(
+                        raw_output=response.content or "",
+                        parse_error=parse_error,
+                        symbol=symbol,
+                    )
+                    if repaired is not None:
+                        parsed, repair_error = self._parse_response_with_status(
+                            repaired
+                        )
+                        log_json_parse_outcome(
+                            agent="testing",
+                            stage="repair",
+                            success=repair_error is None,
+                            error=repair_error or "",
+                        )
+                    else:
+                        log_json_parse_outcome(
+                            agent="testing",
+                            stage="repair",
+                            success=False,
+                            error="repair call failed or returned empty",
+                        )
+            normalized = self._normalize_symbol_result(parsed, symbol)
+            if normalized.generated_tests and output_cache is not None:
+                try:
+                    output_cache.set(cache_key, normalized.model_dump())
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist testing output cache entry for %s: %s",
+                        symbol.qualname,
+                        exc,
+                    )
+            self._trace(
+                "testing_symbol_generation_finished",
+                success=bool(normalized.generated_tests),
+                symbol=symbol.qualname,
+                files=len(normalized.generated_tests),
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+            return normalized
+
+        with ThreadPoolExecutor(max_workers=_MAX_TEST_WORKERS) as pool:
+            futures = [pool.submit(_run_one_symbol, sym) for sym in selected]
+            for future in as_completed(futures):
+                normalized = future.result()
+                if normalized is not None and normalized.generated_tests:
+                    partial_results.append(normalized)
+
+        result = self._merge_testing_results(partial_results)
+        self._trace(
+            "testing_merge_completed",
+            generated_test_files=len(result.generated_tests),
+            symbols_generated=len(partial_results),
+            symbols_selected=len(selected),
+        )
+
+        if not result.generated_tests:
+            evidence = [
+                f"{len(selected)} public symbol(s) selected",
+                f"{len(inventory)} inventoried Python file(s)",
+            ]
+            abstained = self._abstain_result(
+                reason="LLM response could not be verified.",
+                evidence_available=evidence,
+                recommended_next_steps=[
+                    "Retry with a narrower target module.",
+                    "Confirm the model returned valid TestingResult JSON.",
+                ],
+            )
+            self._trace(
+                "testing_finished",
+                success=False,
+                abstained=True,
+                reason=abstained.abstention.reason if abstained.abstention else "",
+            )
+            return abstained
+
+        logger.info(
+            "Test generation finished: %d file(s), coverage≈%.2f",
+            len(result.generated_tests),
+            result.coverage_estimate,
+        )
+
+        if result.generated_tests:
+            result, import_report = self._apply_import_validation(
+                workspace=workspace,
+                result=result,
+                inventory=inventory,
+            )
+            first_outcome = self._run_generated_tests(
+                workspace,
+                import_report.executable_tests or result.generated_tests,
+                target_path=target_path,
+            )
+            # Used-invalid imports with no executable suite: surface in summary.
+            if (
+                import_report.rejected_files
+                and not import_report.executable_tests
+                and not first_outcome.needs_repair
+                and not first_outcome.skipped_execution
+            ):
+                first_outcome = _ExecutionOutcome(
+                    summary=self._merge_summaries(
+                        first_outcome.summary,
+                        "Import validation: all generated modules had used "
+                        "invalid imports.",
+                    ),
+                    passed=first_outcome.passed,
+                    failed=max(first_outcome.failed, 1),
+                    skipped=first_outcome.skipped,
+                    errors=first_outcome.errors,
+                    output=first_outcome.output,
+                    skipped_execution=False,
+                    coverage=first_outcome.coverage,
+                )
+            elif (
+                import_report.rejected_files
+                and import_report.executable_tests
+                and not first_outcome.needs_repair
+            ):
+                # Remaining valid tests ran; keep going without abstaining.
+                first_outcome = _ExecutionOutcome(
+                    summary=self._merge_summaries(
+                        first_outcome.summary,
+                        "Import validation: skipped "
+                        f"{len(import_report.rejected_files)} module(s) with "
+                        "used invalid imports.",
+                    ),
+                    passed=first_outcome.passed,
+                    failed=first_outcome.failed,
+                    skipped=first_outcome.skipped,
+                    errors=first_outcome.errors,
+                    output=first_outcome.output,
+                    skipped_execution=first_outcome.skipped_execution,
+                    coverage=first_outcome.coverage,
+                )
+
+            result = self._apply_execution_summary(result, first_outcome.summary)
+            result = self._apply_coverage_measurement(result, first_outcome)
+
+        self._trace(
+            "testing_finished",
+            success=True,
+            generated_tests=len(result.generated_tests),
+            coverage_estimate=result.coverage_estimate,
+        )
+        return result
+
+    def _execute_generated_tests(
+        self,
+        workspace: str,
+        generated_tests: Dict[str, str],
+    ) -> str:
+        """
+        Write generated tests to a temp directory and run pytest on them.
+
+        Never raises. Never mutates ``generated_tests``. Failures
+        (missing pytest, I/O errors, collection/runtime errors) are
+        reported as an execution summary string.
+
+        Args:
+            workspace: Repository root used for imports (added to
+                ``sys.path`` for the duration of the run).
+            generated_tests: Mapping of filename -> source produced by
+                the LLM. Values are written unchanged.
+
+        Returns:
+            A short execution summary suitable for appending to
+            ``TestingResult.summary``.
+        """
+        return self._run_generated_tests(workspace, generated_tests, target_path="").summary
+
+    def _run_generated_tests(
+        self,
+        workspace: str,
+        generated_tests: Dict[str, str],
+        target_path: str = "",
+    ) -> _ExecutionOutcome:
+        """
+        Write and execute generated tests; return a structured outcome.
+
+        Never raises. Never mutates ``generated_tests``.
+        """
+        if not generated_tests:
+            return _ExecutionOutcome(summary="", skipped_execution=True)
+
+        try:
+            import pytest as pytest_api
+        except ImportError:
+            logger.info("pytest is not installed; skipping test execution.")
+            return _ExecutionOutcome(
+                summary="Execution: skipped (pytest is not installed).",
+                skipped_execution=True,
+            )
+
+        temp_dir: Optional[str] = None
+        try:
+            temp_dir = self._create_temp_test_dir(workspace)
+        except Exception as exc:
+            logger.warning("Could not create temp test directory: %s", exc)
+            return _ExecutionOutcome(
+                summary=(
+                    f"Execution: skipped (could not create temp directory: {exc})."
+                ),
+                skipped_execution=True,
+            )
+
+        try:
+            try:
+                written = self._write_generated_tests(temp_dir, generated_tests)
+            except Exception as exc:
+                logger.warning("Failed writing generated tests: %s", exc)
+                return _ExecutionOutcome(
+                    summary=f"Execution: skipped (could not write tests: {exc}).",
+                    skipped_execution=True,
+                )
+
+            if not written:
+                return _ExecutionOutcome(
+                    summary="Execution: skipped (no test files were written).",
+                    skipped_execution=True,
+                )
+
+            self._trace(
+                "generated_tests_written",
+                files=len(written),
+                temp_dir=temp_dir,
+            )
+
+            self._trace("pytest_execution_started", files=len(written))
+            pytest_started = time.perf_counter()
+            stats, coverage = self._run_pytest_and_measure_coverage(
+                pytest_api,
+                workspace=workspace,
+                temp_dir=temp_dir,
+                target_path=target_path,
+            )
+            summary = self._format_execution_summary(stats)
+            self._trace(
+                "pytest_execution_finished",
+                success=stats.failed == 0 and stats.errors == 0,
+                duration_ms=(time.perf_counter() - pytest_started) * 1000.0,
+                passed=stats.passed,
+                failed=stats.failed,
+                skipped=stats.skipped,
+                errors=stats.errors,
+                exit_code=stats.exit_code,
+            )
+
+            if coverage.summary:
+                summary = self._merge_summaries(summary, coverage.summary)
+
+            return _ExecutionOutcome(
+                summary=summary,
+                passed=stats.passed,
+                failed=stats.failed,
+                skipped=stats.skipped,
+                errors=stats.errors,
+                output=stats.output or stats.detail or "",
+                coverage=coverage,
+            )
+        finally:
+            self._cleanup_temp_test_dir(temp_dir)
+
+    @staticmethod
+    def _apply_execution_summary(
+        result: TestingResult, execution_summary: str
+    ) -> TestingResult:
+        """Append an execution summary line to ``result.summary``."""
+        if not execution_summary:
+            return result
+        return TestingResult(
+            summary=TestingAgent._merge_summaries(
+                result.summary, execution_summary
+            ),
+            generated_tests=result.generated_tests,
+            coverage_estimate=result.coverage_estimate,
+            abstention=result.abstention,
+        )
+
+    @staticmethod
+    def _apply_coverage_measurement(
+        result: TestingResult,
+        outcome: "_ExecutionOutcome",
+    ) -> TestingResult:
+        """
+        Prefer measured pytest-cov coverage when available.
+
+        Keeps the model estimate when coverage could not be measured.
+        Coverage prose is already appended via ``outcome.summary``.
+        """
+        coverage = outcome.coverage
+        if coverage is None or not coverage.measured:
+            return result
+        return TestingResult(
+            summary=result.summary,
+            generated_tests=result.generated_tests,
+            coverage_estimate=coverage.ratio,
+            abstention=result.abstention,
+        )
+
+    @staticmethod
+    def _merge_summaries(*parts: Optional[str]) -> str:
+        """Join non-empty summary fragments with newlines."""
+        chunks = [part.strip() for part in parts if part and str(part).strip()]
+        return "\n".join(chunks)
+
+    def _create_temp_test_dir(self, workspace: str) -> str:
+        """
+        Create a temporary directory for generated tests.
+
+        Uses an isolated system temp directory so generated modules do
+        not pollute the repository tree or confuse nested pytest runs.
+        The repository ``workspace`` is used only for imports via
+        ``sys.path`` during execution.
+        """
+        _ = workspace
+        return tempfile.mkdtemp(prefix="codebase_assistant_temp_tests_")
+
+    def _write_generated_tests(
+        self,
+        temp_dir: str,
+        generated_tests: Dict[str, str],
+    ) -> List[str]:
+        """
+        Write each generated test module into ``temp_dir``.
+
+        Args:
+            temp_dir: Destination directory.
+            generated_tests: Filename -> source mapping (unchanged).
+
+        Returns:
+            Absolute paths of files successfully written.
+        """
+        written: List[str] = []
+        used_names: set[str] = set()
+        for raw_name, source in generated_tests.items():
+            filename = self._safe_test_filename(raw_name, used_names)
+            used_names.add(filename)
+            path = os.path.join(temp_dir, filename)
+            # Keep LLM source exactly as generated.
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(source if source is not None else "")
+            written.append(path)
+            logger.info("Wrote generated test file: %s", path)
+        return written
+
+    @staticmethod
+    def _safe_test_filename(raw_name: str, used: set[str]) -> str:
+        """
+        Flatten a generated_tests key into a safe basename under temp_dir.
+
+        Args:
+            raw_name: Original key from the LLM payload.
+            used: Filenames already claimed in this write pass.
+
+        Returns:
+            A unique ``*.py`` basename with no path separators.
+        """
+        name = (raw_name or "").replace("\\", "/").strip()
+        base = os.path.basename(name) or "test_generated.py"
+        base = base.replace("..", "_")
+        if not base.endswith(".py"):
+            base = f"{base}.py"
+        if not base.startswith("test_") and not base.endswith("_test.py"):
+            # Keep LLM names as-is when already pytest-discoverable;
+            # otherwise leave unchanged — discovery still finds test_* defs.
+            pass
+        candidate = base
+        counter = 2
+        while candidate in used:
+            stem, ext = os.path.splitext(base)
+            candidate = f"{stem}_{counter}{ext}"
+            counter += 1
+        return candidate
+
+    def _run_pytest(
+        self,
+        pytest_api: Any,
+        workspace: str,
+        temp_dir: str,
+        *,
+        extra_args: Optional[List[str]] = None,
+        coverage_file: Optional[str] = None,
+    ) -> "_PytestExecutionStats":
+        """
+        Execute pytest against ``temp_dir`` using the Python API.
+
+        Args:
+            pytest_api: The imported ``pytest`` module.
+            workspace: Repository root to put on ``sys.path``.
+            temp_dir: Directory containing the written test modules.
+            extra_args: Additional CLI args appended to the pytest
+                invocation. Used to fold ``--cov``/``--cov-report`` into
+                this same run instead of paying for a second, separate
+                pytest invocation just to measure coverage.
+            coverage_file: When set, ``COVERAGE_FILE`` is pointed at this
+                path for the duration of the call and restored afterward,
+                matching what a dedicated coverage run would do.
+
+        Returns:
+            Collected pass/fail/skip/error counts and duration.
+        """
+        plugin = _PytestStatsPlugin()
+        path_inserted = False
+        workspace_abs = os.path.abspath(workspace)
+        previous_cwd = os.getcwd()
+        previous_cov_file = (
+            os.environ.get("COVERAGE_FILE") if coverage_file else None
+        )
+        started = time.perf_counter()
+        loaded_modules = self._test_module_names(temp_dir)
+
+        try:
+            if coverage_file:
+                os.environ["COVERAGE_FILE"] = coverage_file
+            if workspace_abs not in sys.path:
+                sys.path.insert(0, workspace_abs)
+                path_inserted = True
+
+            # Run from the workspace so relative imports and package
+            # discovery behave like a developer running tests locally.
+            try:
+                os.chdir(workspace_abs)
+            except OSError:
+                pass
+
+            # importlib mode avoids "import file mismatch" when the same
+            # generated basename is executed more than once in-process
+            # (e.g. nested pytest while the suite tests TestingAgent).
+            args = [
+                temp_dir,
+                "-q",
+                "--tb=line",
+                "--import-mode=importlib",
+                "-p",
+                "no:cacheprovider",
+                f"--rootdir={temp_dir}",
+                "-o",
+                "addopts=",
+            ]
+            if extra_args:
+                args.extend(extra_args)
+            sink = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
+                    sink
+                ):
+                    exit_code = int(
+                        pytest_api.main(args, plugins=[plugin])  # type: ignore[arg-type]
+                    )
+            except SystemExit as exc:
+                code = exc.code
+                exit_code = int(code) if isinstance(code, int) else 1
+            except Exception as exc:
+                logger.warning("pytest.main raised: %s", exc)
+                plugin.stats.errors += 1
+                plugin.stats.detail = str(exc)
+                exit_code = 3
+
+            plugin.stats.output = sink.getvalue()
+            plugin.stats.exit_code = exit_code
+            plugin.stats.duration_seconds = time.perf_counter() - started
+            if (
+                plugin.stats.passed == 0
+                and plugin.stats.failed == 0
+                and plugin.stats.skipped == 0
+                and plugin.stats.errors == 0
+                and exit_code not in (0, 5)
+            ):
+                # Collection crashed before any reports (e.g. syntax).
+                plugin.stats.errors = max(plugin.stats.errors, 1)
+                if not plugin.stats.detail:
+                    plugin.stats.detail = (
+                        f"pytest exited with code {exit_code}"
+                    )
+            return plugin.stats
+        finally:
+            for module_name in loaded_modules:
+                sys.modules.pop(module_name, None)
+            try:
+                os.chdir(previous_cwd)
+            except OSError:
+                pass
+            if path_inserted:
+                try:
+                    sys.path.remove(workspace_abs)
+                except ValueError:
+                    pass
+            if coverage_file:
+                if previous_cov_file is None:
+                    os.environ.pop("COVERAGE_FILE", None)
+                else:
+                    os.environ["COVERAGE_FILE"] = previous_cov_file
+
+    @staticmethod
+    def _test_module_names(temp_dir: str) -> List[str]:
+        """Return importable module names for ``*.py`` files under temp_dir."""
+        names: List[str] = []
+        try:
+            entries = os.listdir(temp_dir)
+        except OSError:
+            return names
+        for entry in entries:
+            if entry.endswith(".py") and entry != "__init__.py":
+                names.append(os.path.splitext(entry)[0])
+        return names
+
+    @staticmethod
+    def _format_execution_summary(stats: "_PytestExecutionStats") -> str:
+        """Render a one-line (plus optional detail) execution summary."""
+        line = (
+            "Execution: "
+            f"{stats.passed} passed, {stats.failed} failed, "
+            f"{stats.skipped} skipped, {stats.errors} errors "
+            f"in {stats.duration_seconds:.2f}s."
+        )
+        detail = (stats.detail or "").strip()
+        if detail:
+            # Keep detail short so TestingResult.summary stays compact.
+            if len(detail) > 240:
+                detail = detail[:237].rstrip() + "..."
+            return f"{line} Detail: {detail}"
+        return line
+
+    def _run_pytest_and_measure_coverage(
+        self,
+        pytest_api: Any,
+        *,
+        workspace: str,
+        temp_dir: str,
+        target_path: str = "",
+    ) -> Tuple["_PytestExecutionStats", _CoverageMeasurement]:
+        """
+        Run the generated tests once, folding coverage instrumentation
+        into that same pytest invocation whenever pytest-cov is
+        available.
+
+        This used to be two full pytest invocations per generation: one
+        plain run for pass/fail stats, then a second, separate run just
+        to measure coverage via ``--cov``. The stats plugin's counts come
+        from pytest hooks (not stdout parsing), so adding ``--cov``/
+        ``--cov-report`` args to the same run does not affect them --
+        both results can come out of one invocation in the common case.
+
+        Falls back to one dedicated coverage-only run (the previous
+        behavior) only if the merged run does not yield a usable
+        coverage report, so correctness never regresses for that edge
+        case -- only the common case gets faster.
+
+        Never raises; an unavailable/failed coverage measurement is
+        returned as a structured result alongside the execution stats.
+        """
+        self._trace("testing_coverage_started", temp_dir=temp_dir)
+        cov_started = time.perf_counter()
+
+        try:
+            import pytest_cov as _pytest_cov  # noqa: F401
+        except ImportError:
+            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            coverage = _CoverageMeasurement(
+                available=False,
+                summary="Coverage: unavailable (pytest-cov not installed).",
+                error="pytest-cov not installed",
+            )
+            self._trace(
+                "testing_coverage_failed",
+                success=False,
+                error=coverage.error,
+                duration_ms=(time.perf_counter() - cov_started) * 1000.0,
+            )
+            return stats, coverage
+
+        report_path = os.path.join(temp_dir, "coverage.json")
+        cov_data_file = os.path.join(temp_dir, ".coverage")
+        targets = self._coverage_targets(workspace, target_path=target_path)
+        cov_args = [f"--cov-report=json:{report_path}", "--cov-report=term"]
+        for target in targets:
+            cov_args.extend(["--cov", target])
+
+        try:
+            stats = self._run_pytest(
+                pytest_api,
+                workspace,
+                temp_dir,
+                extra_args=cov_args,
+                coverage_file=cov_data_file,
+            )
+        except Exception as exc:
+            # The stats run itself must still be usable even if attaching
+            # --cov somehow blew up; fall back to a plain run so callers
+            # always get pass/fail results.
+            logger.warning(
+                "pytest run with --cov attached failed (%s); retrying "
+                "without coverage instrumentation.",
+                exc,
+            )
+            stats = self._run_pytest(pytest_api, workspace, temp_dir)
+            coverage = _CoverageMeasurement(
+                available=True,
+                measured=False,
+                summary="Coverage: unavailable (coverage execution failed).",
+                error=str(exc),
+            )
+            self._trace(
+                "testing_coverage_failed",
+                success=False,
+                error=coverage.error,
+                duration_ms=(time.perf_counter() - cov_started) * 1000.0,
+            )
+            return stats, coverage
+
+        coverage = self._parse_coverage_report(
+            report_path, fallback_text=stats.output or ""
+        )
+        duration_ms = (time.perf_counter() - cov_started) * 1000.0
+
+        if coverage.measured:
+            self._trace(
+                "testing_coverage_finished",
+                success=True,
+                duration_ms=duration_ms,
+                coverage_percent=coverage.percent,
+                files_measured=coverage.files_measured,
+                statements=coverage.statements,
+                missing=coverage.missing,
+            )
+            return stats, coverage
+
+        # Merged run did not produce a usable report (e.g. the cov plugin
+        # failed to write JSON without affecting test collection itself).
+        # Retry coverage measurement alone rather than silently reporting
+        # no coverage -- this is the only case that still pays for a
+        # second pytest invocation.
+        logger.info(
+            "Merged pytest+coverage run produced no usable report; "
+            "retrying coverage measurement separately."
+        )
+        self._trace(
+            "testing_coverage_failed",
+            success=False,
+            error=coverage.error or "coverage report missing",
+            duration_ms=duration_ms,
+        )
+        fallback_coverage = self._measure_coverage(
+            pytest_api,
+            workspace=workspace,
+            temp_dir=temp_dir,
+            target_path=target_path,
+        )
+        return stats, fallback_coverage
+
+    def _measure_coverage(
+        self,
+        pytest_api: Any,
+        *,
+        workspace: str,
+        temp_dir: str,
+        target_path: str = "",
+    ) -> _CoverageMeasurement:
+        """
+        Run pytest-cov against the generated tests and parse line coverage.
+
+        Prefers the JSON coverage report. Never raises; unavailable tooling
+        or parse failures return a structured unavailable measurement.
+
+        Kept as the fallback path for `_run_pytest_and_measure_coverage`
+        when the merged single-run attempt does not produce a usable
+        report -- most callers now go through the merged method instead
+        of calling this directly.
+        """
+        self._trace("testing_coverage_started", temp_dir=temp_dir)
+        started = time.perf_counter()
+
+        try:
+            import pytest_cov as _pytest_cov  # noqa: F401
+        except ImportError:
+            measurement = _CoverageMeasurement(
+                available=False,
+                summary="Coverage: unavailable (pytest-cov not installed).",
+                error="pytest-cov not installed",
+            )
+            self._trace(
+                "testing_coverage_failed",
+                success=False,
+                error=measurement.error,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return measurement
+
+        report_path = os.path.join(temp_dir, "coverage.json")
+        cov_data_file = os.path.join(temp_dir, ".coverage")
+        targets = self._coverage_targets(workspace, target_path=target_path)
+        args = [
+            temp_dir,
+            "-q",
+            "--tb=no",
+            "--import-mode=importlib",
+            "-p",
+            "no:cacheprovider",
+            f"--rootdir={temp_dir}",
+            "-o",
+            "addopts=",
+            f"--cov-report=json:{report_path}",
+            "--cov-report=term",
+        ]
+        for target in targets:
+            args.extend(["--cov", target])
+
+        previous_cov_file = os.environ.get("COVERAGE_FILE")
+        path_inserted = False
+        workspace_abs = os.path.abspath(workspace)
+        previous_cwd = os.getcwd()
+        loaded_modules = self._test_module_names(temp_dir)
+        sink = io.StringIO()
+
+        try:
+            os.environ["COVERAGE_FILE"] = cov_data_file
+            if workspace_abs not in sys.path:
+                sys.path.insert(0, workspace_abs)
+                path_inserted = True
+            try:
+                os.chdir(workspace_abs)
+            except OSError:
+                pass
+
+            try:
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(
+                    sink
+                ):
+                    pytest_api.main(args)  # type: ignore[arg-type]
+            except SystemExit:
+                pass
+            except Exception as exc:
+                logger.warning("pytest-cov execution failed: %s", exc)
+                measurement = _CoverageMeasurement(
+                    available=True,
+                    measured=False,
+                    summary="Coverage: unavailable (coverage execution failed).",
+                    error=str(exc),
+                )
+                self._trace(
+                    "testing_coverage_failed",
+                    success=False,
+                    error=measurement.error,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                )
+                return measurement
+
+            measurement = self._parse_coverage_report(
+                report_path, fallback_text=sink.getvalue()
+            )
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            if measurement.measured:
+                self._trace(
+                    "testing_coverage_finished",
+                    success=True,
+                    duration_ms=duration_ms,
+                    coverage_percent=measurement.percent,
+                    files_measured=measurement.files_measured,
+                    statements=measurement.statements,
+                    missing=measurement.missing,
+                )
+            else:
+                self._trace(
+                    "testing_coverage_failed",
+                    success=False,
+                    error=measurement.error or "coverage report missing",
+                    duration_ms=duration_ms,
+                )
+            return measurement
+        finally:
+            for module_name in loaded_modules:
+                sys.modules.pop(module_name, None)
+            try:
+                os.chdir(previous_cwd)
+            except OSError:
+                pass
+            if path_inserted:
+                try:
+                    sys.path.remove(workspace_abs)
+                except ValueError:
+                    pass
+            if previous_cov_file is None:
+                os.environ.pop("COVERAGE_FILE", None)
+            else:
+                os.environ["COVERAGE_FILE"] = previous_cov_file
+
+    def _coverage_targets(self, workspace: str, target_path: str = "") -> List[str]:
+        """
+        Choose ``--cov`` targets for the workspace under test.
+
+        When a specific target_path is provided (e.g. a file or sub-directory
+        the user asked to test), we scope coverage to just that target so the
+        reported percentage reflects the code that was actually tested rather
+        than the entire repository.
+
+        Falls back to scanning top-level modules/packages when no specific
+        target is given, and ultimately to ``.`` when the workspace inventory
+        is empty.
+        """
+        # --- Scoped coverage: user asked to test a specific file or directory ---
+        if target_path:
+            # Normalise to a path relative to workspace
+            abs_target = os.path.abspath(target_path)
+            abs_workspace = os.path.abspath(workspace)
+            try:
+                rel = os.path.relpath(abs_target, abs_workspace)
+            except ValueError:
+                rel = target_path  # different drive on Windows — keep as-is
+
+            # Single Python file → use module name (strip .py)
+            if rel.endswith(".py") and not self._should_skip_path(rel):
+                return [rel[:-3].replace(os.sep, ".")]
+
+            # Directory → use it directly if it is a package, else its name
+            if os.path.isdir(abs_target):
+                # If the directory itself is the workspace root fall through
+                # to the full-repo scan so we don't return "."
+                if abs_target != abs_workspace:
+                    return [rel]
+
+        # --- Full-repo fallback: scan top-level modules/packages ---
+        targets: List[str] = []
+        try:
+            entries = sorted(os.listdir(workspace))
+        except OSError:
+            return ["."]
+
+        for entry in entries:
+            if entry.startswith("."):
+                continue
+            path = os.path.join(workspace, entry)
+            if entry.endswith(".py"):
+                if self._should_skip_path(entry):
+                    continue
+                targets.append(entry[:-3])
+            elif os.path.isdir(path) and entry not in _SKIP_DIR_NAMES:
+                init_py = os.path.join(path, "__init__.py")
+                if os.path.isfile(init_py):
+                    targets.append(entry)
+            if len(targets) >= 12:
+                break
+        return targets or ["."]
+
+    @staticmethod
+    def _parse_coverage_report(
+        report_path: str,
+        *,
+        fallback_text: str = "",
+    ) -> _CoverageMeasurement:
+        """Parse coverage.py JSON output, with term-report fallback."""
+        if report_path and os.path.isfile(report_path):
+            try:
+                with open(report_path, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                term = TestingAgent._parse_coverage_term(fallback_text)
+                if term.measured:
+                    return term
+                return _CoverageMeasurement(
+                    available=True,
+                    measured=False,
+                    summary="Coverage: unavailable (malformed coverage output).",
+                    error=f"malformed coverage JSON: {exc}",
+                )
+
+            if not isinstance(payload, dict):
+                return _CoverageMeasurement(
+                    available=True,
+                    measured=False,
+                    summary="Coverage: unavailable (malformed coverage output).",
+                    error="coverage JSON root was not an object",
+                )
+
+            totals = payload.get("totals") or {}
+            try:
+                percent = float(totals.get("percent_covered", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                percent = 0.0
+            try:
+                statements = int(totals.get("num_statements", 0) or 0)
+            except (TypeError, ValueError):
+                statements = 0
+            try:
+                missing = int(totals.get("missing_lines", 0) or 0)
+            except (TypeError, ValueError):
+                missing = 0
+            files = payload.get("files") or {}
+            files_measured = len(files) if isinstance(files, dict) else 0
+            summary = (
+                f"Coverage: {percent:.0f}% line coverage\n"
+                f"{files_measured} files measured"
+            )
+            if statements:
+                summary = (
+                    f"{summary}\n"
+                    f"{statements} statements, {missing} missed"
+                )
+            return _CoverageMeasurement(
+                available=True,
+                measured=True,
+                percent=percent,
+                files_measured=files_measured,
+                statements=statements,
+                missing=missing,
+                summary=summary,
+            )
+
+        term = TestingAgent._parse_coverage_term(fallback_text)
+        if term.measured:
+            return term
+        return _CoverageMeasurement(
+            available=True,
+            measured=False,
+            summary="Coverage: unavailable (coverage report missing).",
+            error="coverage JSON report missing",
+        )
+
+    @staticmethod
+    def _parse_coverage_term(text: str) -> _CoverageMeasurement:
+        """Parse a pytest-cov terminal TOTAL line when JSON is unavailable."""
+        if not text:
+            return _CoverageMeasurement(available=True, measured=False)
+        # Example: TOTAL                                      40     8    80%
+        match = re.search(
+            r"TOTAL\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)%",
+            text,
+        )
+        if not match:
+            return _CoverageMeasurement(
+                available=True,
+                measured=False,
+                error="could not parse coverage terminal output",
+            )
+        try:
+            statements = int(match.group(1))
+            missing = int(match.group(2))
+            percent = float(match.group(3))
+        except (TypeError, ValueError):
+            return _CoverageMeasurement(
+                available=True,
+                measured=False,
+                error="could not parse coverage terminal totals",
+            )
+        file_lines = [
+            line
+            for line in text.splitlines()
+            if line.strip()
+            and not line.startswith("Name")
+            and not line.startswith("-")
+            and not line.startswith("TOTAL")
+            and "%" in line
+        ]
+        files_measured = len(file_lines)
+        summary = (
+            f"Coverage: {percent:.0f}% line coverage\n"
+            f"{files_measured} files measured"
+        )
+        if statements:
+            summary = (
+                f"{summary}\n"
+                f"{statements} statements, {missing} missed"
+            )
+        return _CoverageMeasurement(
+            available=True,
+            measured=True,
+            percent=percent,
+            files_measured=files_measured,
+            statements=statements,
+            missing=missing,
+            summary=summary,
+        )
+
+    @staticmethod
+    def _cleanup_temp_test_dir(temp_dir: Optional[str]) -> None:
+        """Remove the temporary test directory; never raise."""
+        if not temp_dir:
+            return
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("Failed cleaning temp test dir %s: %s", temp_dir, exc)
+
+    def _model_available(self) -> bool:
+        """Report whether the injected model client can serve requests."""
+        if self.model_client is None:
+            return False
+        try:
+            return bool(self.model_client.is_available())
+        except Exception as exc:
+            logger.warning("Testing model availability check failed: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Import hygiene (validate before pytest)
+    # ------------------------------------------------------------------
+
+    def _apply_import_validation(
+        self,
+        *,
+        workspace: str,
+        result: TestingResult,
+        inventory: Sequence[str],
+    ) -> Tuple[TestingResult, _ImportValidationReport]:
+        """
+        Validate and sanitize imports in ``result.generated_tests``.
+
+        Unused invalid imports are removed. Modules that still reference
+        invalid imports are excluded from the executable set. Never
+        abstains; callers continue with remaining executable tests.
+        """
+        generated = dict(result.generated_tests or {})
+        if not generated:
+            empty = _ImportValidationReport(cleaned_tests={}, executable_tests={})
+            return result, empty
+
+        filesystem = self._filesystem_tools(workspace)
+        report = self._validate_generated_imports(
+            filesystem=filesystem,
+            generated_tests=generated,
+            inventory=inventory,
+        )
+
+        note = ""
+        if report.removed_imports:
+            note = (
+                "Import validation: removed "
+                f"{len(report.removed_imports)} unused invalid import(s)."
+            )
+        if report.rejected_files:
+            skipped = ", ".join(report.rejected_files[:5])
+            skip_note = (
+                "Import validation: skipped invalid module(s) for execution: "
+                f"{skipped}."
+            )
+            note = self._merge_summaries(note, skip_note)
+
+        updated = TestingResult(
+            summary=self._merge_summaries(result.summary, note),
+            generated_tests=report.cleaned_tests,
+            coverage_estimate=result.coverage_estimate,
+            abstention=result.abstention,
+        )
+        return updated, report
+
+    def _validate_generated_imports(
+        self,
+        *,
+        filesystem: FilesystemTools,
+        generated_tests: Dict[str, str],
+        inventory: Sequence[str],
+    ) -> _ImportValidationReport:
+        """Parse generated tests and drop/reject invalid imports."""
+        self._trace(
+            "testing_import_validation_started",
+            files=len(generated_tests),
+            inventory=len(inventory),
+        )
+        started = time.perf_counter()
+        catalog = self._build_import_catalog(filesystem, inventory)
+
+        cleaned: Dict[str, str] = {}
+        executable: Dict[str, str] = {}
+        invalid: List[_ImportIssue] = []
+        removed: List[str] = []
+        rejected: List[str] = []
+
+        for filename, source in generated_tests.items():
+            text = source if source is not None else ""
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                cleaned[filename] = text
+                executable[filename] = text
+                continue
+
+            issues = self._collect_import_issues(
+                tree, filename=filename, catalog=catalog
+            )
+            invalid.extend(issues)
+            for issue in issues:
+                self._trace(
+                    "testing_import_validation_failed",
+                    file=issue.file,
+                    module=issue.module,
+                    symbol=issue.symbol,
+                    reason=issue.reason,
+                    used=issue.used,
+                )
+
+            unused_node_ids = {
+                issue.node_id for issue in issues if not issue.used
+            }
+            used_issues = [issue for issue in issues if issue.used]
+            new_source = text
+            if unused_node_ids:
+                new_source, removed_labels = self._strip_invalid_imports(
+                    text, tree, unused_node_ids, issues
+                )
+                removed.extend(removed_labels)
+
+            cleaned[filename] = new_source
+            if used_issues:
+                rejected.append(filename)
+            else:
+                executable[filename] = new_source
+
+        report = _ImportValidationReport(
+            cleaned_tests=cleaned,
+            executable_tests=executable,
+            invalid_imports=invalid,
+            removed_imports=removed,
+            rejected_files=rejected,
+        )
+        self._trace(
+            "testing_import_validation_finished",
+            success=not report.has_issues,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            files=len(generated_tests),
+            invalid_imports=len(invalid),
+            removed_imports=len(removed),
+            rejected_files=len(rejected),
+            executable_files=len(executable),
+        )
+        return report
+
+    def _build_import_catalog(
+        self,
+        filesystem: FilesystemTools,
+        inventory: Sequence[str],
+    ) -> _ImportCatalog:
+        """Build module/package/symbol sets from the AST inventory."""
+        catalog = _ImportCatalog()
+        paths = list(inventory)
+        if not paths:
+            try:
+                paths = filesystem.list_files(".", pattern="*.py", recursive=True)
+            except Exception as exc:
+                logger.warning("Import catalog could not list Python files: %s", exc)
+                paths = []
+
+        for raw in paths:
+            normalized = str(raw or "").replace("\\", "/").strip()
+            if not normalized.endswith(".py"):
+                continue
+            if self._should_skip_path(normalized):
+                continue
+            module = self._module_name_from_path(normalized)
+            if not module:
+                continue
+            catalog.modules.add(module)
+            parts = module.split(".")
+            for index in range(1, len(parts)):
+                catalog.packages.add(".".join(parts[:index]))
+            if normalized.endswith("/__init__.py") or normalized == "__init__.py":
+                catalog.packages.add(module)
+
+            try:
+                if not filesystem.file_exists(normalized):
+                    continue
+                source = filesystem.read_file(normalized)
+            except Exception:
+                continue
+            try:
+                tree = ast.parse(source or "", filename=normalized)
+            except SyntaxError:
+                continue
+            names = catalog.symbols.setdefault(module, set())
+            for node in getattr(tree, "body", []):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = []
+                    if isinstance(node, ast.Assign):
+                        targets = list(node.targets)
+                    elif node.target is not None:
+                        targets = [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+        return catalog
+
+    @staticmethod
+    def _module_name_from_path(path: str) -> str:
+        """Convert a repo-relative ``.py`` path into a dotted module name."""
+        normalized = (path or "").replace("\\", "/").strip().lstrip("./")
+        if not normalized.endswith(".py"):
+            return ""
+        without_ext = normalized[:-3]
+        if without_ext.endswith("/__init__"):
+            without_ext = without_ext[: -len("/__init__")]
+        elif without_ext == "__init__":
+            return ""
+        return without_ext.replace("/", ".").strip(".")
+
+    def _collect_import_issues(
+        self,
+        tree: ast.AST,
+        *,
+        filename: str,
+        catalog: _ImportCatalog,
+    ) -> List[_ImportIssue]:
+        """Return invalid import issues for one parsed test module."""
+        used_names = self._loaded_name_ids(tree)
+        issues: List[_ImportIssue] = []
+
+        for node in getattr(tree, "body", []):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module = (alias.name or "").strip()
+                    bound = alias.asname or module.split(".", 1)[0]
+                    ok, reason = self._import_module_allowed(module, catalog)
+                    if ok:
+                        continue
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=module,
+                            symbol="",
+                            reason=reason,
+                            used=bound in used_names,
+                            bound_names=[bound] if bound else [],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            if not isinstance(node, ast.ImportFrom):
+                continue
+
+            level = int(getattr(node, "level", 0) or 0)
+            if level >= 2:
+                bound = [
+                    (alias.asname or alias.name)
+                    for alias in node.names
+                    if alias.name and alias.name != "*"
+                ]
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=node.module or "",
+                        symbol=",".join(
+                            alias.name for alias in node.names if alias.name
+                        ),
+                        reason="relative import escapes repository root",
+                        used=bool(bound) and any(name in used_names for name in bound),
+                        bound_names=bound,
+                        node_id=id(node),
+                    )
+                )
+                continue
+
+            # ``from . import auth`` → each alias is a module under repo root.
+            if level == 1 and not (node.module or "").strip():
+                for alias in node.names:
+                    symbol = (alias.name or "").strip()
+                    if not symbol or symbol == "*":
+                        continue
+                    bound = alias.asname or symbol
+                    ok, reason = self._import_module_allowed(symbol, catalog)
+                    if ok:
+                        continue
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=symbol,
+                            symbol="",
+                            reason=reason,
+                            used=bound in used_names,
+                            bound_names=[bound],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            module = self._resolve_from_module(node)
+            root_ok, root_reason = self._import_module_allowed(module, catalog)
+            if node.names and any(alias.name == "*" for alias in node.names):
+                if not root_ok:
+                    issues.append(
+                        _ImportIssue(
+                            file=filename,
+                            module=module or "",
+                            symbol="*",
+                            reason=root_reason,
+                            used=True,
+                            bound_names=["*"],
+                            node_id=id(node),
+                        )
+                    )
+                continue
+
+            if not root_ok:
+                bound = [
+                    (alias.asname or alias.name)
+                    for alias in node.names
+                    if alias.name and alias.name != "*"
+                ]
+                used = any(name in used_names for name in bound)
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=module or "",
+                        symbol=",".join(
+                            alias.name for alias in node.names if alias.name
+                        ),
+                        reason=root_reason,
+                        used=used,
+                        bound_names=bound,
+                        node_id=id(node),
+                    )
+                )
+                continue
+
+            for alias in node.names:
+                symbol = (alias.name or "").strip()
+                if not symbol or symbol == "*":
+                    continue
+                bound = alias.asname or symbol
+                if catalog.has_symbol(module, symbol):
+                    continue
+                if self._is_external_module(module, catalog):
+                    # Third-party/stdlib: do not invent or reject symbols.
+                    continue
+                issues.append(
+                    _ImportIssue(
+                        file=filename,
+                        module=module or "",
+                        symbol=symbol,
+                        reason=f"symbol {symbol!r} not found in module {module!r}",
+                        used=bound in used_names,
+                        bound_names=[bound] if bound else [],
+                        node_id=id(node),
+                    )
+                )
+        return issues
+
+    def _import_module_allowed(
+        self, module: str, catalog: _ImportCatalog
+    ) -> Tuple[bool, str]:
+        """Return ``(allowed, reason)`` for a dotted import module."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False, "empty import module"
+        root = name.split(".", 1)[0]
+        if root in _ALWAYS_ALLOWED_IMPORT_ROOTS:
+            return True, ""
+        if self._is_stdlib_module(root):
+            return True, ""
+        if catalog.has_module(name):
+            return True, ""
+        # ``import app.services`` requires the full dotted path in-repo.
+        if "." in name and catalog.has_module(root) and not catalog.has_module(name):
+            return False, f"module {name!r} not found in repository"
+        if catalog.has_module(root) and "." not in name:
+            return True, ""
+        if self._is_third_party_module(name) or self._is_third_party_module(root):
+            return True, ""
+        return False, f"module {name!r} not found in repository, stdlib, or environment"
+
+    def _is_external_module(
+        self, module: str, catalog: Optional[_ImportCatalog] = None
+    ) -> bool:
+        """True when ``module`` is stdlib/third-party rather than repo code."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False
+        # Repository modules win over similarly named installed packages.
+        if catalog is not None and (
+            catalog.has_module(name) or catalog.has_module(name.split(".", 1)[0])
+        ):
+            return False
+        root = name.split(".", 1)[0]
+        if root in _ALWAYS_ALLOWED_IMPORT_ROOTS:
+            return True
+        if self._is_stdlib_module(root):
+            return True
+        return self._is_third_party_module(name) or self._is_third_party_module(root)
+
+    @staticmethod
+    def _is_stdlib_module(root: str) -> bool:
+        """Return True for Python standard-library top-level modules."""
+        name = (root or "").strip()
+        if not name:
+            return False
+        stdlib = getattr(sys, "stdlib_module_names", None)
+        if stdlib is not None:
+            return name in stdlib
+        return name in {
+            "abc",
+            "ast",
+            "asyncio",
+            "collections",
+            "contextlib",
+            "copy",
+            "dataclasses",
+            "datetime",
+            "enum",
+            "functools",
+            "hashlib",
+            "io",
+            "itertools",
+            "json",
+            "logging",
+            "math",
+            "os",
+            "pathlib",
+            "re",
+            "sys",
+            "tempfile",
+            "threading",
+            "time",
+            "typing",
+            "unittest",
+            "uuid",
+            "warnings",
+        }
+
+    @staticmethod
+    def _is_third_party_module(module: str) -> bool:
+        """Return True when ``importlib`` can find an installed module."""
+        name = (module or "").strip().strip(".")
+        if not name:
+            return False
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ModuleNotFoundError, ValueError, ImportError):
+            return False
+
+    @staticmethod
+    def _resolve_from_module(node: ast.ImportFrom) -> str:
+        """Resolve ``from X import`` including relative imports."""
+        module = (node.module or "").strip()
+        level = int(getattr(node, "level", 0) or 0)
+        if level <= 0:
+            return module
+        # Generated tests are executed from an isolated temp dir with the
+        # repository on ``sys.path``; treat relative imports as repo-root
+        # absolute modules (``from .auth import x`` → ``auth``).
+        if level == 1:
+            return module
+        # ``from ..x`` escapes the repo root for our execution model.
+        return module
+
+    @staticmethod
+    def _loaded_name_ids(tree: ast.AST) -> Set[str]:
+        """Names loaded in the module body outside import statements."""
+        used: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                root = node.value
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                if isinstance(root, ast.Name):
+                    used.add(root.id)
+        return used
+
+    def _strip_invalid_imports(
+        self,
+        source: str,
+        tree: ast.Module,
+        unused_node_ids: Set[int],
+        issues: Sequence[_ImportIssue],
+    ) -> Tuple[str, List[str]]:
+        """
+        Remove unused invalid import statements / aliases from ``source``.
+
+        Returns ``(new_source, removed_labels)``.
+        """
+        unused_issues = [
+            issue
+            for issue in issues
+            if issue.node_id in unused_node_ids and not issue.used
+        ]
+        if not unused_issues:
+            return source, []
+
+        issues_by_node: Dict[int, List[_ImportIssue]] = {}
+        for issue in unused_issues:
+            issues_by_node.setdefault(issue.node_id, []).append(issue)
+
+        removed_labels: List[str] = []
+        new_body: List[ast.stmt] = []
+
+        for node in tree.body:
+            node_issues = issues_by_node.get(id(node))
+            if not node_issues:
+                new_body.append(node)
+                continue
+
+            if isinstance(node, ast.Import):
+                bad_modules = {issue.module for issue in node_issues}
+                keep = [
+                    alias
+                    for alias in node.names
+                    if (alias.name or "") not in bad_modules
+                ]
+                for issue in node_issues:
+                    removed_labels.append(f"{issue.file}:{issue.module}")
+                if keep:
+                    new_body.append(ast.Import(names=keep))
+                continue
+
+            if isinstance(node, ast.ImportFrom):
+                module_invalid = any(
+                    not issue.symbol or "," in issue.symbol for issue in node_issues
+                )
+                if module_invalid:
+                    for issue in node_issues:
+                        label = f"{issue.file}:{issue.module}"
+                        if issue.symbol:
+                            label = f"{label}.{issue.symbol}"
+                        removed_labels.append(label)
+                    continue
+
+                bad_symbols = {issue.symbol for issue in node_issues if issue.symbol}
+                keep = [
+                    alias
+                    for alias in node.names
+                    if (alias.name or "") not in bad_symbols
+                ]
+                for issue in node_issues:
+                    removed_labels.append(
+                        f"{issue.file}:{issue.module}.{issue.symbol}"
+                    )
+                if keep:
+                    new_body.append(
+                        ast.ImportFrom(
+                            module=node.module,
+                            names=keep,
+                            level=getattr(node, "level", 0) or 0,
+                        )
+                    )
+                continue
+
+            new_body.append(node)
+
+        new_module = ast.Module(body=new_body, type_ignores=[])
+        ast.fix_missing_locations(new_module)
+        try:
+            rendered = ast.unparse(new_module)
+        except Exception:
+            return source, removed_labels
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        return rendered, removed_labels
+
+    # ------------------------------------------------------------------
+    # AST inventory + symbol-scoped generation
+    # ------------------------------------------------------------------
+
+    def _list_python_inventory(
+        self,
+        filesystem: FilesystemTools,
+        target_path: str,
+    ) -> List[str]:
+        """
+        List inventory Python modules eligible for test generation.
+
+        Prefers a single target file when ``target_path`` points at one;
+        otherwise lists repository ``*.py`` files with test/generated
+        paths filtered out.
+        """
+        relative_target = self._relative_to_workspace(filesystem, target_path)
+        if (
+            relative_target
+            and relative_target not in {".", ""}
+            and relative_target.endswith(".py")
+        ):
+            try:
+                if filesystem.file_exists(relative_target) and not self._should_skip_path(
+                    relative_target
+                ):
+                    return [relative_target.replace("\\", "/")]
+            except Exception as exc:
+                logger.warning("Could not resolve target %s: %s", target_path, exc)
+
+        try:
+            files = filesystem.list_files(".", pattern="*.py", recursive=True)
+        except Exception as exc:
+            logger.warning("Could not list Python inventory: %s", exc)
+            return []
+
+        inventory: List[str] = []
+        for path in files:
+            normalized = str(path).replace("\\", "/")
+            if self._should_skip_path(normalized):
+                continue
+            inventory.append(normalized)
+            if len(inventory) >= _MAX_AST_FILES:
+                break
+        return inventory
+
+    @staticmethod
+    def _should_skip_path(path: str) -> bool:
+        """Return True for tests/, caches, generated modules, and test files."""
+        normalized = (path or "").replace("\\", "/").strip()
+        if not normalized.endswith(".py"):
+            return True
+        parts = [part for part in normalized.split("/") if part]
+        if any(part in _SKIP_DIR_NAMES for part in parts[:-1]):
+            return True
+        filename = parts[-1] if parts else normalized
+        if filename.startswith("test_") or filename.endswith("_test.py"):
+            return True
+        if filename.endswith("_pb2.py") or filename.endswith("_pb2_grpc.py"):
+            return True
+        return False
+
+    def _collect_testable_symbols(
+        self,
+        filesystem: FilesystemTools,
+        inventory: Sequence[str],
+    ) -> Tuple[List[_TestableSymbol], List[str]]:
+        """
+        Parse inventory modules with AST and collect public symbols.
+
+        Returns:
+            ``(symbols, skipped_labels)`` where skipped labels describe
+            private/dunder/duplicate/empty-class omissions.
+        """
+        symbols: List[_TestableSymbol] = []
+        skipped: List[str] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        for module_path in inventory:
+            try:
+                source = filesystem.read_file(module_path)
+            except Exception as exc:
+                skipped.append(f"{module_path}:unreadable")
+                logger.warning("AST scan skipped %s: %s", module_path, exc)
+                continue
+            try:
+                tree = self._parse_module_ast(filesystem, module_path, source)
+            except SyntaxError:
+                skipped.append(f"{module_path}:syntax_error")
+                continue
+
+            lines = (source or "").splitlines()
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if self._is_private_name(node.name) or self._is_dunder_name(
+                        node.name
+                    ):
+                        skipped.append(f"{module_path}:{node.name}:private")
+                        continue
+                    key = (module_path, "function", node.name)
+                    if key in seen:
+                        skipped.append(f"{module_path}:{node.name}:duplicate")
+                        continue
+                    seen.add(key)
+                    symbols.append(
+                        _TestableSymbol(
+                            kind="function",
+                            name=node.name,
+                            qualname=node.name,
+                            module_path=module_path,
+                            signature=self._format_callable_signature(node),
+                            docstring=ast.get_docstring(node) or "",
+                            source=self._slice_source(lines, node),
+                        )
+                    )
+                    continue
+
+                if isinstance(node, ast.ClassDef):
+                    if self._is_private_name(node.name):
+                        skipped.append(f"{module_path}:{node.name}:private_class")
+                        continue
+                    methods: List[_MethodInfo] = []
+                    for member in node.body:
+                        if not isinstance(
+                            member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                        ):
+                            continue
+                        if self._is_private_name(member.name) or self._is_dunder_name(
+                            member.name
+                        ):
+                            skipped.append(
+                                f"{module_path}:{node.name}.{member.name}:private"
+                            )
+                            continue
+                        methods.append(
+                            _MethodInfo(
+                                name=member.name,
+                                signature=self._format_callable_signature(member),
+                                docstring=ast.get_docstring(member) or "",
+                                source=self._slice_source(lines, member),
+                            )
+                        )
+                    if not methods:
+                        skipped.append(f"{module_path}:{node.name}:no_public_methods")
+                        continue
+                    key = (module_path, "class", node.name)
+                    if key in seen:
+                        skipped.append(f"{module_path}:{node.name}:duplicate")
+                        continue
+                    seen.add(key)
+                    class_source = self._slice_source(lines, node)
+                    symbols.append(
+                        _TestableSymbol(
+                            kind="class",
+                            name=node.name,
+                            qualname=node.name,
+                            module_path=module_path,
+                            signature=node.name,
+                            docstring=ast.get_docstring(node) or "",
+                            source=class_source,
+                            methods=methods,
+                        )
+                    )
+        return symbols, skipped
+
+    @staticmethod
+    def _is_private_name(name: str) -> bool:
+        """True for single-underscore private names (not dunders)."""
+        return bool(name) and name.startswith("_") and not (
+            name.startswith("__") and name.endswith("__")
+        )
+
+    @staticmethod
+    def _is_dunder_name(name: str) -> bool:
+        """True for ``__init__``-style dunder names."""
+        return bool(name) and name.startswith("__") and name.endswith("__") and len(name) > 4
+
+    @staticmethod
+    def _slice_source(lines: Sequence[str], node: ast.AST) -> str:
+        """Return the source text spanning an AST node."""
+        start = max(0, int(getattr(node, "lineno", 1) or 1) - 1)
+        end = int(getattr(node, "end_lineno", None) or getattr(node, "lineno", start + 1))
+        end = max(start + 1, end)
+        return "\n".join(lines[start:end])
+
+    @staticmethod
+    def _format_callable_signature(node: ast.AST) -> str:
+        """Render ``name(args)`` for a function/method node."""
+        name = getattr(node, "name", "callable")
+        args = getattr(node, "args", None)
+        if args is None:
+            return f"{name}()"
+        try:
+            rendered = TestingAgent._ast_unparse(args)
+        except Exception:
+            rendered = ""
+        if not rendered:
+            arg_names = [
+                getattr(arg, "arg", "")
+                for arg in getattr(args, "args", [])
+                if getattr(arg, "arg", "")
+            ]
+            rendered = ", ".join(arg_names)
+        return f"{name}({rendered})"
+
+    @staticmethod
+    def _ast_unparse(node: ast.AST) -> str:
+        """Best-effort ``ast.unparse`` with a safe fallback."""
+        unparse = getattr(ast, "unparse", None)
+        if callable(unparse):
+            return str(unparse(node))
+        return ""
+
+    def _build_symbol_prompt(
+        self,
+        *,
+        instruction: str,
+        symbol: _TestableSymbol,
+        chunks: Sequence[RetrievedChunk],
+        source_excerpts: Sequence[str],
+    ) -> str:
+        """Build a focused user prompt for one public symbol."""
+        packed_chunks = self._dedupe_chunks(chunks)[:_MAX_CONTEXT_CHUNKS]
+        sections = [
+            "TESTING MODE\npytest unit test generation for one symbol",
+            f"WRITING INSTRUCTIONS\n{_WRITING_INSTRUCTIONS}",
+            f"REQUEST\n{instruction}",
+            f"FOCUS\n{symbol.focus_instruction}",
+            (
+                "SYMBOL\n"
+                f"kind={symbol.kind}\n"
+                f"name={symbol.name}\n"
+                f"module={symbol.module_path}\n"
+                f"signature={symbol.signature}\n"
+                f"docstring={symbol.docstring or '(none)'}"
+            ),
+        ]
+        if symbol.kind == "class" and symbol.methods:
+            # Metadata only here so retrieved context still precedes bodies.
+            method_lines = [
+                f"- {method.signature} :: {method.docstring.strip() or '(no docstring)'}"
+                for method in symbol.methods
+            ]
+            sections.append("PUBLIC METHODS\n" + "\n".join(method_lines))
+
+        if packed_chunks:
+            rendered = []
+            for index, chunk in enumerate(packed_chunks, start=1):
+                source = getattr(chunk, "source", None) or (
+                    chunk.metadata.get("file_path", "unknown")
+                    if chunk.metadata
+                    else "unknown"
+                )
+                body = chunk.content or ""
+                if len(body) > _MAX_CHUNK_CHARS:
+                    body = body[:_MAX_CHUNK_CHARS] + "\n..."
+                rendered.append(
+                    f"[{index}] source={source} score={float(chunk.score):.3f}\n{body}"
+                )
+            sections.append(
+                "RETRIEVED CONTEXT (primary - write tests from these symbols first)\n"
+                + "\n\n".join(rendered)
+            )
+        else:
+            sections.append(
+                "RETRIEVED CONTEXT (primary - write tests from these symbols first)\n"
+                "(none)\n"
+                "Rely on SYMBOL SOURCE / REPOSITORY CONTENTS only; "
+                "still do not invent APIs."
+            )
+
+        # Symbol/module source comes after retrieval, matching the
+        # repository-contents secondary evidence role.
+        sections.append(f"SYMBOL SOURCE\n{symbol.source}")
+        if source_excerpts:
+            sections.append(
+                "REPOSITORY CONTENTS (secondary - fill gaps only)\n"
+                + "\n\n".join(source_excerpts)
+            )
+        else:
+            sections.append("REPOSITORY CONTENTS\n(none)")
+
+        sections.append(
+            "OUTPUT CONTRACT\n"
+            "Return only the TestingResult JSON object. "
+            f"Prefer a single module named "
+            f"`{self._test_filename_for_module(symbol.module_path)}`. "
+            "Test ONLY the focused symbol. "
+            "`generated_tests` values must be complete runnable pytest "
+            "modules. Do not wrap the JSON in markdown fences."
+        )
+        return self._truncate_prompt("\n\n".join(sections))
+
+    @staticmethod
+    def _test_filename_for_module(module_path: str) -> str:
+        """Map ``pkg/mod.py`` → ``test_mod.py``."""
+        stem = os.path.splitext(os.path.basename(module_path or "module.py"))[0]
+        stem = stem or "module"
+        return f"test_{stem}.py"
+
+    def _normalize_symbol_result(
+        self,
+        result: TestingResult,
+        symbol: _TestableSymbol,
+    ) -> TestingResult:
+        """Force per-symbol outputs into one canonical test module filename."""
+        if not result.generated_tests:
+            return result
+        canonical = self._test_filename_for_module(symbol.module_path)
+        merged_source = self._merge_module_sources(list(result.generated_tests.values()))
+        if not merged_source.strip():
+            return self._empty_result()
+        return TestingResult(
+            summary=result.summary,
+            generated_tests={canonical: merged_source},
+            coverage_estimate=result.coverage_estimate,
+            abstention=None,
+        )
+
+    def _merge_testing_results(
+        self,
+        results: Sequence[TestingResult],
+    ) -> TestingResult:
+        """Merge per-symbol TestingResult objects into one suite."""
+        if not results:
+            return self._empty_result()
+
+        by_file: Dict[str, List[str]] = {}
+        summaries: List[str] = []
+        coverages: List[float] = []
+
+        for result in results:
+            if result.summary and result.summary.strip():
+                summaries.append(result.summary.strip())
+            try:
+                coverages.append(float(result.coverage_estimate))
+            except (TypeError, ValueError):
+                pass
+            for name, source in (result.generated_tests or {}).items():
+                if not source or not str(source).strip():
+                    continue
+                by_file.setdefault(name, []).append(source)
+
+        merged_tests = {
+            name: self._merge_module_sources(sources)
+            for name, sources in by_file.items()
+            if sources
+        }
+        merged_tests = {
+            name: source for name, source in merged_tests.items() if source.strip()
+        }
+        coverage = sum(coverages) / len(coverages) if coverages else 0.0
+        summary = " ".join(summaries).strip() or (
+            f"Generated tests for {len(results)} public symbol(s)."
+        )
+        return TestingResult(
+            summary=summary,
+            generated_tests=merged_tests,
+            coverage_estimate=min(max(coverage, 0.0), 1.0),
+            abstention=None,
+        )
+
+    @classmethod
+    def _merge_module_sources(cls, sources: Sequence[str]) -> str:
+        """
+        Merge pytest module sources: unique imports, fixtures, and tests.
+
+        Uses AST when possible so duplicate ``test_*`` names and import
+        statements are dropped while preserving order.
+        """
+        usable = [str(source) for source in sources if source and str(source).strip()]
+        if not usable:
+            return ""
+        if len(usable) == 1:
+            return usable[0]
+
+        import_nodes: List[ast.AST] = []
+        body_nodes: List[ast.AST] = []
+        seen_imports: Set[str] = set()
+        seen_defs: Set[str] = set()
+        module_doc: Optional[str] = None
+        fell_back = False
+
+        for source in usable:
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                fell_back = True
+                break
+            if module_doc is None:
+                module_doc = ast.get_docstring(tree)
+            for node in tree.body:
+                if isinstance(node, ast.Expr) and isinstance(
+                    getattr(node, "value", None), ast.Constant
+                ):
+                    # Skip module docstring expression; re-emit later.
+                    if isinstance(node.value.value, str) and module_doc == node.value.value:
+                        continue
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    key = cls._ast_unparse(node) or ast.dump(node)
+                    if key in seen_imports:
+                        continue
+                    seen_imports.add(key)
+                    import_nodes.append(node)
+                    continue
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name in seen_defs:
+                        continue
+                    seen_defs.add(node.name)
+                    body_nodes.append(node)
+                    continue
+                # Keep other top-level statements (assignments, etc.) once.
+                key = cls._ast_unparse(node) or ast.dump(node)
+                if key in seen_imports:
+                    continue
+                seen_imports.add(key)
+                body_nodes.append(node)
+
+        if fell_back:
+            return cls._merge_module_sources_textual(usable)
+
+        parts: List[str] = []
+        if module_doc:
+            parts.append(f'"""{module_doc}"""')
+        for node in import_nodes:
+            rendered = cls._ast_unparse(node)
+            if rendered:
+                parts.append(rendered)
+        if import_nodes and body_nodes:
+            parts.append("")
+        for node in body_nodes:
+            rendered = cls._ast_unparse(node)
+            if rendered:
+                parts.append(rendered)
+                parts.append("")
+        return "\n".join(parts).rstrip() + ("\n" if parts else "")
+
+    @staticmethod
+    def _merge_module_sources_textual(sources: Sequence[str]) -> str:
+        """Regex-based merge fallback when AST parsing fails."""
+        imports: List[str] = []
+        seen_imports: Set[str] = set()
+        tests: List[str] = []
+        seen_tests: Set[str] = set()
+        other: List[str] = []
+
+        for source in sources:
+            blocks = re.split(r"\n(?=def\s+|async\s+def\s+|class\s+|@)", source)
+            for block in blocks:
+                text = block.strip("\n")
+                if not text.strip():
+                    continue
+                first = text.lstrip().splitlines()[0] if text.lstrip() else ""
+                if first.startswith("import ") or first.startswith("from "):
+                    for line in text.splitlines():
+                        stripped = line.strip()
+                        if (
+                            stripped.startswith("import ")
+                            or stripped.startswith("from ")
+                        ) and stripped not in seen_imports:
+                            seen_imports.add(stripped)
+                            imports.append(stripped)
+                    continue
+                match = _TEST_DEF.search(text)
+                if match:
+                    name = match.group(1)
+                    if name in seen_tests:
+                        continue
+                    seen_tests.add(name)
+                    tests.append(text)
+                    continue
+                other.append(text)
+
+        parts = imports + ([""] if imports and (other or tests) else []) + other + tests
+        return "\n\n".join(parts).rstrip() + ("\n" if parts else "")
+
+    def _ensure_index(self, workspace: str) -> None:
+        """
+        Index the workspace into the per-repository store Analysis uses.
+
+        Uses Indexer.update_index for incremental updates so unchanged
+        files skip re-embedding. Failures are logged and swallowed so
+        generation can continue from files.
+        """
+        if self.retriever is None:
+            logger.info("No retriever configured; skipping testing indexing.")
+            return
+
+        from ..hooks.events import HookEvent
+        from ..rag.store_paths import vector_store_for_repository
+
+        config = self.retriever.config
+        store_path = vector_store_for_repository(
+            config.chroma_persist_directory, workspace
+        )
+        if self.retriever.vector_store_path != store_path:
+            self.retriever.vector_store_path = store_path
+            self.retriever._vector_db = None
+
+        if self._recently_indexed(workspace):
+            # Another agent sharing this Supervisor's index_reuse_cache
+            # already brought this exact workspace's index up to date
+            # moments ago (e.g. code analysis or documentation just
+            # before testing in a `--agent all` run). Skip the redundant
+            # walk-and-hash pass; the persistent store already has the
+            # latest data.
+            logger.info(
+                "Testing index: reusing recent index for %s (indexed "
+                "moments ago by another agent in this run).",
+                workspace,
+            )
+            return
+
+        self._hook(HookEvent.BEFORE_INGEST, workspace=workspace)
+        started = time.perf_counter()
+        try:
+            indexer = Indexer(
+                vector_store_path=store_path,
+                config=config,
+                workspace_root=workspace,
+                vector_db=self.retriever._vector_db,
+            )
+            update = indexer.update_index(".")
+            self.retriever._vector_db = indexer.vector_db
+            self._mark_indexed(workspace)
+            logger.info("Testing index: %s", update.summary())
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=workspace,
+                success=True,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                summary=update.summary(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Testing indexing failed; retrieval may be empty: %s",
+                exc,
+            )
+            self._hook(
+                HookEvent.AFTER_INGEST,
+                workspace=workspace,
+                success=False,
+                error=str(exc),
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            self._hook(
+                HookEvent.ON_ERROR,
+                workspace=workspace,
+                error=str(exc),
+                success=False,
+                stage="indexing",
+            )
+
+    def _retrieve_context(
+        self, query: str, target_path: str
+    ) -> List[RetrievedChunk]:
+        """
+        Retrieve RAG chunks for the testing request.
+
+        Returns an empty list when the retriever is missing, the index
+        is empty, or retrieval fails - callers continue with source files.
+        """
+        if self.retriever is None:
+            logger.info("No retriever configured; continuing with repository files only.")
+            return []
+
+        try:
+            chunks = self.retriever.retrieve(
+                query=query or target_path or "unit tests"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Retrieval failed; continuing with repository files only: %s",
+                exc,
+            )
+            return []
+
+        if not chunks:
+            logger.info(
+                "Retriever returned no chunks; continuing with repository files only."
+            )
+            return []
+        return self._dedupe_chunks(chunks)[:_MAX_CONTEXT_CHUNKS]
+
+    @staticmethod
+    def _dedupe_chunks(chunks: Sequence[RetrievedChunk]) -> List[RetrievedChunk]:
+        """
+        Collapse exact and near-duplicate retrieved chunks.
+
+        Drops empty chunks, whitespace-normalized duplicates, and shorter
+        excerpts already contained in a longer kept chunk. When a new
+        chunk fully contains a shorter kept excerpt, the longer one wins.
+        """
+        unique: List[RetrievedChunk] = []
+        keys: List[str] = []
+
+        for chunk in chunks:
+            content = (chunk.content or "").strip()
+            if not content:
+                continue
+            key = " ".join(content.split())
+            if not key:
+                continue
+            # Exact duplicate, or already covered by a longer excerpt.
+            if any(key == kept or key in kept for kept in keys):
+                continue
+            # Replace a shorter kept excerpt that this chunk supersedes.
+            replace_at = next(
+                (i for i, kept in enumerate(keys) if kept in key and kept != key),
+                None,
+            )
+            if replace_at is not None:
+                unique[replace_at] = chunk
+                keys[replace_at] = key
+                continue
+            unique.append(chunk)
+            keys.append(key)
+        return unique
+
+    def _read_repository_sources(
+        self,
+        filesystem: FilesystemTools,
+        target_path: str,
+        max_file_chars: int = _MAX_FILE_CHARS,
+        prefer_target_only: bool = False,
+    ) -> List[str]:
+        """
+        Read repository source files via FilesystemTools.
+
+        Prefers the target file when it is a single file; otherwise lists
+        Python sources under the workspace. When retrieved context is
+        already available, prefer the target file only.
+        """
+        excerpts: List[str] = []
+        relative_target = self._relative_to_workspace(filesystem, target_path)
+
+        if relative_target and relative_target not in {".", ""}:
+            try:
+                if filesystem.file_exists(relative_target):
+                    content = filesystem.read_file(relative_target)
+                    excerpts.append(
+                        self._format_file_excerpt(
+                            relative_target, content, max_file_chars
+                        )
+                    )
+                    return excerpts
+            except Exception as exc:
+                logger.warning(
+                    "Could not read target file %s: %s", target_path, exc
+                )
+
+        if prefer_target_only:
+            return excerpts
+
+        try:
+            files = filesystem.list_files(".", pattern="*.py", recursive=True)
+        except Exception as exc:
+            logger.warning("Could not list repository files: %s", exc)
+            return excerpts
+
+        for file_path in files[:_MAX_SOURCE_FILES]:
+            try:
+                content = filesystem.read_file(file_path)
+            except Exception as exc:
+                logger.warning("Skipping unreadable file %s: %s", file_path, exc)
+                continue
+            excerpts.append(
+                self._format_file_excerpt(file_path, content, max_file_chars)
+            )
+        return excerpts
+
+    @staticmethod
+    def _relative_to_workspace(
+        filesystem: FilesystemTools, target_path: str
+    ) -> str:
+        """Express target_path relative to the FilesystemTools workspace."""
+        if not target_path or not str(target_path).strip():
+            return "."
+        absolute = os.path.abspath(os.path.expanduser(target_path))
+        root = os.path.abspath(str(filesystem.workspace_root))
+        try:
+            common = os.path.commonpath([absolute, root])
+        except ValueError:
+            return os.path.basename(absolute) or "."
+        if common != root:
+            return os.path.basename(absolute) or "."
+        relative = os.path.relpath(absolute, root).replace("\\", "/")
+        return "." if relative in {".", ""} else relative
+
+    @staticmethod
+    def _format_file_excerpt(
+        file_path: str, content: str, max_chars: int = _MAX_FILE_CHARS
+    ) -> str:
+        """Format one source file for inclusion in the prompt."""
+        body = content if len(content) <= max_chars else content[:max_chars] + "\n..."
+        return f"### {file_path}\n{body}"
+
+    def _build_prompt(
+        self,
+        instruction: str,
+        target_path: str,
+        chunks: Sequence[RetrievedChunk],
+        source_excerpts: Sequence[str],
+    ) -> str:
+        """
+        Build the user prompt for the test-generation model call.
+
+        Packing order: instructions → retrieved chunks (deduped/truncated)
+        → shorter repository excerpts → output contract. Oversized
+        prompts are truncated from the secondary excerpts first.
+        """
+        packed_chunks = self._dedupe_chunks(chunks)[:_MAX_CONTEXT_CHUNKS]
+        sections = [
+            "TESTING MODE\npytest unit test generation",
+            f"WRITING INSTRUCTIONS\n{_WRITING_INSTRUCTIONS}",
+            f"REQUEST\n{instruction}",
+            f"TARGET\n{target_path}",
+        ]
+
+        if packed_chunks:
+            rendered = []
+            for index, chunk in enumerate(packed_chunks, start=1):
+                source = getattr(chunk, "source", None) or (
+                    chunk.metadata.get("file_path", "unknown")
+                    if chunk.metadata
+                    else "unknown"
+                )
+                body = chunk.content or ""
+                if len(body) > _MAX_CHUNK_CHARS:
+                    body = body[:_MAX_CHUNK_CHARS] + "\n..."
+                rendered.append(
+                    f"[{index}] source={source} score={float(chunk.score):.3f}\n{body}"
+                )
+            sections.append(
+                "RETRIEVED CONTEXT (primary - write tests from these symbols first)\n"
+                + "\n\n".join(rendered)
+            )
+        else:
+            sections.append(
+                "RETRIEVED CONTEXT (primary - write tests from these symbols first)\n"
+                "(none)\n"
+                "Rely on REPOSITORY CONTENTS only; still do not invent APIs."
+            )
+
+        if source_excerpts:
+            label = (
+                "REPOSITORY CONTENTS (secondary - fill gaps only; shorter excerpts)"
+                if packed_chunks
+                else "REPOSITORY CONTENTS (primary - no retrieved context)"
+            )
+            sections.append(f"{label}\n" + "\n\n".join(source_excerpts))
+        else:
+            sections.append("REPOSITORY CONTENTS\n(none)")
+
+        sections.append(
+            "OUTPUT CONTRACT\n"
+            "Return only the TestingResult JSON object. "
+            "`generated_tests` values must be complete runnable pytest "
+            "modules. Do not wrap the JSON in markdown fences."
+        )
+        return self._truncate_prompt("\n\n".join(sections))
+
+    @staticmethod
+    def _truncate_prompt(prompt: str, limit: int = _MAX_PROMPT_CHARS) -> str:
+        """
+        Truncate an oversized user prompt while keeping the head intact.
+
+        Prefer keeping instructions + retrieved context; the tail is
+        usually secondary repository excerpts and the output contract,
+        so a short marker is appended when cutting.
+        """
+        if len(prompt) <= limit:
+            return prompt
+        marker = "\n\n[truncated: prompt exceeded size budget]\n"
+        keep = max(0, limit - len(marker))
+        return prompt[:keep] + marker
+
+    def _parse_response(self, content: str) -> TestingResult:
+        """
+        Parse model output into TestingResult.
+
+        Returns an empty result when parsing fails rather than raising.
+        """
+        result, _error = self._parse_response_with_status(content)
+        return result
+
+    def _parse_response_with_status(
+        self, content: str
+    ) -> Tuple[TestingResult, Optional[str]]:
+        """
+        Parse model output and report whether a JSON object was recovered.
+
+        Returns:
+            ``(result, None)`` when a JSON object was parsed (tests may
+            still be empty). ``(empty, error)`` when unparseable.
+        """
+        empty = self._empty_result()
+        if not content or not str(content).strip():
+            return empty, "Model response was empty."
+
+        payload, extract_error = extract_json_object(str(content))
+        if payload is None:
+            logger.warning("Testing model response was not valid JSON.")
+            return empty, extract_error or (
+                "Testing model response was not valid JSON."
+            )
+
+        generated_raw = payload.get("generated_tests") or {}
+        generated_tests: Dict[str, str] = {}
+        if isinstance(generated_raw, dict):
+            for key, value in generated_raw.items():
+                name = str(key or "").strip()
+                code = value if isinstance(value, str) else str(value or "")
+                if name and code.strip():
+                    generated_tests[name] = code
+
+        try:
+            coverage = float(payload.get("coverage_estimate", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            coverage = 0.0
+        coverage = min(max(coverage, 0.0), 1.0)
+
+        return (
+            TestingResult(
+                summary=str(payload.get("summary") or ""),
+                generated_tests=generated_tests,
+                coverage_estimate=coverage,
+            ),
+            None,
+        )
+
+    def _generate_with_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        stream_label: str = "",
+    ) -> Any:
+        """
+        Call the model, streaming tokens to the live UI when supported.
+
+        Prefers ``generate_stream`` (same pattern as Analysis/Documentation).
+        OpenRouter may drop ``response_format`` while streaming; the system
+        prompt still requires TestingResult JSON and we parse afterward.
+        Concurrent symbol workers share ``_STREAM_EMIT_LOCK`` so deltas are
+        not character-interleaved in the progress file.
+        """
+        if self.model_client is None:
+            raise RuntimeError("No model client configured for TestingAgent.")
+
+        label = (stream_label or "").strip()
+        header_sent = False
+
+        def _on_chunk(text: str) -> None:
+            nonlocal header_sent
+            chunk = str(text or "")
+            if not chunk:
+                return
+            with _STREAM_EMIT_LOCK:
+                if label and not header_sent:
+                    self._trace(
+                        "testing_stream_delta",
+                        text=f"\n\n### {label}\n\n",
+                    )
+                    header_sent = True
+                self._trace(
+                    "testing_stream_delta",
+                    text=chunk,
+                )
+
+        messages = [
+            ModelMessage(role="system", content=system_prompt),
+            ModelMessage(role="user", content=user_prompt),
+        ]
+        generate_stream = getattr(self.model_client, "generate_stream", None)
+        if callable(generate_stream):
+            return generate_stream(
+                messages,
+                max_tokens=_TEST_MAX_TOKENS,
+                temperature=0.0,
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+                on_chunk=_on_chunk,
+            )
+
+        response = self.model_client.generate(
+            messages,
+            max_tokens=_TEST_MAX_TOKENS,
+            temperature=0.0,
+            response_format=JSON_OBJECT_RESPONSE_FORMAT,
+        )
+        _on_chunk(getattr(response, "content", "") or "")
+        return response
+
+    def _retry_json_repair(
+        self,
+        *,
+        raw_output: str,
+        parse_error: str,
+        symbol: Optional["_TestableSymbol"] = None,
+    ) -> Optional[str]:
+        """
+        Perform exactly one surgical JSON-repair model call.
+
+        Distinct from pytest failure repair: this only fixes malformed
+        TestingResult JSON. Returns repaired text, or ``None`` on failure.
+        """
+        if self.model_client is None:
+            return None
+
+        raw_text = (raw_output or "").strip() or "(empty)"
+        if len(raw_text) > _MAX_JSON_REPAIR_RAW_CHARS:
+            raw_text = raw_text[:_MAX_JSON_REPAIR_RAW_CHARS] + "\n...[truncated]"
+
+        symbol_label = getattr(symbol, "qualname", "") or "(unknown)"
+        retry_prompt = (
+            "TESTING JSON REPAIR MODE\n"
+            "Return ONLY the corrected TestingResult JSON object.\n"
+            "No Markdown, no code fences, no explanation, no extra fields.\n"
+            "Preserve recoverable test source from the raw output.\n\n"
+            f"SYMBOL\n{symbol_label}\n\n"
+            f"PARSER ERROR\n{parse_error or 'unknown'}\n\n"
+            f"RAW MODEL OUTPUT\n{raw_text}\n"
+        )
+        self._trace(
+            "testing_json_repair_started",
+            parse_error=parse_error,
+            symbol=symbol_label,
+            raw_chars=len(raw_output or ""),
+        )
+        started = time.perf_counter()
+        try:
+            response = self.model_client.generate(
+                [
+                    ModelMessage(
+                        role="system", content=_JSON_REPAIR_SYSTEM_PROMPT
+                    ),
+                    ModelMessage(role="user", content=retry_prompt),
+                ],
+                max_tokens=_TEST_MAX_TOKENS,
+                temperature=0.0,
+                response_format=JSON_OBJECT_RESPONSE_FORMAT,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Testing JSON repair call failed for %s: %s",
+                symbol_label,
+                exc,
+            )
+            self._trace(
+                "testing_json_repair_failed",
+                success=False,
+                error=str(exc),
+                symbol=symbol_label,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            return None
+
+        content = response.content or ""
+        self._trace(
+            "testing_json_repair_finished",
+            success=bool(content.strip()),
+            symbol=symbol_label,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            content_chars=len(content),
+        )
+        return content if content.strip() else None
+
+    def _salvage_raw_testing(
+        self,
+        content: str,
+        *,
+        symbol: Optional[_TestableSymbol] = None,
+    ) -> TestingResult:
+        """
+        Keep usable pytest source when TestingResult JSON parsing fails.
+
+        Prefers fenced ``python`` blocks that contain ``def test_``, then
+        falls back to a contiguous ``def test_`` region in the raw text.
+        """
+        text = (content or "").strip()
+        if not text:
+            return self._empty_result()
+
+        codes: List[str] = []
+        for match in _PYTHON_FENCE.finditer(text):
+            block = (match.group(1) or "").strip()
+            if "def test_" in block:
+                codes.append(block)
+
+        if not codes and "def test_" in text:
+            # Drop leading prose; keep from the earliest import/def near tests.
+            test_at = text.find("def test_")
+            window = text[:test_at]
+            start = 0
+            for marker in ("\nimport ", "\nfrom ", "\ndef ", "\nclass "):
+                idx = window.rfind(marker)
+                if idx >= 0:
+                    start = max(start, idx + 1)
+            snippet = text[start:].strip()
+            if "def test_" in snippet and len(snippet) >= 40:
+                codes.append(snippet)
+
+        if not codes:
+            # Last resort: pull string values that look like test modules
+            # out of nearly-JSON payloads.
+            for match in re.finditer(
+                r'"(test_[^"\\]+\.py)"\s*:\s*("((?:\\.|[^"\\])*)"|"""([\s\S]*?)""")',
+                text,
+            ):
+                name = match.group(1)
+                code = match.group(3) if match.group(3) is not None else match.group(4)
+                if code is None:
+                    continue
+                code = (
+                    code.replace("\\n", "\n")
+                    .replace('\\"', '"')
+                    .replace("\\\\", "\\")
+                    .strip()
+                )
+                if "def test_" in code:
+                    filename = name
+                    if symbol is not None:
+                        filename = self._test_filename_for_module(symbol.module_path)
+                    return TestingResult(
+                        summary=(
+                            "Salvaged test source from non-JSON model output."
+                        ),
+                        generated_tests={filename: code},
+                        coverage_estimate=0.0,
+                        abstention=None,
+                    )
+
+        if not codes:
+            return self._empty_result()
+
+        filename = "test_salvaged.py"
+        if symbol is not None:
+            filename = self._test_filename_for_module(symbol.module_path)
+        merged = self._merge_module_sources(codes)
+        if not merged.strip():
+            return self._empty_result()
+        return TestingResult(
+            summary="Salvaged test source from non-JSON model output.",
+            generated_tests={filename: merged},
+            coverage_estimate=0.0,
+            abstention=None,
+        )
+
+    @staticmethod
+    def _extract_json_object(content: str) -> Optional[Dict[str, Any]]:
+        """Extract the first JSON object from a model response."""
+        payload, _error = extract_json_object(content)
+        return payload
+
+    @staticmethod
+    def _empty_result() -> TestingResult:
+        """Build an empty TestingResult for failure paths."""
+        return TestingResult(
+            summary="",
+            generated_tests={},
+            coverage_estimate=0.0,
+            abstention=None,
+        )
+
+    @staticmethod
+    def _abstain_result(
+        *,
+        reason: str,
+        evidence_available: Optional[List[str]] = None,
+        recommended_next_steps: Optional[List[str]] = None,
+    ) -> TestingResult:
+        """Build a TestingResult that carries an explicit abstention."""
+        abstention: AbstentionResult = ReportBuilder().abstain(
+            reason,
+            confidence=1.0,
+            evidence_available=evidence_available,
+            recommended_next_steps=recommended_next_steps,
+        )
+        return TestingResult(
+            summary="",
+            generated_tests={},
+            coverage_estimate=0.0,
+            abstention=abstention,
+        )
+
+    @staticmethod
+    def _workspace_for(path: str) -> str:
+        """
+        Resolve a workspace root for FilesystemTools.
+
+        A directory path is used as-is. A file path uses its parent
+        directory. Missing paths fall back to the current directory.
+        """
+        if not path or not str(path).strip():
+            return os.path.abspath(".")
+        absolute = os.path.abspath(os.path.expanduser(path))
+        if os.path.isdir(absolute):
+            return absolute
+        if os.path.isfile(absolute):
+            return os.path.dirname(absolute) or absolute
+        parent = os.path.dirname(absolute)
+        return parent if parent else os.path.abspath(".")

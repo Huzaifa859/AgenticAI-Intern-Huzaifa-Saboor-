@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -774,6 +775,18 @@ class Indexer:
                 "starting a new manifest."
             )
             return self._empty_manifest()
+
+        tracked_root = str(manifest.get("workspace_root") or "").strip()
+        if tracked_root:
+            current_root = os.path.abspath(str(self.workspace_root or "."))
+            if os.path.abspath(tracked_root) != current_root:
+                logger.info(
+                    "Manifest workspace_root mismatch (%s vs %s); "
+                    "starting a new manifest.",
+                    tracked_root,
+                    current_root,
+                )
+                return self._empty_manifest()
 
         files = manifest.get("files")
         manifest["files"] = files if isinstance(files, dict) else {}

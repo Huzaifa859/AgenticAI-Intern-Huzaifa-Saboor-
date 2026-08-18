@@ -1,47 +1,63 @@
 # Dockerfile
 # ==========
 #
-# Jupyter environment for Codebase Assistant.
+# Streamlit Web UI for Codebase Assistant (OpenRouter).
+# Ships only the runtime app package + demo repo — not tests/docs/benchmarks.
 #
-# Paired with docker-compose.yml, which also brings up an Ollama
-# container so the full system (notebook + local llama3) runs with a
-# single `docker compose up`, per the proposal's Deployment section.
+# Build / run from the Project directory:
 #
-# NOTE: Placeholder. This builds and starts Jupyter, but the image is
-# not yet usable end-to-end -- see the TODOs below.
+#     docker compose up --build
+#     # open http://localhost:8501
+#
+# Secrets come from Compose env_file (.env) — never bake OPENROUTER_API_KEY
+# into the image. See .dockerignore.
 
 FROM python:3.11-slim
 
-# git is required at runtime: the ingestion pipeline clones the target
-# repository into the container.
+# git: clone GitHub repos at runtime. curl: Compose healthcheck.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# TODO: codebase_assistant/requirements.txt currently pins only
-# pydantic. Add the rest of the stack (jupyter, chromadb,
-# sentence-transformers, GitPython, pyflakes, pytest, and an
-# OpenRouter/Ollama client) before this image can run the notebook.
-COPY codebase_assistant/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Dependency layer first so code-only changes reuse the pip cache.
+# Longer timeout/retries: PyPI downloads from inside Docker are often slow.
+COPY requirements-docker.txt ./requirements.txt
+ENV PIP_DEFAULT_TIMEOUT=100 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir --retries 10 --default-timeout=100 -r requirements.txt
 
-COPY . .
+# Runtime application only (see .dockerignore for excluded paths).
+COPY app ./app
+COPY codebase_assistant ./codebase_assistant
+COPY .streamlit ./.streamlit
+COPY examples/demo_repo ./examples/demo_repo
+COPY .env.example ./.env.example
 
-# TODO: source these from Config rather than duplicating defaults here.
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    OLLAMA_BASE_URL=http://ollama:11434
+RUN useradd -m appuser \
+    && mkdir -p /data/chroma /data/memory /data/history \
+    && chown -R appuser:appuser /app /data
 
-# Jupyter.
-EXPOSE 8888
+USER appuser
 
-# TODO: token-based auth is disabled for local development only. Do not
-# expose this container beyond localhost as configured.
-CMD ["jupyter", "notebook", \
-     "--ip=0.0.0.0", \
-     "--port=8888", \
-     "--no-browser", \
-     "--allow-root", \
-     "--NotebookApp.token="]
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_FILE_WATCHER_TYPE=none \
+    CODEBASE_ASSISTANT_DATA_DIR=/data \
+    CHROMA_PERSIST_DIR=/data/chroma \
+    MEMORY_STORE_PATH=/data/memory \
+    RUN_HISTORY_PATH=/data/history/ui_run_history.jsonl \
+    CA_WORKER_HOST=127.0.0.1 \
+    CA_WORKER_PORT=8765 \
+    CA_WORKER_URL=http://127.0.0.1:8765
+
+EXPOSE 8501
+
+# Warm worker on localhost:8765, then Streamlit on :8501 (only :8501 published).
+CMD ["python", "app/docker_entrypoint.py"]

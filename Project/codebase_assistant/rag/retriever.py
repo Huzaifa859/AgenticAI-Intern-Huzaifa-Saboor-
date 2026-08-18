@@ -21,13 +21,16 @@ vectors, or the distances are meaningless. That is why the embedding
 model name lives in Config and why sharing an Indexer here is the safest
 way to construct one.
 
-TODO: `rerank` currently just orders by similarity. Real cross-encoder
-re-ranking is a Week 7 item.
+When ``Config.rerank_enabled`` is True, ``retrieve`` fetches a wider
+candidate pool and optionally reorders it with a cross-encoder. If the
+reranker cannot be loaded or scoring fails, the original vector-search
+order is returned unchanged.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..config import Config
@@ -37,6 +40,14 @@ from .indexer import Indexer
 from .vectordb import SearchResult, VectorDB
 
 logger = logging.getLogger(__name__)
+
+# Cross-encoder models keyed by name, shared across Retriever instances
+# in the process. Guarded so two concurrent first queries cannot both
+# pay to load the same weights.
+_RERANKER_CACHE: Dict[str, Any] = {}
+_RERANKER_CACHE_LOCK = threading.Lock()
+# Sentinel meaning "we already tried and failed to load this model".
+_RERANKER_UNAVAILABLE = object()
 
 
 class Retriever:
@@ -56,13 +67,15 @@ class Retriever:
         vector_db: Optional[VectorDB] = None,
         embedder: Optional[EmbeddingGenerator] = None,
         indexer: Optional[Indexer] = None,
+        reranker: Optional[Any] = None,
+        rerank_enabled: Optional[bool] = None,
     ) -> None:
         """
         Initialize the Retriever.
 
         Nothing is loaded here. The Supervisor constructs a Retriever
         during startup, so opening the store or loading the embedding
-        model is deferred until a query actually arrives.
+        / reranker models is deferred until a query actually arrives.
 
         Args:
             vector_store_path: Directory the vector store persists to.
@@ -80,6 +93,10 @@ class Retriever:
                 its Config are both adopted, which is the simplest way
                 to guarantee the Retriever reads the collection the
                 Indexer wrote with the settings it wrote it under.
+            reranker: Optional pre-built cross-encoder (must expose
+                ``predict``). Injected by tests; production loads from
+                ``Config.rerank_model_name`` on first use.
+            rerank_enabled: Optional override for ``Config.rerank_enabled``.
         """
         # Adopting the store without the config would be a trap: the
         # Retriever would read the right collection while taking
@@ -101,6 +118,8 @@ class Retriever:
 
         self._vector_db = vector_db
         self._embedder = embedder
+        self._reranker = reranker
+        self._rerank_enabled_override = rerank_enabled
 
     # ------------------------------------------------------------------
     # Lazily built collaborators
@@ -233,7 +252,9 @@ class Retriever:
         Retrieve the most relevant chunks for a query.
 
         The agent-facing entry point, returning the RetrievedChunk
-        schema the scaffold was built against.
+        schema the scaffold was built against. When reranking is
+        enabled, a wider candidate pool is fetched from the vector
+        store, reordered by ``rerank``, then trimmed to ``top_k``.
 
         Args:
             query: Natural language or code query.
@@ -251,11 +272,20 @@ class Retriever:
             ProviderUnavailableError: If the model or store is unusable.
             EmbeddingError: If the query cannot be embedded.
         """
-        return [
+        limit = top_k if top_k is not None else self.config.retrieval_top_k
+        if limit <= 0:
+            raise ValueError("top_k must be positive.")
+
+        fetch_k = self._candidate_count(limit) if self.rerank_enabled else limit
+        chunks = [
             self._to_retrieved_chunk(hit)
-            for hit in self.search(query, top_k=top_k, where=where,
-                                   min_score=min_score)
+            for hit in self.search(
+                query, top_k=fetch_k, where=where, min_score=min_score
+            )
         ]
+        if self.rerank_enabled and chunks:
+            chunks = self.rerank(query, chunks)
+        return chunks[:limit]
 
     def retrieve_by_file(
         self,
@@ -308,30 +338,150 @@ class Retriever:
             for chunk in chunks[:limit]
         ]
 
+    @property
+    def rerank_enabled(self) -> bool:
+        """Report whether cross-encoder reranking should run."""
+        if self._rerank_enabled_override is not None:
+            return bool(self._rerank_enabled_override)
+        return bool(getattr(self.config, "rerank_enabled", False))
+
     def rerank(
         self, query: str, chunks: List[RetrievedChunk]
     ) -> List[RetrievedChunk]:
         """
-        Re-order retrieved chunks by relevance.
+        Re-order retrieved chunks with an optional cross-encoder.
 
-        Currently a stable sort on the similarity score already
-        attached, which is a no-op for results straight out of
-        `retrieve` and useful only when merging several result sets.
-        It is deliberately not a second scoring pass: a cross-encoder
-        would give better ordering but needs its own model, and
-        pretending to re-rank without one would be worse than being
-        explicit that this only sorts.
+        When reranking is disabled, or when no cross-encoder is
+        available, the original retrieval results are returned
+        unchanged (still ordered by their existing vector scores if a
+        plain sort is all that is needed for merged result sets).
 
         Args:
-            query: The original query. Unused today, kept because the
-                cross-encoder implementation will need it and callers
-                should not have to change.
-            chunks: Chunks to re-order.
+            query: The original retrieval query.
+            chunks: Candidate chunks from the initial vector search.
 
         Returns:
-            The chunks ordered by score, highest first.
+            Chunks ordered by cross-encoder relevance when reranking
+            succeeds, otherwise the original list (or a score-sorted
+            copy when reranking is disabled).
         """
-        return sorted(chunks, key=lambda chunk: chunk.score, reverse=True)
+        if not chunks:
+            return []
+
+        if not self.rerank_enabled:
+            return sorted(chunks, key=lambda chunk: chunk.score, reverse=True)
+
+        if not isinstance(query, str) or not query.strip():
+            logger.warning(
+                "Retriever.rerank: empty query; returning original retrieval order."
+            )
+            return list(chunks)
+
+        reranker = self._get_reranker()
+        if reranker is None:
+            logger.info(
+                "Retriever.rerank: no cross-encoder available; "
+                "returning original retrieval results."
+            )
+            return list(chunks)
+
+        try:
+            pairs = [(query, chunk.content or "") for chunk in chunks]
+            raw_scores = reranker.predict(pairs)
+            scores = [float(score) for score in raw_scores]
+        except Exception as exc:
+            logger.warning(
+                "Retriever.rerank: cross-encoder scoring failed; "
+                "returning original retrieval results: %s",
+                exc,
+            )
+            return list(chunks)
+
+        if len(scores) != len(chunks):
+            logger.warning(
+                "Retriever.rerank: score count mismatch (%d vs %d); "
+                "returning original retrieval results.",
+                len(scores),
+                len(chunks),
+            )
+            return list(chunks)
+
+        ranked: List[RetrievedChunk] = []
+        for chunk, score in sorted(
+            zip(chunks, scores), key=lambda item: item[1], reverse=True
+        ):
+            metadata = dict(chunk.metadata or {})
+            metadata["vector_score"] = float(chunk.score)
+            metadata["rerank_score"] = float(score)
+            ranked.append(
+                RetrievedChunk(
+                    source=chunk.source,
+                    content=chunk.content,
+                    score=float(score),
+                    metadata=metadata,
+                )
+            )
+        logger.info(
+            "Retriever.rerank: reordered %d chunk(s) with %s.",
+            len(ranked),
+            getattr(self.config, "rerank_model_name", "cross-encoder"),
+        )
+        return ranked
+
+    def _candidate_count(self, top_k: int) -> int:
+        """
+        How many vector hits to fetch before a rerank pass.
+
+        Args:
+            top_k: Final number of chunks the caller wants.
+
+        Returns:
+            A candidate pool at least as large as ``top_k``.
+        """
+        configured = int(getattr(self.config, "rerank_candidates", top_k) or top_k)
+        return max(top_k, configured)
+
+    def _get_reranker(self) -> Optional[Any]:
+        """
+        Return a usable cross-encoder, or None when unavailable.
+
+        A failed load is cached so every subsequent query does not
+        retry a missing dependency or download error.
+        """
+        if self._reranker is not None:
+            return self._reranker
+
+        model_name = (
+            getattr(self.config, "rerank_model_name", None)
+            or "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        )
+        with _RERANKER_CACHE_LOCK:
+            cached = _RERANKER_CACHE.get(model_name)
+            if cached is _RERANKER_UNAVAILABLE:
+                return None
+            if cached is not None:
+                self._reranker = cached
+                return cached
+
+            try:
+                from sentence_transformers import CrossEncoder
+
+                logger.info("Loading cross-encoder reranker %r...", model_name)
+                model = CrossEncoder(model_name)
+            except Exception as exc:
+                logger.warning(
+                    "Cross-encoder %r unavailable; reranking disabled for "
+                    "this process: %s",
+                    model_name,
+                    exc,
+                )
+                _RERANKER_CACHE[model_name] = _RERANKER_UNAVAILABLE
+                return None
+
+            _RERANKER_CACHE[model_name] = model
+            self._reranker = model
+            logger.info("Cross-encoder reranker %r ready.", model_name)
+            return model
 
     # ------------------------------------------------------------------
     # Filters
