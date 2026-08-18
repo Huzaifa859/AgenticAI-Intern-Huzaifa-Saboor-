@@ -1,0 +1,108 @@
+[
+  {
+    "timestamp": "2026-07-22T05:36:54.606+00:00",
+    "agent": "manual_test",
+    "kind": "mcp_resource_read",
+    "name": "app://status",
+    "input": null,
+    "output": "{\n  \"app_name\": \"DemoApp\",\n  \"version\": \"1.0.0\",\n  \"status\": \"healthy\",\n  \"kb_entries\": 5\n}",
+    "duration_ms": 5.13
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.612+00:00",
+    "agent": "manual_test",
+    "kind": "mcp_tool_call",
+    "name": "search_knowledge_base",
+    "input": {
+      "query": "shipping"
+    },
+    "output": "[shipping] Standard shipping takes 5-7 business days. Express shipping takes 1-2 business days.",
+    "duration_ms": 5.81
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.652+00:00",
+    "agent": "supervisor",
+    "kind": "routing_decision",
+    "name": "route_task",
+    "input": "What is your refund policy?",
+    "output": "knowledge_worker",
+    "duration_ms": 0.01
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.658+00:00",
+    "agent": "knowledge_worker",
+    "kind": "mcp_tool_call",
+    "name": "search_knowledge_base",
+    "input": {
+      "query": "What is your refund policy?"
+    },
+    "output": "[refund policy] Refunds are available within 30 days of purchase with a valid receipt.\n[account password] To reset your password, go to Settings > Security > Reset Password.\n[support hours] Customer support is available Monday-Friday, 9am-6pm EST.",
+    "duration_ms": 6.16
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.658+00:00",
+    "agent": "supervisor",
+    "kind": "routing_decision",
+    "name": "route_task",
+    "input": "What is 42 * 8 + 10?",
+    "output": "math_worker",
+    "duration_ms": 0.08
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.659+00:00",
+    "agent": "math_worker",
+    "kind": "local_tool_call",
+    "name": "calculator",
+    "input": {
+      "args": [
+        "What is 42 * 8 + 10?"
+      ],
+      "kwargs": {}
+    },
+    "output": 346,
+    "duration_ms": 0.04
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.659+00:00",
+    "agent": "supervisor",
+    "kind": "routing_decision",
+    "name": "route_task",
+    "input": "How many business days does express shipping take?",
+    "output": "knowledge_worker",
+    "duration_ms": 0.0
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.665+00:00",
+    "agent": "knowledge_worker",
+    "kind": "mcp_tool_call",
+    "name": "search_knowledge_base",
+    "input": {
+      "query": "How many business days does express shipping take?"
+    },
+    "output": "[refund policy] Refunds are available within 30 days of purchase with a valid receipt.\n[shipping] Standard shipping takes 5-7 business days. Express shipping takes 1-2 business days.",
+    "duration_ms": 6.34
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.665+00:00",
+    "agent": "supervisor",
+    "kind": "routing_decision",
+    "name": "route_task",
+    "input": "Tell me a fun fact about octopuses",
+    "output": "general_worker",
+    "duration_ms": 0.02
+  },
+  {
+    "timestamp": "2026-07-22T05:36:54.665+00:00",
+    "agent": "general_worker",
+    "kind": "local_tool_call",
+    "name": "llm_general_answer",
+    "input": {
+      "args": [
+        "Tell me a fun fact about octopuses"
+      ],
+      "kwargs": {}
+    },
+    "output": "(No ANTHROPIC_API_KEY set - returning canned response) I can't look that up right now, but I can help with knowledge-base or math questions.",
+    "duration_ms": 0.01
+  }
+]

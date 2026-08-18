@@ -221,6 +221,53 @@ Run all notebook cells from top to bottom. The first cell installs the required 
 - A file reader supporting `.txt` and `.pdf` documents
 - Multi-hop reasoning across file content, memory, and web search within a single agent
 
+# Week 5 — MCP Server, Multi-Agent Supervisor, and Execution Tracing
+
+**Folder:** `Week5Assignment/`
+
+This assignment demonstrates a custom **Model Context Protocol (MCP)** server, a Python MCP client, a supervisor–worker multi-agent system, and an execution tracing layer. The implementation shows how tasks are routed between specialized agents while logging every tool call, resource access, and routing decision throughout the workflow.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `Week5_MCP_Agents.ipynb` | Main notebook implementing the MCP server, client, supervisor, worker agents, tracing, and demonstrations. |
+| `mcp_server.py` | Standalone MCP server exposing one resource and one tool, generated from the notebook. |
+| `trace_log.json` | Example execution trace containing logged tool calls and routing decisions. |
+
+## Setup
+
+The notebook installs the required Python packages automatically when executed.
+
+An Anthropic API key is **optional**. If provided, the general worker uses a live Claude model; otherwise, it falls back to a predefined response.
+
+```text
+ANTHROPIC_API_KEY=your_api_key_here
+```
+
+## Run
+
+```bash
+cd Week5Assignment
+jupyter notebook Week5_MCP_Agents.ipynb
+```
+
+Restart the kernel and run all cells from top to bottom.
+
+## Expected Output
+
+- Successful connection between the MCP client and server.
+- Display of available MCP tools and resources.
+- Supervisor routing tasks to specialized worker agents.
+- Trace logs capturing tool calls, resource reads, and routing decisions.
+- Exported execution trace in `trace_log.json`.
+
+## Features
+
+- Custom MCP server exposing one application resource and one tool.
+- Python MCP client communicating with the server over `stdio`.
+- Supervisor agent coordinating multiple specialized worker agents.
+- Execution tracing layer logging tool calls, resource access, and routing decisions.
 
 # Prompts Log
 
